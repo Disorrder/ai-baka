@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Secrets
+.env
+
+# Runtime data (архив живёт на archive volume, а не в репозитории)
+surreal-archive/
+logs/
+exports/
+reports/
+tmp/
+staging/
+
+# Legacy-артефакты (никогда не коммитятся)
+index.sqlite
+db-backups/
+raw/
+
+# OS
+.DS_Store
