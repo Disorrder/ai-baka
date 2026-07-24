@@ -48,12 +48,12 @@ BM25 + HNSW + RRF
 ## Физическая структура архива
 
 Корень — `BAKA_ARCHIVE_ROOT`
-(по умолчанию `/Volumes/Archive/Conversations/surreal-archive`):
+(по умолчанию `/Volumes/Archive/Conversations`):
 
 ```text
-surreal-archive/
+Conversations/
 ├── .baka-archive.json        # sentinel: archiveId, formatVersion, expected NS/DB
-├── data/db/                  # RocksDB (bind mount контейнера SurrealDB)
+├── db/                       # RocksDB (bind mount контейнера SurrealDB)
 ├── raw/<harness>/            # плоские immutable snapshots: <basename>__<sha256>.<ext>
 ├── staging/<sync-run-id>/    # тот же диск → atomic rename
 ├── backups/surreal/          # logical exports .surql.zst + manifests

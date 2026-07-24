@@ -17,7 +17,7 @@ SQLite-архива нетронутым до ручного удаления.
 - добавлен седьмой harness — Kimi Code (Kimi CLI);
 - legacy-архив перенесён из `/Volumes/Archive/Conversations` в
   `/Volumes/Archive/Legacy Conversations/`; новый архив начинается с чистой
-  папки `/Volumes/Archive/Conversations/surreal-archive`.
+  папки `/Volumes/Archive/Conversations`.
 
 ---
 
@@ -208,7 +208,7 @@ baka git commit: commit SHA
 Корень задаётся через переменную окружения:
 
 ```dotenv
-BAKA_ARCHIVE_ROOT=/Volumes/Archive/Conversations/surreal-archive
+BAKA_ARCHIVE_ROOT=/Volumes/Archive/Conversations
 ```
 
 Никаких захардкоженных путей внутри compose или TypeScript-кода.
@@ -216,10 +216,9 @@ BAKA_ARCHIVE_ROOT=/Volumes/Archive/Conversations/surreal-archive
 Рекомендуемая структура:
 
 ```text
-surreal-archive/
+Conversations/
 ├── .baka-archive.json
-├── data/
-│   └── db/                         # RocksDB
+├── db/                             # RocksDB
 ├── raw/
 │   ├── codex/
 │   ├── claude-code/
@@ -321,7 +320,7 @@ surrealdb
 | Container port   | `8000`                                  |
 | Storage          | RocksDB                                 |
 | Container path   | `/data/db`                              |
-| Host path        | `${BAKA_ARCHIVE_ROOT}/data/db`          |
+| Host path        | `${BAKA_ARCHIVE_ROOT}/db`               |
 | Namespace        | `baka`                                  |
 | Database         | `archive`                               |
 | Network exposure | только loopback                         |
@@ -2310,7 +2309,6 @@ surreal start memory
    index.sqlite
    db-backups/
    raw/
-   surreal-archive/
    logs/
    exports/
    .env

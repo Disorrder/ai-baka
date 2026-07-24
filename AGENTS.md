@@ -13,7 +13,7 @@
 - SurrealDB 3.2.3 (image pinned tag + digest), RocksDB, отдельный
   docker-compose, только `127.0.0.1:8901`.
 - Архив на внешнем диске: `BAKA_ARCHIVE_ROOT`
-  (по умолчанию `/Volumes/Archive/Conversations/surreal-archive`).
+  (по умолчанию `/Volumes/Archive/Conversations`).
 
 ## Жёсткие ограничения
 

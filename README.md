@@ -37,7 +37,7 @@ raw-архива, а не местом, куда напрямую перекла
 
 | Что | Где |
 | --- | --- |
-| Архив (RocksDB + raw + backups) | `/Volumes/Archive/Conversations/surreal-archive` (задаётся `BAKA_ARCHIVE_ROOT`) |
+| Архив (RocksDB + raw + backups) | `/Volumes/Archive/Conversations` (задаётся `BAKA_ARCHIVE_ROOT`) |
 | Legacy-архив SQLite (read-only, не трогаем) | `/Volumes/Archive/Legacy Conversations/` |
 | SurrealDB | отдельный Docker-контейнер, `127.0.0.1:8901`, image `surrealdb/surrealdb:v3.2.3` (tag + digest) |
 

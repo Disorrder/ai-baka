@@ -5,7 +5,6 @@ node_modules/
 .env
 
 # Runtime data (архив живёт на archive volume, а не в репозитории)
-surreal-archive/
 logs/
 exports/
 reports/
