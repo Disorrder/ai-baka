@@ -1,0 +1,24 @@
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:v3.2.3@sha256:2006fe3f88f6f240c6463460021b4a14ffe102aea376284428f850045b7b382e
+    container_name: baka-surrealdb
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8901:8000"
+    volumes:
+      - "${BAKA_ARCHIVE_ROOT}/db:/data/db"
+    command:
+      - start
+      - --log
+      - info
+      - --username
+      - ${SURREAL_USER}
+      - --password
+      - ${SURREAL_PASS}
+      - rocksdb:///data/db
+    healthcheck:
+      test: ["CMD", "/surreal", "is-ready", "--endpoint", "http://127.0.0.1:8000"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s

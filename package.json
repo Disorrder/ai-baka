@@ -1,0 +1,29 @@
+{
+  "name": "ai-baka",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "baka": "./src/cli.ts"
+  },
+  "scripts": {
+    "baka": "bun run src/cli.ts",
+    "archive:init": "bun run src/cli.ts archive:init",
+    "db:preflight": "bun run src/cli.ts db preflight",
+    "db:up": "bun run src/cli.ts db up",
+    "db:down": "bun run src/cli.ts db down",
+    "db:status": "bun run src/cli.ts db status",
+    "db:logs": "bun run src/cli.ts db logs",
+    "disk:eject": "bun run src/cli.ts disk eject",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "commander": "15.0.0",
+    "surrealdb": "2.0.8"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.3",
+    "typescript": "5.9.3"
+  }
+}

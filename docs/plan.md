@@ -334,13 +334,16 @@ OrbStack, но проект не должен зависеть от OrbStack-spe
 
 ## 5.2. Credentials
 
-Не использовать `root/root`.
+**Решение владельца от 24.07.2026:** инстанс чисто локальный, single-user,
+доступен только через loopback, репозиторий никуда не пушится — поэтому
+используется `root/root`. Если инстанс когда-либо будет exposed за пределы
+loopback, вернуться к random-generated secret.
 
 В `.env`, исключённом из Git:
 
 ```dotenv
 SURREAL_USER=root
-SURREAL_PASS=<random-generated-secret>
+SURREAL_PASS=root
 SURREAL_URL=ws://127.0.0.1:8901/rpc
 SURREAL_NAMESPACE=baka
 SURREAL_DATABASE=archive
