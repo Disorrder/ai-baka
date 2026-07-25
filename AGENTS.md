@@ -2,20 +2,31 @@
 
 ## Статус проекта
 
-Реализованы этапы 0–3 из [`docs/plan.md`](docs/plan.md) (раздел «Порядок
+Реализованы этапы 0–5 из [`docs/plan.md`](docs/plan.md) (раздел «Порядок
 реализации»): инфраструктура, schema migrations, source snapshot layer
 (discovery `baka discover`, complete/partial scan, immutable raw snapshots,
-SQLite через `VACUUM INTO`, deletion/rename/reconcile-логика). Записи в БД
-из sync пока нет (этап 5). Авторитетный источник требований — `docs/plan.md`;
-при расхождении кода с планом сначала сверяйся с ним.
+SQLite через `VACUUM INTO`, deletion/rename/reconcile-логика), parser
+contract + parsers/extractors всех 7 harness'ов (parser_version = 1,
+EXTRACTOR_VERSION = 1), SurrealDB writer и structured sync
+(`baka sync` / `baka status` / `baka validate`): репозитории
+`src/db/repositories/`, транзакция диалога по §10.4
+(`src/db/repositories/corpus.ts`), orchestrator `src/sync/sync-run.ts`.
+Embeddings пока не вызываются: embedding jobs создаются только при
+существовании active `embedding_space` (появится на этапе 7).
+Авторитетный источник требований — `docs/plan.md`; при расхождении кода
+с планом сначала сверяйся с ним.
 
-Этап 4 реализован частично (4a): parser contract (`src/domain/`), общие
-нормализаторы model/usage и базовый интерфейс parser'а
-(`src/parsers/shared/`), reference-parser'ы `src/parsers/codex/` и
-`src/parsers/kimi-code/` (parser_version = 1), extractor'ы
-user_prompt/assistant_final (`src/search/extractors/`) для тех же двух
-harness'ов, обезличенные golden fixtures в `tests/fixtures/`. Parser'ы
-остальных 5 harness'ов добавляются по этому образцу.
+Ключевые решения этапа 5 (подробности — комментарии в коде):
+
+- транзакция SurrealDB = ОДИН query-вызов `BEGIN; ...; COMMIT;`
+  (транзакция не живёт между вызовами SDK 2.x); мульти-statement IF/ELSE
+  внутри транзакции не использовать (молча биндит null) — upsert dialogue
+  через `UPSERT ONLY ... WHERE`;
+- dialogue_revision id детерминирован: sha256(identity_key + parser@version
+  + canonical_hash) — идемпотентность повторных sync;
+- kimi-code: диалог = каталог сессии; sync собирает parse-view из immutable
+  raw-файлов (hardlink'и в staging) и парсит его целиком; session_index.jsonl
+  архивируется, но не парсится (parse_status = unsupported).
 
 ## Стек
 

@@ -16,6 +16,10 @@ import { assertPreflight } from "./infra/preflight.ts";
 import { acquireLock } from "./infra/lock.ts";
 import { readSentinel } from "./infra/sentinel.ts";
 import { discoverSourceRoots } from "./sources/discovery/discovery.ts";
+import { runSync } from "./sync/sync-run.ts";
+import { HARNESSES, type HarnessSlug } from "./sources/adapters/harnesses.ts";
+import { collectStatus, formatStatus } from "./status.ts";
+import { runValidation } from "./validate.ts";
 
 const program = new Command();
 
@@ -206,6 +210,90 @@ disk
       const cfg = loadConfig();
       await ejectDisk(cfg.archiveRoot, (message) => console.log(message));
       console.log("диск извлечён");
+    }),
+  );
+
+program
+  .command("sync")
+  .description("Structured sync: discovery → snapshot → parse → SurrealDB (docs/plan.md §10)")
+  .option("--harness <slug>", `только один harness (${Object.keys(HARNESSES).join(", ")})`)
+  .option("--source-root <path>", "только один source root (точный путь)")
+  .option("--full-rescan", "игнорировать fingerprint'ы и переснять все файлы")
+  .option("--deletion-confirmations <n>", "complete-scan'ов до deleted_in_source", Number)
+  .option("--no-enqueue-embeddings", "не создавать embedding jobs")
+  .option("--dry-run", "только показать действия, без записи в БД и raw")
+  .option("--json", "итоговая сводка в JSON (лог событий — в stderr)")
+  .action(
+    handle(
+      async (options: {
+        harness?: string;
+        sourceRoot?: string;
+        fullRescan?: boolean;
+        deletionConfirmations?: number;
+        enqueueEmbeddings?: boolean;
+        dryRun?: boolean;
+        json?: boolean;
+      }) => {
+        if (options.harness && !(options.harness in HARNESSES)) {
+          throw new Error(`неизвестный harness: ${options.harness}`);
+        }
+        const cfg = loadConfig();
+        const summary = await runSync(cfg, {
+          harness: options.harness as HarnessSlug | undefined,
+          sourceRoot: options.sourceRoot,
+          fullRescan: options.fullRescan,
+          deletionConfirmations:
+            options.deletionConfirmations && options.deletionConfirmations > 0
+              ? options.deletionConfirmations
+              : undefined,
+          enqueueEmbeddings: options.enqueueEmbeddings,
+          dryRun: options.dryRun,
+        });
+        if (options.json) {
+          console.log(JSON.stringify(summary, null, 2));
+        } else {
+          console.log(`sync: ${summary.status}`);
+          for (const [key, value] of Object.entries(summary.counters)) {
+            console.log(`  ${key}: ${value}`);
+          }
+          for (const error of summary.errors) console.error(`  error: ${error}`);
+        }
+        if (summary.status === "failed") process.exitCode = 1;
+      },
+    ),
+  );
+
+program
+  .command("status")
+  .description("Сводка состояния архива (docs/plan.md §17.2)")
+  .option("--json", "вывести результат в JSON")
+  .action(
+    handle(async (options: { json?: boolean }) => {
+      const cfg = loadConfig();
+      const report = await collectStatus(cfg);
+      console.log(options.json ? JSON.stringify(report, null, 2) : formatStatus(report));
+    }),
+  );
+
+program
+  .command("validate")
+  .description("Проверка инвариантов архива (docs/plan.md §17.3, §23)")
+  .option("--json", "вывести результат в JSON")
+  .action(
+    handle(async (options: { json?: boolean }) => {
+      const cfg = loadConfig();
+      const report = await runValidation(cfg);
+      if (options.json) {
+        console.log(JSON.stringify(report, null, 2));
+      } else if (report.ok) {
+        console.log("validate: ok — инварианты соблюдены");
+      } else {
+        console.log(`validate: ${report.issues.length} проблем(а)`);
+        for (const issue of report.issues) {
+          console.log(`  [${issue.check}] ${issue.detail}`);
+        }
+      }
+      if (!report.ok) process.exitCode = 1;
     }),
   );
 

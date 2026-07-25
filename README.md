@@ -6,16 +6,28 @@
 с нуля: SurrealDB становится канонической моделью и индексом поверх неизменяемого
 raw-архива, а не местом, куда напрямую перекладываются прежние таблицы SQLite.
 
-**Статус:** этап 3 плана (source snapshot layer) завершён: discovery
-(`baka discover`), scan со статусами complete/partial/unavailable, immutable
-raw snapshots (staging → SHA-256 → atomic rename, SQLite — через `VACUUM INTO`),
-orphan detection, чистая deletion/rename/reconcile-логика. Схема БД — миграции
+**Статус:** этап 5 плана (SurrealDB writer и structured sync) завершён:
+репозитории поверх SDK, атомарная транзакция диалога (§10.4), immutable
+dialogue revisions с current pointers, quarantine через ingest_error,
+`baka sync` / `baka status` / `baka validate`. Первый живой sync по kimi-code
+пройден на боевой базе; повторный sync идемпотентен. Схема БД — миграции
 в [`schema/`](schema/) (применяются `bun run db:migrate`, runner —
 `src/db/migrations.ts`). Авторитетным источником требований остаётся
 [`docs/plan.md`](docs/plan.md).
 
 ## CLI
 
+- `baka sync [--harness <slug>] [--source-root <path>] [--full-rescan]
+  [--deletion-confirmations <n>] [--no-enqueue-embeddings] [--dry-run] [--json]` —
+  structured sync: discovery → scan → immutable raw snapshot → parse →
+  транзакции диалогов → search_documents → embedding jobs (только при
+  active embedding space; сам OpenAI не вызывается). Лог событий — JSON
+  lines в stderr;
+- `baka status [--json]` — сводка архива (§17.2);
+- `baka validate [--json]` — проверка инвариантов (§17.3): orphan raw,
+  missing/hash mismatch raw, dialogue без current / current не ready,
+  duplicate identity keys, sequence collisions, search_document не из
+  current revision, unknown schema version;
 - `baka discover [--json]` — обнаруженные harness installations и source roots
   (переопределение путей — `BAKA_SOURCES__<SLUG>`, см. `.env.example`);
 - `baka archive:init`, `baka db up/down/status/migrate/preflight/logs`,
