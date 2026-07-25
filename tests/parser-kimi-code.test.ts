@@ -12,6 +12,7 @@ const FIXTURES = "tests/fixtures/kimi-code";
 const BASIC = join(FIXTURES, "basic/session_11111111-aaaa-4bbb-8ccc-111111111111");
 const TOOLS = join(FIXTURES, "tools-and-subagent/session_22222222-bbbb-4ccc-8ddd-222222222222");
 const UNKNOWN = join(FIXTURES, "unknown-truncated/session_33333333-cccc-4ddd-8eee-333333333333");
+const UNKNOWN_ORIGIN = join(FIXTURES, "unknown-origin/session_44444444-dddd-4eee-8fff-444444444444");
 
 async function parseSession(
   path: string,
@@ -25,7 +26,7 @@ async function parseSession(
 describe("kimi-code parser: basic", () => {
   test("метаданные диалога из state.json и parser version", async () => {
     expect(kimiCodeParser.parserName).toBe("kimi-code");
-    expect(KIMI_CODE_PARSER_VERSION).toBe(1);
+    expect(KIMI_CODE_PARSER_VERSION).toBe(2);
     const { dialogue } = await parseSession(BASIC);
     expect(dialogue.externalId).toBe("session_11111111-aaaa-4bbb-8ccc-111111111111");
     expect(dialogue.title).toContain("кэша");
@@ -143,6 +144,27 @@ describe("kimi-code parser: tools-and-subagent", () => {
     // Накопительные значения turn'а из usage.record.
     expect(turnEvent.inputTokens).toBe(3800 + 17600 + 500);
     expect(turnEvent.cachedInputTokens).toBe(17600);
+  });
+});
+
+describe("kimi-code parser: unknown-origin", () => {
+  test("turn.prompt без origin → humanAuthored unknown, промпт не теряется", async () => {
+    const { dialogue } = await parseSession(UNKNOWN_ORIGIN);
+    const users = dialogue.messages.filter((m) => m.role === "user");
+    expect(users).toHaveLength(2);
+    expect(users[0]!.humanAuthored).toBe(true);
+    expect(users[1]!.humanAuthored).toBe("unknown");
+    expect(users[1]!.visibleToUser).toBe("unknown");
+    expect(users[1]!.chunks[0]!.content).toBe("Второй вопрос без origin в wire");
+  });
+
+  test("неизвестная raw role → role unknown, исходная роль в rawRole", async () => {
+    const { dialogue } = await parseSession(UNKNOWN_ORIGIN);
+    const critic = dialogue.messages.find((m) => m.rawRole === "critic")!;
+    expect(critic.role).toBe("unknown");
+    expect(critic.humanAuthored).toBe(false);
+    expect(critic.chunks[0]!.kind).toBe("text");
+    expect(critic.chunks[0]!.content).toContain("рецензента");
   });
 });
 

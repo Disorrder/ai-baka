@@ -46,6 +46,17 @@ describe("codex extractors", () => {
     // Reasoning/tool не попали в финальный ответ.
     expect(extracted.content).not.toContain("rg -n fetchOrder");
   });
+
+  test("final_answer предыдущего turn'а не подменяет ответ текущего (обрыв)", async () => {
+    const dialogue = await parseCodex("stale-final.jsonl");
+    const extracted = codexExtractors.extractAssistantFinal(dialogue.messages)!;
+    // Turn 1 завершён (phase final_answer), turn 2 оборвался после видимого
+    // текста: extractor обязан вернуть текст ТЕКУЩЕГО turn'а, а не старый
+    // marked final.
+    expect(extracted.extractionMethod).toBe("fallback_visible_assistant_text");
+    expect(extracted.content).toBe("Частичный ответ на второй вопрос: вызов в src/cli.ts");
+    expect(extracted.content).not.toContain("Ответ на первый вопрос");
+  });
 });
 
 describe("kimi-code extractors", () => {
@@ -91,5 +102,23 @@ describe("kimi-code extractors", () => {
     // Текст субагента не попал в финальный ответ основного диалога
     // (его реплика отличается формулировкой "таймер держит ссылку").
     expect(extracted.content).not.toContain("таймер держит ссылку");
+  });
+
+  test("промпт без origin.kind: fallback + граница turn'а", async () => {
+    const dialogue = await parseKimi(
+      "unknown-origin/session_44444444-dddd-4eee-8fff-444444444444",
+    );
+    const users = dialogue.messages.filter((m) => m.role === "user");
+    expect(users).toHaveLength(2);
+    expect(users[0]!.humanAuthored).toBe(true);
+    expect(users[1]!.humanAuthored).toBe("unknown");
+    const prompt = kimiCodeExtractors.extractUserPrompt(users[1]!)!;
+    expect(prompt.extractionMethod).toBe("fallback_visible_user_text");
+    expect(prompt.content).toBe("Второй вопрос без origin в wire");
+    // Unknown-промпт — граница turn'а: ответ первого turn'а не склеивается.
+    const final = kimiCodeExtractors.extractAssistantFinal(dialogue.messages)!;
+    expect(final.extractionMethod).toBe("fallback_visible_assistant_text");
+    expect(final.content).toBe("Ответ на второй вопрос.");
+    expect(final.content).not.toContain("Ответ на первый вопрос");
   });
 });

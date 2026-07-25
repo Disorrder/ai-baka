@@ -62,7 +62,7 @@ import {
 import { normalizeModelName } from "../shared/model-normalization.ts";
 
 export const QWEN_CODE_PARSER_NAME = "qwen-code";
-export const QWEN_CODE_PARSER_VERSION = 1;
+export const QWEN_CODE_PARSER_VERSION = 2;
 
 /** Операционные system-subtypes: не сообщения, только счётчики. */
 const OPERATIONAL_SYSTEM_SUBTYPES = new Set([
@@ -410,7 +410,7 @@ class DialogueBuilder {
     return this.chunk({
       kind: "unknown",
       rawKind: keys,
-      content: JSON.stringify(part ?? null).slice(0, 4000),
+      content: JSON.stringify(part ?? null),
       rawEventType,
       sourceLocator: locator,
       metadata: {},
@@ -444,7 +444,7 @@ class DialogueBuilder {
         this.chunk({
           kind: "unknown",
           rawKind: rawEventType,
-          content: JSON.stringify(record).slice(0, 4000),
+          content: JSON.stringify(record),
           rawEventType,
           sourceLocator: locator,
           metadata: {},

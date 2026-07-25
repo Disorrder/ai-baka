@@ -53,7 +53,7 @@ import { normalizeModelName } from "../shared/model-normalization.ts";
 import { isSqliteFile } from "../shared/sqlite.ts";
 
 export const CODEX_PARSER_NAME = "codex";
-export const CODEX_PARSER_VERSION = 1;
+export const CODEX_PARSER_VERSION = 2;
 
 /** Операционные event_msg/верхние типы: не сообщения, только счётчики. */
 const OPERATIONAL_EVENT_TYPES = new Set([
@@ -672,7 +672,7 @@ class DialogueBuilder {
         this.chunk({
           kind: "unknown",
           rawKind: rawEventType,
-          content: JSON.stringify(payload).slice(0, 4000),
+          content: JSON.stringify(payload),
           rawEventType,
           sourceLocator: locator,
           metadata: {},

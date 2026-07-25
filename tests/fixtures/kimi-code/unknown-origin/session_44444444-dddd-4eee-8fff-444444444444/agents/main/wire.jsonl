@@ -1,0 +1,11 @@
+{"type":"metadata","protocol_version":"1.4","created_at":1783700000000}
+{"type":"turn.prompt","input":[{"type":"text","text":"Первый вопрос: что делает parseConfig?"}],"origin":{"kind":"user"},"time":1783700001000}
+{"type":"llm.request","kind":"loop","provider":"kimi","model":"k3","modelAlias":"kimi-code/k3","thinkingEffort":"low","messageCount":1,"time":1783700001001}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"u-step-1","turnId":"1","step":1},"time":1783700001002}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"u-part-1","turnId":"1","step":1,"stepUuid":"u-step-1","part":{"type":"text","text":"Ответ на первый вопрос: parseConfig читает TOML."}},"time":1783700001500}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"u-step-end-1","turnId":"1","step":1,"usage":{"inputOther":100,"output":20,"inputCacheRead":0,"inputCacheCreation":0},"finishReason":"stop","messageId":"chatcmpl-fixture6"},"time":1783700001600}
+{"type":"turn.prompt","input":[{"type":"text","text":"Второй вопрос без origin в wire"}],"time":1783700002000}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"u-step-2","turnId":"2","step":1},"time":1783700002001}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"u-part-2","turnId":"2","step":1,"stepUuid":"u-step-2","part":{"type":"text","text":"Ответ на второй вопрос."}},"time":1783700002500}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"u-step-end-2","turnId":"2","step":1,"usage":{"inputOther":110,"output":10,"inputCacheRead":0,"inputCacheCreation":0},"finishReason":"stop","messageId":"chatcmpl-fixture7"},"time":1783700002600}
+{"type":"context.append_message","message":{"role":"critic","content":[{"type":"text","text":"Замечание стороннего рецензента."}]},"time":1783700003000}

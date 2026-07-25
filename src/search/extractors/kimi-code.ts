@@ -11,8 +11,10 @@
  * assistant_final:
  * Явных final markers у kimi-code wire нет → fallback по §8.3:
  * все text-чанки assistant-сообщений ПОСЛЕДНЕГО turn'а основного агента
- * (после последнего human-authored user message), в исходном порядке —
- * включая текст до и после tool activity (§8.3 п.5). Без think/tool.
+ * (после последнего user message, дающего промпт, — включая промпт с
+ * humanAuthored "unknown", прошедший fallback: он тоже граница turn'а),
+ * в исходном порядке — включая текст до и после tool activity (§8.3 п.5).
+ * Без think/tool.
  * Сообщения субагентов (metadata.subagentId) в финальный ответ основного
  * диалога не входят: их вывод свёрнут в tool result основного агента.
  * Метод фиксируется как fallback_visible_assistant_text.
@@ -24,6 +26,7 @@ import {
   FALLBACK_ASSISTANT_FINAL_METHOD,
   FALLBACK_USER_PROMPT_METHOD,
   collectTextChunks,
+  findLastTurnBoundary,
   type ExtractedDocument,
   type HarnessExtractors,
 } from "./types.ts";
@@ -54,15 +57,9 @@ export const kimiCodeExtractors: HarnessExtractors = {
   },
 
   extractAssistantFinal(messages: readonly ParsedMessage[]): ExtractedDocument | undefined {
-    // Граница последнего turn'а: последний human-authored user message.
-    let boundary = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i]!;
-      if (message.role === "user" && message.humanAuthored === true) {
-        boundary = i;
-        break;
-      }
-    }
+    // Граница последнего turn'а: последний user message, дающий промпт
+    // (human-authored или unknown, прошедший fallback).
+    const boundary = findLastTurnBoundary(messages, (m) => this.extractUserPrompt(m));
 
     const candidates = messages.filter(
       (message, index) =>

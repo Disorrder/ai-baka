@@ -256,6 +256,9 @@ export const unknownAndEmpty: CursorFixtureSpec = {
             type: 99,
             bubbleId: "b-unknown-0002",
             hologramPayload: { rendered: true },
+            // Длинное поле: unknown chunk должен сохранять событие ПОЛНОСТЬЮ
+            // (§7.3), без обрезки на 4000 символов.
+            padding: `${"x".repeat(4400)}TAIL_MARKER_UNKNOWN_BUBBLE`,
           },
         },
         // Пустое сообщение: text === "", без toolFormerData.
@@ -263,6 +266,36 @@ export const unknownAndEmpty: CursorFixtureSpec = {
         {
           bubbleId: "b-asst-0004",
           value: assistantBubble("b-asst-0004", "Вот список заметок: первая, вторая."),
+        },
+      ],
+    },
+  ],
+};
+
+/**
+ * Bubble с reasoning (allThinkingBlocks) и обычным видимым text в одном
+ * сообщении: text-чанк остаётся видимым, финальный ответ не теряется.
+ */
+export const reasoningAndTextDialogue: CursorFixtureSpec = {
+  composers: [
+    {
+      composerId: COMPOSER_BASIC,
+      composerData: composerDataSpec({
+        composerId: COMPOSER_BASIC,
+        name: "Reasoning и видимый текст",
+        createdAt: T0,
+        bubbleRefs: [
+          { bubbleId: "b-user-0001", type: 1 },
+          { bubbleId: "b-asst-0002", type: 2 },
+        ],
+      }),
+      bubbles: [
+        { bubbleId: "b-user-0001", value: userBubble("b-user-0001", "Объясни работу кэша") },
+        {
+          bubbleId: "b-asst-0002",
+          value: assistantBubble("b-asst-0002", "Кэш устроен как in-memory Map с TTL.", {
+            allThinkingBlocks: [{ text: "Сначала вспомню устройство кэша." }],
+          }),
         },
       ],
     },

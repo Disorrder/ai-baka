@@ -13,9 +13,11 @@
  * Явных final markers у qwen-code chat JSONL нет (usageMetadata и
  * ui_telemetry — не маркеры конца ответа) → fallback по §8.3:
  * все text-чанки видимых assistant-сообщений ПОСЛЕДНЕГО turn'а (после
- * последнего human-authored user message, включая mid_turn), в исходном
- * порядке — текст до и после tool activity сохраняется (§8.3 п.5).
- * Без thought/tool_call/tool_result. Метод — fallback_visible_assistant_text.
+ * последнего user message, дающего промпт, — включая mid_turn и промпт с
+ * humanAuthored "unknown", прошедший fallback: он тоже граница turn'а,
+ * иначе ответы склеиваются), в исходном порядке — текст до и после
+ * tool activity сохраняется (§8.3 п.5). Без thought/tool_call/tool_result.
+ * Метод — fallback_visible_assistant_text.
  */
 
 import type { ParsedMessage } from "../../domain/canonical-types.ts";
@@ -24,6 +26,7 @@ import {
   FALLBACK_ASSISTANT_FINAL_METHOD,
   FALLBACK_USER_PROMPT_METHOD,
   collectTextChunks,
+  findLastTurnBoundary,
   type ExtractedDocument,
   type HarnessExtractors,
 } from "./types.ts";
@@ -51,15 +54,9 @@ export const qwenCodeExtractors: HarnessExtractors = {
   },
 
   extractAssistantFinal(messages: readonly ParsedMessage[]): ExtractedDocument | undefined {
-    // Граница последнего turn'а: последний human-authored user message.
-    let boundary = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i]!;
-      if (message.role === "user" && message.humanAuthored === true) {
-        boundary = i;
-        break;
-      }
-    }
+    // Граница последнего turn'а: последний user message, дающий промпт
+    // (human-authored или unknown, прошедший fallback).
+    const boundary = findLastTurnBoundary(messages, (m) => this.extractUserPrompt(m));
 
     const contentParts: string[] = [];
     const sourceChunks: ExtractedDocument["sourceChunks"] = [];

@@ -12,6 +12,7 @@ const FIXTURES = "tests/fixtures/claude-desktop";
 const BASIC_DIR = join(FIXTURES, "basic/local_11111111-1111-4111-8111-111111111111");
 const BASIC = join(BASIC_DIR, "audit.jsonl");
 const TOOLS = join(FIXTURES, "tools-sidechain/local_22222222-2222-4222-8222-222222222222/audit.jsonl");
+const STREAMING = join(FIXTURES, "streaming/local_55555555-5555-4555-8555-555555555555/audit.jsonl");
 const UNKNOWN = join(FIXTURES, "unknown-truncated/local_33333333-3333-4333-8333-333333333333/audit.jsonl");
 const METADATA_ONLY = join(FIXTURES, "metadata-only/local_44444444-4444-4444-8444-444444444444.json");
 const LEVELDB = join(FIXTURES, "leveldb/000005.ldb");
@@ -28,7 +29,7 @@ async function parseSession(
 describe("claude-desktop parser: basic", () => {
   test("метаданные диалога из local_*.json и parser version", async () => {
     expect(claudeDesktopParser.parserName).toBe("claude-desktop");
-    expect(CLAUDE_DESKTOP_PARSER_VERSION).toBe(1);
+    expect(CLAUDE_DESKTOP_PARSER_VERSION).toBe(2);
     const { dialogue } = await parseSession(BASIC);
     expect(dialogue.externalId).toBe("local_11111111-1111-4111-8111-111111111111");
     expect(dialogue.title).toBe("VACUUM INTO и копирование SQLite");
@@ -96,6 +97,29 @@ describe("claude-desktop parser: basic", () => {
     const { dialogue } = await parseSession(BASIC_DIR);
     expect(dialogue.externalId).toBe("local_11111111-1111-4111-8111-111111111111");
     expect(dialogue.messages.length).toBeGreaterThan(0);
+  });
+});
+
+describe("claude-desktop parser: streaming", () => {
+  test("записи одного message.id склеиваются, usage не задваивается", async () => {
+    const { dialogue } = await parseSession(STREAMING);
+    const assistants = dialogue.messages.filter((m) => m.role === "assistant");
+    expect(assistants).toHaveLength(1);
+    const assistant = assistants[0]!;
+    expect(assistant.chunks.map((c) => c.kind)).toEqual(["thought", "text"]);
+    expect(assistant.chunks.map((c) => c.sequence)).toEqual([0, 1]);
+    // Первая запись стриминга без text была невидимой; после склейки — видима.
+    expect(assistant.visibleToUser).toBe(true);
+    expect(assistant.metadata.stopReason).toBe("end_turn");
+    // usage повторялся в обеих записях — засчитан один раз (+ turn от result).
+    expect(assistant.usageEvents.map((e) => e.scope).sort()).toEqual(["request", "turn"]);
+    const counts = dialogue.metadata.eventCounts as Record<string, number>;
+    expect(counts["usage.deduped"]).toBe(1);
+    const usage = normalizeUsageEvents(assistant.usageEvents)!;
+    expect(usage.inputTokens).toBe(2520); // 20 + 500 + 2000, один раз
+    expect(usage.cachedInputTokens).toBe(2000);
+    // result-событие привязалось к склеенному сообщению.
+    expect(assistant.metadata.turnResult).toMatchObject({ subtype: "success" });
   });
 });
 

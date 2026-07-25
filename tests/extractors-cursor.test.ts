@@ -6,6 +6,7 @@ import type { ParsedDialogue } from "../src/domain/canonical-types.ts";
 import { makeCursorDb, type CursorFixtureDb } from "./fixtures/cursor/make-db.ts";
 import {
   basicDialogue,
+  reasoningAndTextDialogue,
   toolCallsDialogue,
   unknownAndEmpty,
   type CursorFixtureSpec,
@@ -68,6 +69,14 @@ describe("cursor extractors: assistant_final", () => {
     // Tool call/result не попали.
     expect(extracted.content).not.toContain("grep_search");
     expect(extracted.sourceChunks).toHaveLength(3);
+  });
+
+  test("bubble с reasoning + text: видимый text попадает в assistant_final", async () => {
+    const dialogue = await parseFixture(reasoningAndTextDialogue);
+    const extracted = cursorExtractors.extractAssistantFinal(dialogue.messages)!;
+    expect(extracted.extractionMethod).toBe("fallback_visible_assistant_text");
+    expect(extracted.content).toBe("Кэш устроен как in-memory Map с TTL.");
+    expect(extracted.content).not.toContain("вспомню устройство кэша");
   });
 
   test("пустое assistant message не даёт пустой документ", async () => {

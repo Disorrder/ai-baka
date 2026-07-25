@@ -84,6 +84,14 @@ describe("qwen-code extractors: assistant_final", () => {
     expect(extracted.content).toContain("Сначала поищу вызовы");
   });
 
+  test("unknown user prompt — граница turn'а: ответы не склеиваются", async () => {
+    const dialogue = await parseChat("unknown-turn-boundary.jsonl");
+    const extracted = qwenCodeExtractors.extractAssistantFinal(dialogue.messages)!;
+    expect(extracted.extractionMethod).toBe("fallback_visible_assistant_text");
+    expect(extracted.content).toBe("Ответ на второй вопрос.");
+    expect(extracted.content).not.toContain("Ответ на первый вопрос");
+  });
+
   test("sidechain: видимых assistant-сообщений нет → undefined", async () => {
     const dialogue = await parseChat("subagent.jsonl");
     expect(qwenCodeExtractors.extractAssistantFinal(dialogue.messages)).toBeUndefined();

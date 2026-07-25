@@ -1,0 +1,8 @@
+{"timestamp":"2026-07-02T10:00:00.000Z","type":"session_meta","payload":{"id":"55555555-2222-4333-8444-555555555555","timestamp":"2026-07-02T10:00:00.000Z","cwd":"/Users/example/projects/demo-app","originator":"codex_cli_rs","cli_version":"0.50.0","source":"cli","model_provider":"openai"}}
+{"timestamp":"2026-07-02T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Первый вопрос: что делает parseConfig?"}]}}
+{"timestamp":"2026-07-02T10:00:01.100Z","type":"event_msg","payload":{"type":"user_message","message":"Первый вопрос: что делает parseConfig?","images":[],"local_images":[]}}
+{"timestamp":"2026-07-02T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Ответ на первый вопрос: parseConfig читает TOML."}]}}
+{"timestamp":"2026-07-02T10:00:03.100Z","type":"event_msg","payload":{"type":"agent_message","message":"Ответ на первый вопрос: parseConfig читает TOML.","phase":"final_answer"}}
+{"timestamp":"2026-07-02T10:01:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Второй вопрос: а где она вызывается?"}]}}
+{"timestamp":"2026-07-02T10:01:00.100Z","type":"event_msg","payload":{"type":"user_message","message":"Второй вопрос: а где она вызывается?","images":[],"local_images":[]}}
+{"timestamp":"2026-07-02T10:01:05.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Частичный ответ на второй вопрос: вызов в src/cli.ts"}]}}

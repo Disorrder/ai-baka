@@ -66,7 +66,7 @@ import { normalizeModelName } from "../shared/model-normalization.ts";
 import { isSqliteFile } from "../shared/sqlite.ts";
 
 export const CURSOR_PARSER_NAME = "cursor";
-export const CURSOR_PARSER_VERSION = 1;
+export const CURSOR_PARSER_VERSION = 2;
 
 /** Операционные префиксы cursorDiskKV: не сообщения, только счётчики. */
 const OPERATIONAL_KEY_PREFIXES = [
@@ -428,7 +428,7 @@ function buildDialogue(
             chunkOf({
               kind: "unknown",
               rawKind: "unparseable_bubble",
-              content: text.slice(0, 4000),
+              content: text,
               rawEventType: "bubble_parse_error",
               sourceLocator: locator,
               metadata: {},
@@ -655,7 +655,9 @@ function bubbleToMessages(
       role: "assistant",
       rawRole: "assistant",
       humanAuthored: false,
-      visibleToUser: !isThought && thoughtBlocks.length === 0,
+      // Thinking blocks не отменяют видимость: text-чанк того же bubble
+      // показывается пользователю (иначе финальный ответ теряется, §8.3).
+      visibleToUser: !isThought,
       chunks,
       model,
       metadata: baseMetadata,
@@ -682,7 +684,7 @@ function bubbleToMessages(
         chunkOf({
           kind: "unknown",
           rawKind: `bubble_type_${String(type)}`,
-          content: JSON.stringify(bubble).slice(0, 4000),
+          content: JSON.stringify(bubble),
           rawEventType: `bubble.type.${String(type)}`,
           sourceLocator: locator,
           metadata: {},

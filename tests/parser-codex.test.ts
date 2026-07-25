@@ -24,7 +24,7 @@ async function parseFixture(
 describe("codex parser: basic-dialogue", () => {
   test("метаданные диалога и parser version", async () => {
     expect(codexParser.parserName).toBe("codex");
-    expect(CODEX_PARSER_VERSION).toBe(1);
+    expect(CODEX_PARSER_VERSION).toBe(2);
     const { dialogue } = await parseFixture("basic-dialogue.jsonl");
     expect(dialogue.externalId).toBe("11111111-2222-4333-8444-555555555555");
     expect(dialogue.workspace?.path).toBe("/Users/example/projects/demo-app");

@@ -19,6 +19,7 @@ import {
   basicDialogue,
   corrupted,
   multiDialogue,
+  reasoningAndTextDialogue,
   toolCallsDialogue,
   unknownAndEmpty,
   type CursorFixtureSpec,
@@ -46,7 +47,7 @@ async function parseFixture(
 describe("cursor parser: basic-dialogue", () => {
   test("метаданные диалога, workspace из composerHeaders, parser version", async () => {
     expect(cursorParser.parserName).toBe("cursor");
-    expect(CURSOR_PARSER_VERSION).toBe(1);
+    expect(CURSOR_PARSER_VERSION).toBe(2);
     const { snapshot, dialogues } = await parseFixture(basicDialogue);
     expect(snapshot.sourceKind).toBe("sqlite");
     expect(dialogues).toHaveLength(1);
@@ -162,6 +163,17 @@ describe("cursor parser: tool-calls", () => {
   });
 });
 
+describe("cursor parser: reasoning-and-text", () => {
+  test("bubble с thinking blocks + text: text-чанк остаётся видимым", async () => {
+    const { dialogues } = await parseFixture(reasoningAndTextDialogue);
+    const assistant = dialogues[0]!.messages.find((m) => m.role === "assistant")!;
+    expect(assistant.chunks.map((c) => c.kind)).toEqual(["thought", "text"]);
+    expect(assistant.chunks[1]!.content).toBe("Кэш устроен как in-memory Map с TTL.");
+    // Наличие thought-чанка не делает сообщение невидимым (§8.3).
+    expect(assistant.visibleToUser).toBe(true);
+  });
+});
+
 describe("cursor parser: multi-dialogue", () => {
   test("несколько диалогов в одном snapshot, старый формат conversation, workspaceHint fallback", async () => {
     const { dialogues } = await parseFixture(multiDialogue, "/Users/example/projects/legacy-app");
@@ -186,6 +198,9 @@ describe("cursor parser: unknown-and-empty", () => {
     expect(unknown.role).toBe("unknown");
     expect(unknown.chunks[0]!.rawEventType).toBe("bubble.type.99");
     expect(unknown.chunks[0]!.content).toContain("hologramPayload");
+    // Событие сохранено полностью, без обрезки на 4000 символов (§7.3).
+    expect(unknown.chunks[0]!.content!.length).toBeGreaterThan(4000);
+    expect(unknown.chunks[0]!.content).toContain("TAIL_MARKER_UNKNOWN_BUBBLE");
     expect(snapshot.diagnostics.some((d) => d.code === "unknown_event")).toBe(true);
     // Диалог не потерян: user prompt и финальный ответ на месте.
     expect(dialogue.messages.some((m) => m.role === "user")).toBe(true);

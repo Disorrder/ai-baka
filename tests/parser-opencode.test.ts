@@ -37,7 +37,7 @@ async function parseFixture(
 describe("opencode parser: basic", () => {
   test("метаданные диалога и parser version", async () => {
     expect(openCodeParser.parserName).toBe("opencode");
-    expect(OPENCODE_PARSER_VERSION).toBe(1);
+    expect(OPENCODE_PARSER_VERSION).toBe(2);
     const { dialogues, diagnostics } = await parseFixture("basic");
     expect(diagnostics).toHaveLength(0);
     expect(dialogues).toHaveLength(1);

@@ -10,8 +10,11 @@
  *
  * assistant_final:
  * - явный marker: последнее assistant message с metadata.phase ===
- *   "final_answer" (event_msg/agent_message) → codex_final_answer_phase;
- * - иначе последнее видимое assistant message → fallback.
+ *   "final_answer" (event_msg/agent_message) ПОСЛЕДНЕГО turn'а (после
+ *   последнего user message, дающего промпт) → codex_final_answer_phase;
+ *   marker предыдущего turn'а не подходит: если текущий turn оборвался,
+ *   старый final_answer не должен выдаваться за ответ на новый промпт;
+ * - иначе последнее видимое assistant message текущего turn'а → fallback.
  */
 
 import type { ParsedMessage } from "../../domain/canonical-types.ts";
@@ -20,6 +23,7 @@ import {
   FALLBACK_ASSISTANT_FINAL_METHOD,
   FALLBACK_USER_PROMPT_METHOD,
   collectTextChunks,
+  findLastTurnBoundary,
   type ExtractedDocument,
   type HarnessExtractors,
 } from "./types.ts";
@@ -57,8 +61,13 @@ export const codexExtractors: HarnessExtractors = {
   },
 
   extractAssistantFinal(messages: readonly ParsedMessage[]): ExtractedDocument | undefined {
+    // Граница последнего turn'а: final_answer предыдущих turn'ов не
+    // рассматривается — иначе при обрыве текущего turn'а extractor вернул
+    // бы ответ на ПРЕДЫДУЩИЙ промпт.
+    const boundary = findLastTurnBoundary(messages, (m) => this.extractUserPrompt(m));
     const assistants = messages.filter(
-      (message) => message.role === "assistant" && message.visibleToUser !== false,
+      (message, index) =>
+        index > boundary && message.role === "assistant" && message.visibleToUser !== false,
     );
 
     // Явный final marker harness'а (§8.3 п.1).

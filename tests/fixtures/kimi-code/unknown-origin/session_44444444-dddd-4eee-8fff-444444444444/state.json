@@ -1,0 +1,11 @@
+{
+  "createdAt": "2026-07-13T20:00:00.000Z",
+  "updatedAt": "2026-07-13T20:05:00.000Z",
+  "title": "Промпт без origin",
+  "isCustomTitle": false,
+  "agents": {
+    "main": { "homedir": "agents/main", "type": "main", "parentAgentId": null }
+  },
+  "custom": {},
+  "workDir": "/Users/example/projects/demo-app"
+}

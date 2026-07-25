@@ -69,7 +69,7 @@ import { normalizeModelName } from "../shared/model-normalization.ts";
 import { isSqliteFile } from "../shared/sqlite.ts";
 
 export const OPENCODE_PARSER_NAME = "opencode";
-export const OPENCODE_PARSER_VERSION = 1;
+export const OPENCODE_PARSER_VERSION = 2;
 
 /** Part types, которые не становятся чанками (операционные маркеры шага). */
 const OPERATIONAL_PART_TYPES = new Set(["step-start", "step-finish"]);
@@ -334,7 +334,7 @@ function buildMessage(
           sequence: 0,
           kind: "unknown",
           rawKind: "message",
-          content: row.data.slice(0, 4000),
+          content: row.data,
           rawEventType: "message_data_parse_error",
           sourceLocator: locator,
           metadata: {},
@@ -433,7 +433,7 @@ function buildPartChunks(
         sequence: -1,
         kind: "unknown",
         rawKind: "part",
-        content: part.data.slice(0, 4000),
+        content: part.data,
         rawEventType: "part_data_parse_error",
         sourceLocator: locator,
         metadata: {},
@@ -576,7 +576,7 @@ function buildPartChunks(
           ...base,
           kind: "unknown",
           rawKind: type,
-          content: JSON.stringify(data).slice(0, 4000),
+          content: JSON.stringify(data),
           rawEventType: type,
           metadata: {},
         },

@@ -14,7 +14,7 @@
 import type { ParsedMessage } from "../../domain/canonical-types.ts";
 
 /** Версия логики извлечения (search_document.extraction_version). */
-export const EXTRACTOR_VERSION = 1;
+export const EXTRACTOR_VERSION = 2;
 
 export interface ExtractedDocument {
   content: string;
@@ -57,3 +57,25 @@ export function collectTextChunks(
 
 export const FALLBACK_USER_PROMPT_METHOD = "fallback_visible_user_text";
 export const FALLBACK_ASSISTANT_FINAL_METHOD = "fallback_visible_assistant_text";
+
+/**
+ * Граница последнего turn'а: индекс последнего user message, дающего
+ * промпт — human-authored ИЛИ humanAuthored "unknown", прошедший
+ * harness-specific fallback (§8.2). Unknown-промпт тоже разделяет turn'ы:
+ * иначе assistant_final склеивает ответы разных turn'ов. -1, если границы
+ * нет (тогда рассматривается весь диалог).
+ */
+export function findLastTurnBoundary(
+  messages: readonly ParsedMessage[],
+  extractUserPrompt: (message: ParsedMessage) => ExtractedDocument | undefined,
+): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!;
+    if (message.role !== "user") continue;
+    if (message.humanAuthored === true) return i;
+    if (message.humanAuthored === "unknown" && extractUserPrompt(message) !== undefined) {
+      return i;
+    }
+  }
+  return -1;
+}

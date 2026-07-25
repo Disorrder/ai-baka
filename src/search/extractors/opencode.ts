@@ -13,8 +13,10 @@
  *   (у opencode finish: stop | tool-calls; «stop» = итоговый ответ,
  *   дальше tool activity нет);
  * - собираются ВСЕ text-чанки assistant-сообщений после последнего
- *   human-authored user message — включая текст до/после tool activity
- *   (§8.3 п.5: в opencode весь text показывается пользователю);
+ *   user message, дающего промпт (human-authored или unknown, прошедший
+ *   fallback — он тоже граница turn'а, иначе ответы склеиваются) —
+ *   включая текст до/после tool activity (§8.3 п.5: в opencode весь text
+ *   показывается пользователю);
  * - reasoning (thought), tool_call/tool_result, object/attachment —
  *   не входят;
  * - если ни одного finish === "stop" в последнем turn'е нет (обрыв,
@@ -27,6 +29,7 @@ import {
   FALLBACK_ASSISTANT_FINAL_METHOD,
   FALLBACK_USER_PROMPT_METHOD,
   collectTextChunks,
+  findLastTurnBoundary,
   type ExtractedDocument,
   type HarnessExtractors,
 } from "./types.ts";
@@ -52,15 +55,9 @@ export const openCodeExtractors: HarnessExtractors = {
   },
 
   extractAssistantFinal(messages: readonly ParsedMessage[]): ExtractedDocument | undefined {
-    // Граница последнего turn'а: последний human-authored user message.
-    let boundary = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i]!;
-      if (message.role === "user" && message.humanAuthored === true) {
-        boundary = i;
-        break;
-      }
-    }
+    // Граница последнего turn'а: последний user message, дающий промпт
+    // (human-authored или unknown, прошедший fallback).
+    const boundary = findLastTurnBoundary(messages, (m) => this.extractUserPrompt(m));
 
     const candidates = messages.filter(
       (message, index) =>

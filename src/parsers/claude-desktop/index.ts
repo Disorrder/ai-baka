@@ -15,7 +15,11 @@
  * - user: message.content — строка (промпт человека, возможно с обёрткой
  *   <uploaded_files>) или массив блоков text / tool_result (tool_use_id);
  * - assistant: message{model,id,content[],stop_reason,usage}; блоки
- *   thinking(+signature) / text / tool_use(id,name,input,caller);
+ *   thinking(+signature) / text / tool_use(id,name,input,caller).
+ *   Одно API-сообщение стримится НЕСКОЛЬКИМИ строками с одним message.id:
+ *   строки склеиваются в одно ParsedMessage, request usage привязывается
+ *   один раз (иначе дубли текста и double-count usage — сценарий 18,
+ *   как в claude-code parser'е);
  *   usage в семантике Anthropic: input_tokens НЕ включает cache —
  *   inputTokens = input + cache_creation + cache_read (как в kimi-code);
  * - system/init: cwd, cliSessionId, model, permissionMode, версии;
@@ -62,7 +66,7 @@ import {
 import { normalizeModelName } from "../shared/model-normalization.ts";
 
 export const CLAUDE_DESKTOP_PARSER_NAME = "claude-desktop";
-export const CLAUDE_DESKTOP_PARSER_VERSION = 1;
+export const CLAUDE_DESKTOP_PARSER_VERSION = 2;
 
 /** Операционные subtype system/*: не сообщения, только счётчики. */
 const OPERATIONAL_SYSTEM_SUBTYPES = new Set([
@@ -220,6 +224,8 @@ class DialogueBuilder {
   /** session_id из user/assistant событий (без префикса local_). */
   private eventSessionId: string | undefined;
   private lastAssistant: ParsedMessage | undefined;
+  /** message.id (msg_*) уже получивших usage — дедупликация стриминга. */
+  private usageSeen = new Set<string>();
 
   constructor(
     private readonly layout: SessionLayout,
@@ -458,6 +464,32 @@ class DialogueBuilder {
 
     const model = asString(message.model);
     if (model) this.modelState.model = model;
+    const apiId = asString(message.id);
+
+    // Стриминг: несколько строк с одним message.id — одно API-сообщение.
+    // Склеиваем чанки в предыдущее сообщение с тем же id (как claude-code).
+    const existing = apiId !== undefined ? this.findAssistantByMessageId(apiId) : undefined;
+    const usage = asObject(message.usage);
+    if (existing) {
+      // sequence выставляем вручную с учётом уже добавленных чанков.
+      for (const chunk of chunks) {
+        chunk.sequence = existing.chunks.length;
+        existing.chunks.push(chunk);
+      }
+      // Видимость могла появиться с text-чанком продолжения стриминга.
+      if (!sidechain && chunks.some((c) => c.kind === "text")) {
+        existing.visibleToUser = true;
+      }
+      if (message.stop_reason != null) existing.metadata.stopReason = message.stop_reason;
+      if (timestamp && (!existing.timestamp || timestamp < existing.timestamp)) {
+        existing.timestamp = timestamp;
+      }
+      const event = this.requestUsageEvent(usage, apiId);
+      if (event) existing.usageEvents.push(event);
+      if (!sidechain) this.lastAssistant = existing;
+      return;
+    }
+
     const visible = chunks.some((c) => c.kind === "text");
     const parsed = this.pushMessage({
       externalId: asString(record.uuid),
@@ -469,19 +501,40 @@ class DialogueBuilder {
       model: this.modelInvocation(),
       chunks,
       metadata: {
-        ...(asString(message.id) !== undefined ? { messageId: asString(message.id) } : {}),
+        ...(apiId !== undefined ? { messageId: apiId } : {}),
         ...(message.stop_reason != null ? { stopReason: message.stop_reason } : {}),
         ...(sidechain ? { parentToolUseId } : {}),
       },
     });
 
-    const usage = asObject(message.usage);
-    if (usage) {
-      parsed.usageEvents.push(
-        anthropicUsageEvent(usage, "request", "claude-desktop.assistant.message.usage"),
-      );
-    }
+    const event = this.requestUsageEvent(usage, apiId);
+    if (event) parsed.usageEvents.push(event);
     if (!sidechain) this.lastAssistant = parsed;
+  }
+
+  /** usage одного API-сообщения, один раз на message.id (сценарий 18). */
+  private requestUsageEvent(
+    usage: Record<string, unknown> | undefined,
+    apiId: string | undefined,
+  ): ParsedUsageEvent | undefined {
+    if (!usage) return undefined;
+    if (apiId !== undefined) {
+      if (this.usageSeen.has(apiId)) {
+        this.count("usage.deduped");
+        return undefined;
+      }
+      this.usageSeen.add(apiId);
+    }
+    return anthropicUsageEvent(usage, "request", "claude-desktop.assistant.message.usage");
+  }
+
+  private findAssistantByMessageId(apiId: string): ParsedMessage | undefined {
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      const message = this.messages[i]!;
+      if (message.role !== "assistant") return undefined;
+      if (message.metadata.messageId === apiId) return message;
+    }
+    return undefined;
   }
 
   private systemEvent(
@@ -590,7 +643,7 @@ class DialogueBuilder {
       this.chunk({
         kind: "unknown",
         rawKind: rawEventType,
-        content: JSON.stringify(block).slice(0, 4000),
+        content: JSON.stringify(block),
         rawEventType,
         sourceLocator: locator,
         metadata: {},
@@ -625,7 +678,7 @@ class DialogueBuilder {
         this.chunk({
           kind: "unknown",
           rawKind: rawEventType,
-          content: JSON.stringify(record).slice(0, 4000),
+          content: JSON.stringify(record),
           rawEventType,
           sourceLocator: locator,
           metadata: {},

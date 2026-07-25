@@ -37,6 +37,7 @@ async function parseFixture(name: string): Promise<ParsedDialogue[]> {
 describe("opencode extractors: user_prompt", () => {
   test("обычный user prompt → opencode_user_message_text", async () => {
     expect(openCodeExtractors.harnessSlug).toBe("opencode");
+    expect(EXTRACTOR_VERSION).toBe(2);
     expect(openCodeExtractors.extractorVersion).toBe(EXTRACTOR_VERSION);
     const [dialogue] = await parseFixture("basic");
     const user = dialogue!.messages.find((m) => m.role === "user")!;
@@ -124,6 +125,15 @@ describe("opencode extractors: assistant_final", () => {
     expect(doc).toBeDefined();
     expect(doc!.extractionMethod).toBe(FALLBACK_ASSISTANT_FINAL_METHOD);
     expect(doc!.content).toContain("LRU");
+  });
+
+  test("unknown user prompt (SDK format) — граница turn'а: ответы не склеиваются", async () => {
+    const [dialogue] = await parseFixture("unknown-turn-boundary");
+    const doc = openCodeExtractors.extractAssistantFinal(dialogue!.messages);
+    expect(doc).toBeDefined();
+    expect(doc!.extractionMethod).toBe("opencode_finish_stop_text");
+    expect(doc!.content).toBe("Answer to the second question.");
+    expect(doc!.content).not.toContain("Answer to the first question");
   });
 
   test("диалог без assistant текста → undefined", async () => {

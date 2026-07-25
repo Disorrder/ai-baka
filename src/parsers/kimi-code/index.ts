@@ -17,7 +17,8 @@
  * - metadata: protocol_version, created_at;
  * - config.update: profileName/systemPrompt/modelAlias/thinkingEffort;
  * - turn.prompt / turn.steer: ввод user'а или системный триггер
- *   (origin.kind: user | system_trigger | background_task | subagent);
+ *   (origin.kind: user | system_trigger | background_task | subagent;
+ *   отсутствующий/новый kind → humanAuthored "unknown", §8.2);
  * - context.append_message: сообщение user'а (дублирует turn.prompt —
  *   дедуплицируется по тексту);
  * - context.append_loop_event: event.type ∈ step.begin | step.end |
@@ -66,7 +67,7 @@ import {
 import { normalizeModelName } from "../shared/model-normalization.ts";
 
 export const KIMI_CODE_PARSER_NAME = "kimi-code";
-export const KIMI_CODE_PARSER_VERSION = 1;
+export const KIMI_CODE_PARSER_VERSION = 2;
 
 const OPERATIONAL_TYPES = new Set([
   "metadata",
@@ -315,7 +316,7 @@ async function parseWireFile(
         chunkOf({
           kind: "unknown",
           rawKind: rawEventType,
-          content: JSON.stringify(payload ?? null).slice(0, 4000),
+          content: JSON.stringify(payload ?? null),
           rawEventType,
           sourceLocator: locator,
           metadata: {},
@@ -387,11 +388,12 @@ async function parseWireFile(
         const chunks = inputChunks(value.input, locator);
         const text = chunks.map((c) => c.content ?? "").join("\n");
         lastPromptText = text;
+        const human = humanAuthoredByOrigin(originKind);
         pushMessage({
           role: "user",
           rawRole: type,
-          humanAuthored: originKind === "user",
-          visibleToUser: originKind === "user",
+          humanAuthored: human,
+          visibleToUser: human,
           timestamp,
           chunks,
           metadata: {
@@ -415,11 +417,12 @@ async function parseWireFile(
           count("context.append_message.deduped");
           break;
         }
+        const human = role === "user" ? humanAuthoredByOrigin(originKind) : false;
         pushMessage({
-          role: role as NormalizedRole,
+          role: normalizeRole(role),
           rawRole: role,
-          humanAuthored: role === "user" ? originKind === "user" : false,
-          visibleToUser: role === "user" ? originKind === "user" : "unknown",
+          humanAuthored: human,
+          visibleToUser: role === "user" ? human : "unknown",
           timestamp,
           chunks,
           metadata: { origin: origin ?? {} },
@@ -467,7 +470,7 @@ async function parseWireFile(
                 chunkOf({
                   kind: "unknown",
                   rawKind: partType,
-                  content: JSON.stringify(part).slice(0, 4000),
+                  content: JSON.stringify(part),
                   rawEventType: `content.part.${partType}`,
                   sourceLocator: locator,
                   metadata: {},
@@ -663,6 +666,36 @@ function buildDialogue(
 }
 
 // --- usage mapping ---
+
+/** origin.kind, гарантированно НЕ набранные человеком. */
+const NON_USER_ORIGIN_KINDS = new Set(["system_trigger", "background_task", "subagent"]);
+
+/**
+ * origin.kind → humanAuthored (§8.2): "user" → true; известные системные
+ * → false; отсутствующий/новый kind → "unknown" — промпт неизвестного
+ * происхождения не теряется (extractor разберёт через fallback).
+ */
+function humanAuthoredByOrigin(originKind: string): boolean | "unknown" {
+  if (originKind === "user") return true;
+  return NON_USER_ORIGIN_KINDS.has(originKind) ? false : "unknown";
+}
+
+/**
+ * Raw role wire-сообщения → NormalizedRole. Неизвестная роль НЕ пропускается
+ * через cast: role = "unknown", исходная строка остаётся в rawRole (§7.3).
+ */
+function normalizeRole(role: string): NormalizedRole {
+  switch (role) {
+    case "user":
+    case "assistant":
+    case "system":
+    case "developer":
+    case "tool":
+      return role;
+    default:
+      return "unknown";
+  }
+}
 
 function mapUsageScope(scope: string | undefined): UsageScope {
   switch (scope) {

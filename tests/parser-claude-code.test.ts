@@ -21,7 +21,7 @@ async function parseFixture(
 describe("claude-code parser: basic-dialogue", () => {
   test("метаданные диалога и parser version", async () => {
     expect(claudeCodeParser.parserName).toBe("claude-code");
-    expect(CLAUDE_CODE_PARSER_VERSION).toBe(1);
+    expect(CLAUDE_CODE_PARSER_VERSION).toBe(2);
     const { dialogue } = await parseFixture("basic-dialogue.jsonl");
     expect(dialogue.externalId).toBe("aaaa1111-2222-4333-8444-555555555555");
     expect(dialogue.title).toBe("Разбор renderReport");
@@ -71,19 +71,22 @@ describe("claude-code parser: basic-dialogue", () => {
     expect(counts["usage.deduped"]).toBe(1);
   });
 
-  test("usage Anthropic: cache_read/creation — часть input, не double-count", async () => {
+  test("usage Anthropic: cache_read — часть input, cache creation — не cached", async () => {
     const { dialogue } = await parseFixture("basic-dialogue.jsonl");
     const assistant = dialogue.messages.find((m) => m.role === "assistant")!;
     const event = assistant.usageEvents[0]!;
     expect(event.scope).toBe("request");
     expect(event.source).toBe("claude-code.message.usage");
     expect(event.inputTokens).toBe(6000); // 1200 + 300 + 4500
-    expect(event.cachedInputTokens).toBe(4800); // 300 + 4500
+    // Единая семантика §7.3: cachedInputTokens = ТОЛЬКО cache read;
+    // cache creation (300) — запись в кэш, остаётся в raw события.
+    expect(event.cachedInputTokens).toBe(4500);
+    expect((event.raw as Record<string, unknown>).cache_creation_input_tokens).toBe(300);
     expect(event.outputTokens).toBe(80);
     const usage = normalizeUsageEvents(assistant.usageEvents)!;
     expect(usage.scope).toBe("request");
     expect(usage.inputTokens).toBe(6000);
-    expect(usage.cachedInputTokens).toBe(4800);
+    expect(usage.cachedInputTokens).toBe(4500);
     // Сценарий 19: cached не прибавляется повторно.
     expect(usage.totalTokensNormalized).toBe(6080);
   });
@@ -216,6 +219,19 @@ describe("claude-code parser: unknown-and-empty", () => {
       (m) => m.role === "assistant" && m.chunks.length === 0,
     );
     expect(empty).toBeDefined();
+  });
+});
+
+describe("claude-code parser: unknown-large", () => {
+  test("unknown chunk хранит событие полностью, без обрезки (§7.3)", async () => {
+    const { dialogue, diagnostics } = await parseFixture("unknown-large.jsonl");
+    const chunk = dialogue.messages
+      .flatMap((m) => m.chunks)
+      .find((c) => c.kind === "unknown")!;
+    expect(chunk.rawEventType).toBe("content.hologram");
+    expect(chunk.content!.length).toBeGreaterThan(4000);
+    expect(chunk.content).toContain("TAIL_MARKER_UNKNOWN_EVENT");
+    expect(diagnostics.some((d) => d.code === "unknown_event")).toBe(true);
   });
 });
 
