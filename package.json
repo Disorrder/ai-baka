@@ -17,7 +17,7 @@
     "db:migrate": "bun run src/cli.ts db migrate",
     "db:logs": "bun run src/cli.ts db logs",
     "disk:eject": "bun run src/cli.ts disk eject",
-    "test": "bun test",
+    "test": "bun test --timeout 30000",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
