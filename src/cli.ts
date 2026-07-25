@@ -15,6 +15,7 @@ import { applyMigrations, checkSchemaVersion } from "./db/migrations.ts";
 import { assertPreflight } from "./infra/preflight.ts";
 import { acquireLock } from "./infra/lock.ts";
 import { readSentinel } from "./infra/sentinel.ts";
+import { discoverSourceRoots } from "./sources/discovery/discovery.ts";
 
 const program = new Command();
 
@@ -48,6 +49,40 @@ program
       });
       console.log(`архив инициализирован: ${cfg.archiveRoot}`);
       console.log(`archiveId: ${sentinel.archiveId}`);
+    }),
+  );
+
+program
+  .command("discover")
+  .description("Обнаружить harness installations и source roots на этой машине")
+  .option("--json", "вывести результат в JSON")
+  .action(
+    handle(async (options: { json?: boolean }) => {
+      const cfg = loadConfig();
+      const report = await discoverSourceRoots({ overrides: cfg.sourceOverrides });
+      if (options.json) {
+        console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+      const rows = report.roots.map((r) => [
+        r.harness,
+        r.enabled ? "ok" : "нет",
+        r.sourceKind,
+        r.snapshotStrategy,
+        r.origin === "override" ? "*" : "",
+        r.path,
+      ]);
+      const header = ["harness", "статус", "kind", "strategy", "", "path"];
+      const widths = header.map((h, i) =>
+        Math.max(h.length, ...rows.map((r) => r[i]!.length)),
+      );
+      const line = (cols: string[]) =>
+        cols.map((c, i) => c.padEnd(widths[i]!)).join("  ").trimEnd();
+      console.log(line(header));
+      for (const row of rows) console.log(line(row));
+      console.log(
+        `\nнайдено: ${report.enabled.length}/${report.roots.length} roots (* — переопределено через BAKA_SOURCES__*)`,
+      );
     }),
   );
 

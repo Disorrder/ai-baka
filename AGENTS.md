@@ -2,10 +2,12 @@
 
 ## Статус проекта
 
-Репозиторий содержит только документацию. Код появится по этапам из
-[`docs/plan.md`](docs/plan.md) (раздел «Порядок реализации», этапы 0–12).
-Авторитетный источник требований — `docs/plan.md`; при расхождении кода
-с планом сначала сверяйся с ним.
+Реализованы этапы 0–3 из [`docs/plan.md`](docs/plan.md) (раздел «Порядок
+реализации»): инфраструктура, schema migrations, source snapshot layer
+(discovery `baka discover`, complete/partial scan, immutable raw snapshots,
+SQLite через `VACUUM INTO`, deletion/rename/reconcile-логика). Записи в БД
+из sync пока нет (этап 5). Авторитетный источник требований — `docs/plan.md`;
+при расхождении кода с планом сначала сверяйся с ним.
 
 ## Стек
 

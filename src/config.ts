@@ -1,3 +1,6 @@
+import { HARNESSES, HARNESS_ORDER, type HarnessSlug } from "./sources/adapters/harnesses.ts";
+import { parseSourceOverride } from "./sources/discovery/discovery.ts";
+
 export interface AppConfig {
   /** Корень архива (BAKA_ARCHIVE_ROOT). Обязателен. */
   archiveRoot: string;
@@ -10,6 +13,11 @@ export interface AppConfig {
   expectedArchiveId?: string;
   minFreeBytes: number;
   deletionConfirmations: number;
+  /**
+   * Переопределённые source roots (BAKA_SOURCES__<SLUG>, пути через запятую).
+   * Отсутствие ключа — используются дефолтные пути harness'а.
+   */
+  sourceOverrides: Partial<Record<HarnessSlug, string[]>>;
 }
 
 const DEFAULT_MIN_FREE_BYTES = 1024 * 1024 * 1024; // 1 GiB
@@ -27,6 +35,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!archiveRoot) {
     throw new ConfigError("BAKA_ARCHIVE_ROOT не задан (см. .env.example)");
   }
+  const home = env.HOME ?? process.env.HOME ?? "";
+  const sourceOverrides: Partial<Record<HarnessSlug, string[]>> = {};
+  for (const slug of HARNESS_ORDER) {
+    const raw = optional(env, HARNESSES[slug].envOverride);
+    if (raw) sourceOverrides[slug] = parseSourceOverride(raw, home);
+  }
   return {
     archiveRoot,
     surrealUrl: optional(env, "SURREAL_URL") ?? "ws://127.0.0.1:8901/rpc",
@@ -38,5 +52,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     minFreeBytes: Number(env.BAKA_MIN_FREE_BYTES) || DEFAULT_MIN_FREE_BYTES,
     deletionConfirmations:
       Number(env.BAKA_DELETION_CONFIRMATIONS) || DEFAULT_DELETION_CONFIRMATIONS,
+    sourceOverrides,
   };
 }

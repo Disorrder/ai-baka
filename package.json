@@ -9,6 +9,7 @@
   "scripts": {
     "baka": "bun run src/cli.ts",
     "archive:init": "bun run src/cli.ts archive:init",
+    "discover": "bun run src/cli.ts discover",
     "db:preflight": "bun run src/cli.ts db preflight",
     "db:up": "bun run src/cli.ts db up",
     "db:down": "bun run src/cli.ts db down",

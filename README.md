@@ -6,10 +6,20 @@
 с нуля: SurrealDB становится канонической моделью и индексом поверх неизменяемого
 raw-архива, а не местом, куда напрямую перекладываются прежние таблицы SQLite.
 
-**Статус:** этап 2 плана (schema migrations) завершён. Схема БД — миграции
+**Статус:** этап 3 плана (source snapshot layer) завершён: discovery
+(`baka discover`), scan со статусами complete/partial/unavailable, immutable
+raw snapshots (staging → SHA-256 → atomic rename, SQLite — через `VACUUM INTO`),
+orphan detection, чистая deletion/rename/reconcile-логика. Схема БД — миграции
 в [`schema/`](schema/) (применяются `bun run db:migrate`, runner —
 `src/db/migrations.ts`). Авторитетным источником требований остаётся
 [`docs/plan.md`](docs/plan.md).
+
+## CLI
+
+- `baka discover [--json]` — обнаруженные harness installations и source roots
+  (переопределение путей — `BAKA_SOURCES__<SLUG>`, см. `.env.example`);
+- `baka archive:init`, `baka db up/down/status/migrate/preflight/logs`,
+  `baka disk eject` — инфраструктура (см. `package.json` scripts).
 
 ## Что архивируется
 
