@@ -57,6 +57,7 @@ import {
   finishSyncRun,
   listActiveEmbeddingSpaces,
   listLocations,
+  resolveStaleIngestErrors,
   setLocationRenamedFrom,
   setLocationRevisions,
   updateLocationPresence,
@@ -431,7 +432,11 @@ async function processSourceRoot(
         syncRun: syncRunId,
         stage: "snapshot",
         errorCode: error instanceof SnapshotError ? "snapshot_failed" : "snapshot_exception",
-        errorMessage: error instanceof Error ? error.message : String(error),
+        // Путь в сообщении: иначе голое "unable to open database file"
+        // из bun:sqlite не привязано к источнику (live acceptance, этап 8).
+        errorMessage:
+          `${action.relativePath}: ` +
+          (error instanceof Error ? error.message : String(error)),
       });
       continue;
     }
@@ -487,6 +492,9 @@ async function processSourceRoot(
     embeddingTables: args.embeddingTables,
   };
 
+  /** Итоги re-parse по revision для bulk-разрешения старых ingest_errors. */
+  const parseResults = new Map<string, { revisionId: RecordId; status: string }>();
+
   const applyOutcomeToRevision = async (
     p: PendingParse,
     result: IngestOutcome,
@@ -497,11 +505,32 @@ async function processSourceRoot(
       dialoguesDiscovered,
       canonicalHash: result.canonicalHash,
     });
+    parseResults.set(p.revisionId.toString(), {
+      revisionId: p.revisionId,
+      status: result.status,
+    });
     const parsedOk = result.status === "parsed" || result.status === "partial";
     await setLocationRevisions(db, p.locationId, {
       currentRevision: p.revisionId,
       lastSuccessfulRevision: parsedOk ? p.revisionId : undefined,
     });
+  };
+
+  /**
+   * Re-parse (обычно после фикса parser'а) заменяет прежний результат:
+   * старые unresolved ingest_errors этих revision — исторические
+   * дубликаты, закрываем их батчами (§7.2 resolved_at/resolution).
+   */
+  const resolveStaleErrors = async () => {
+    const byStatus = new Map<string, RecordId[]>();
+    for (const { revisionId, status } of parseResults.values()) {
+      const list = byStatus.get(status) ?? [];
+      list.push(revisionId);
+      byStatus.set(status, list);
+    }
+    for (const [status, ids] of byStatus) {
+      await resolveStaleIngestErrors(db, ids, syncRunId, `reparse:${status}`);
+    }
   };
 
   /** Счётчики начисляются один раз за parse (а не за каждый файл сессии). */
@@ -593,6 +622,9 @@ async function processSourceRoot(
       }
     }
   }
+
+  // Разрешение старых ingest_errors по всем re-parse'нутым revision (батчи).
+  await resolveStaleErrors();
 
   // --- Phase D: presence (§10.6) + rename detection (§10.7) ---
   const scanComplete = scan.status === "complete";

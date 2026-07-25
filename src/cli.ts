@@ -80,7 +80,11 @@ function handle<A extends unknown[]>(
       await action(...args);
     } catch (error) {
       console.error(`ошибка: ${error instanceof Error ? error.message : error}`);
-      process.exitCode = 1;
+      // Жёсткий exit: на путях ошибок могут остаться незакрытые ресурсы
+      // (WS-соединение SurrealDB и т.п.), держащие event loop, — тогда
+      // exitCode=1 не завершит процесс и зомби удержит sync lock
+      // (live acceptance, этап 8).
+      process.exit(1);
     }
   };
 }

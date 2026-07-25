@@ -341,6 +341,32 @@ export async function updateSourceRevisionParse(
   );
 }
 
+/**
+ * Помечает unresolved ingest_errors revision'ов из ПРЕЖНИХ sync runs
+ * разрешёнными: повторный parse (например, после фикса parser'а) дал
+ * новый результат, и старые ошибки — исторические дубликаты одних и тех
+ * же revision (§7.2, поля resolved_at/resolution). Ошибки текущего run'а
+ * не трогаем — они отражают актуальное состояние.
+ *
+ * Всегда батчами: индекса по source_revision нет, per-revision UPDATE —
+ * полный scan ingest_error на каждую revision.
+ */
+export async function resolveStaleIngestErrors(
+  db: Surreal,
+  sourceRevisions: RecordId[],
+  currentSyncRun: RecordId,
+  resolution: string,
+): Promise<void> {
+  const chunkSize = 500;
+  for (let i = 0; i < sourceRevisions.length; i += chunkSize) {
+    await db.query(
+      `UPDATE ingest_error SET resolved_at = time::now(), resolution = $resolution
+       WHERE resolved_at IS NONE AND sync_run != $run AND source_revision IN $revs`,
+      { revs: sourceRevisions.slice(i, i + chunkSize), run: currentSyncRun, resolution },
+    );
+  }
+}
+
 export interface IngestErrorInput {
   syncRun: RecordId;
   sourceRevision?: RecordId;

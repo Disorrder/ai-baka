@@ -88,10 +88,12 @@ export async function runRestoreTest(
   try {
     await decompressFile(exportPath, tmpExport);
 
+    // Тело — Bun.file (поток с диска), НЕ readFile в память: большой буфер
+    // может оборвать upload, после чего сервер применит усечённый поток.
     const response = await fetch(`${httpBaseUrl(cfg)}/import`, {
       method: "POST",
       headers: httpHeaders(cfg, RESTORE_NAMESPACE, cfg.surrealDatabase),
-      body: await readFile(tmpExport),
+      body: Bun.file(tmpExport),
     });
     if (!response.ok) {
       throw new Error(`import: HTTP ${response.status}: ${await response.text()}`);
@@ -103,10 +105,21 @@ export async function runRestoreTest(
       // 1. record counts против manifest'а
       let mismatches = 0;
       for (const [table, expected] of Object.entries(manifest.recordCounts)) {
-        const actual = await countOf(restored, table);
+        // SELECT по неопределённой таблице в 3.2.3 — ошибка, а не 0 строк:
+        // неполный импорт фиксируем как failed check, а не исключение.
+        let actual: number | null = null;
+        try {
+          actual = await countOf(restored, table);
+        } catch {
+          actual = null;
+        }
         if (actual !== expected) {
           mismatches += 1;
-          push("record_counts", false, `${table}: manifest ${expected}, restored ${actual}`);
+          push(
+            "record_counts",
+            false,
+            `${table}: manifest ${expected}, restored ${actual ?? "таблица отсутствует"}`,
+          );
         }
       }
       if (mismatches === 0) {
