@@ -68,6 +68,11 @@ async function makeSyncEnv(): Promise<SyncEnv> {
     minFreeBytes: 0,
     deletionConfirmations: 2,
     sourceOverrides: { "kimi-code": [srcRoot] },
+    embeddings: {
+      excludeHarnesses: [],
+      excludeWorkspaces: [],
+      excludeDocumentTypes: [],
+    },
   };
   return {
     t,

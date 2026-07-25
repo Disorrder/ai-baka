@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { Command } from "commander";
-import { loadConfig } from "./config.ts";
+import type { Surreal } from "surrealdb";
+import { loadConfig, type AppConfig } from "./config.ts";
 import { initArchive } from "./infra/sentinel.ts";
 import { runPreflight } from "./infra/preflight.ts";
 import {
@@ -21,9 +22,33 @@ import { HARNESSES, type HarnessSlug } from "./sources/adapters/harnesses.ts";
 import { collectStatus, formatStatus } from "./status.ts";
 import { runValidation } from "./validate.ts";
 import { isForensic, searchForensic, searchText, type SearchHit } from "./search/fulltext.ts";
+import {
+  searchHybrid,
+  searchVector,
+  VectorSearchUnavailable,
+} from "./search/hybrid.ts";
 import { rebuildSearchProjection } from "./search/rebuild.ts";
+import { OpenAIEmbeddingProvider } from "./embeddings/openai-provider.ts";
+import type { EmbeddingProvider } from "./embeddings/provider.ts";
+import {
+  activateSpace,
+  createSpace,
+  getActiveSpace,
+  listSpaces,
+  type EmbeddingSpace,
+} from "./embeddings/spaces.ts";
+import {
+  cancelPendingJobs,
+  embeddingsPlan,
+  embeddingsStatus,
+  rebuildStaleJobs,
+  retryFailedJobs,
+  runEmbeddingWorker,
+  type ProviderFactory,
+} from "./embeddings/jobs.ts";
 import { localIdentity } from "./sync/host-identity.ts";
 import { ensureHost } from "./db/repositories/identity.ts";
+import { TARGET_TOKENS } from "./search/segmenter.ts";
 
 const program = new Command();
 
@@ -326,10 +351,8 @@ program
           json?: boolean;
         },
       ) => {
-        if (options.mode !== "text") {
-          console.error(
-            `режим ${options.mode} недоступен до этапа 7 (embedding pipeline); используйте --mode text`,
-          );
+        if (!["text", "vector", "hybrid"].includes(options.mode)) {
+          console.error(`неизвестный режим: ${options.mode} (text|vector|hybrid)`);
           process.exitCode = 1;
           return;
         }
@@ -357,11 +380,35 @@ program
         const db = await connectDb(cfg);
         try {
           const forensic = isForensic(filters);
-          const hits = forensic
-            ? await searchForensic(db, query, filters)
-            : await searchText(db, query, filters);
+          let mode = forensic ? "forensic" : options.mode;
+          let hits: SearchHit[];
+          if (forensic || options.mode === "text") {
+            hits = forensic
+              ? await searchForensic(db, query, filters)
+              : await searchText(db, query, filters);
+          } else {
+            // vector/hybrid: нужен active space + OPENAI_API_KEY (§14).
+            let provider: EmbeddingProvider | undefined;
+            try {
+              provider = await vectorProvider(db, cfg);
+            } catch (error) {
+              if (options.mode === "vector") throw error;
+              provider = undefined;
+              // Hybrid деградирует в lexical с явным предупреждением (§14).
+              console.error(
+                `внимание: vector-ранжирование недоступно (${error instanceof Error ? error.message : error}); ` +
+                  `hybrid деградировал в text search`,
+              );
+              mode = "hybrid→text";
+            }
+            hits = provider
+              ? options.mode === "vector"
+                ? await searchVector(db, provider, query, filters)
+                : await searchHybrid(db, provider, query, filters)
+              : await searchText(db, query, filters);
+          }
           if (options.json) {
-            console.log(JSON.stringify({ mode: forensic ? "forensic" : "text", query, hits }, null, 2));
+            console.log(JSON.stringify({ mode, query, hits }, null, 2));
             return;
           }
           if (forensic) console.log(`forensic mode (поиск по chunk.content)`);
@@ -451,6 +498,284 @@ program
         }
       }
       if (!report.ok) process.exitCode = 1;
+    }),
+  );
+
+/** Provider для vector/hybrid search по ACTIVE space; деградация §14. */
+async function vectorProvider(db: Surreal, cfg: AppConfig): Promise<EmbeddingProvider> {
+  const space = await getActiveSpace(db);
+  if (!space) {
+    throw new VectorSearchUnavailable(
+      "нет active embedding_space (baka embeddings space:create + space:activate)",
+    );
+  }
+  if (!cfg.openaiApiKey) {
+    throw new VectorSearchUnavailable("OPENAI_API_KEY не задан");
+  }
+  return new OpenAIEmbeddingProvider({
+    apiKey: cfg.openaiApiKey,
+    model: space.model,
+    dimensions: space.dimensions,
+  });
+}
+
+/** ProviderFactory worker'а: model/dimensions берутся из space record. */
+function workerProviderFactory(cfg: AppConfig): ProviderFactory {
+  return (space: EmbeddingSpace) => {
+    if (!cfg.openaiApiKey) {
+      throw new Error("OPENAI_API_KEY не задан — worker не может вызвать provider");
+    }
+    return new OpenAIEmbeddingProvider({
+      apiKey: cfg.openaiApiKey,
+      model: space.model,
+      dimensions: space.dimensions,
+    });
+  };
+}
+
+const embeddings = program
+  .command("embeddings")
+  .description("Embedding pipeline: spaces, jobs worker, backfill (docs/plan.md §13)");
+
+embeddings
+  .command("plan")
+  .description("Оценка backfill: документы, токены, storage, цена (read-only, §13.6)")
+  .option("--json", "вывести результат в JSON")
+  .action(
+    handle(async (options: { json?: boolean }) => {
+      const cfg = loadConfig();
+      const db = await connectDb(cfg);
+      try {
+        const plan = await embeddingsPlan(db, cfg.embeddings);
+        if (options.json) {
+          console.log(JSON.stringify(plan, null, 2));
+          return;
+        }
+        const mib = (bytes: number): string => `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+        console.log(`документов (извлечённых): ${plan.documents}`);
+        console.log(`сегментов (search_documents): ${plan.segments}`);
+        console.log(`оценка токенов: ${plan.estimatedTokens}`);
+        console.log(`сегментов свыше target ${TARGET_TOKENS}: ${plan.overTarget}`);
+        console.log(`pending jobs: ${plan.pendingJobs}`);
+        for (const space of plan.spaces) {
+          console.log(
+            `space ${space.slug}${space.active ? " (active)" : ""}: ${space.dimensions}d, ` +
+              `оценка vector storage ${mib(space.estimatedVectorBytes)} (F32, без overhead HNSW)`,
+          );
+        }
+        if (plan.spaces.length === 0) console.log("spaces: нет (baka embeddings space:create)");
+        console.log(
+          plan.estimatedPriceUsd !== undefined
+            ? `цена: $${plan.pricePer1MTokens}/1M токенов → оценка $${plan.estimatedPriceUsd.toFixed(4)}`
+            : "цена: не настроена (OPENAI_EMBEDDING_PRICE_PER_1M_TOKENS в .env)",
+        );
+      } finally {
+        await db.close();
+      }
+    }),
+  );
+
+embeddings
+  .command("run")
+  .description("Worker: lease pending jobs → provider → vectors (§13.6)")
+  .option("--limit <n>", "максимум jobs за запуск", Number)
+  .option("--space <slug>", "только один embedding space")
+  .action(
+    handle(async (options: { limit?: number; space?: string }) => {
+      const cfg = loadConfig();
+      await assertPreflight(cfg);
+      const release = await acquireLock(cfg.archiveRoot, "embeddings run");
+      const db = await connectDb(cfg);
+      try {
+        const summary = await runEmbeddingWorker(db, workerProviderFactory(cfg), {
+          spaceSlug: options.space,
+          limit: options.limit && options.limit > 0 ? options.limit : undefined,
+          privacy: cfg.embeddings,
+          logger: (event) => console.error(JSON.stringify(event)),
+        });
+        console.log(
+          `embeddings run: completed ${summary.completed}, retryable ${summary.failed}, ` +
+            `permanent ${summary.permanentErrors}, privacy-excluded ${summary.privacyExcluded}, ` +
+            `stale-lease возвращено ${summary.releasedStale}, prompt tokens ${summary.promptTokens}`,
+        );
+      } finally {
+        await db.close();
+        await release();
+      }
+    }),
+  );
+
+embeddings
+  .command("status")
+  .description("Jobs по статусам и vectors по каждому space")
+  .option("--json", "вывести результат в JSON")
+  .action(
+    handle(async (options: { json?: boolean }) => {
+      const cfg = loadConfig();
+      const db = await connectDb(cfg);
+      try {
+        const statuses = await embeddingsStatus(db);
+        if (options.json) {
+          console.log(JSON.stringify(statuses, null, 2));
+          return;
+        }
+        if (statuses.length === 0) {
+          console.log("embedding spaces: нет");
+          return;
+        }
+        for (const s of statuses) {
+          console.log(
+            `${s.slug}${s.active ? " (active)" : ""}: ${s.provider}/${s.model} ${s.dimensions}d, ` +
+              `vectors ${s.vectors}, jobs: ` +
+              (Object.entries(s.jobs).map(([k, v]) => `${k} ${v}`).join(", ") || "—"),
+          );
+        }
+      } finally {
+        await db.close();
+      }
+    }),
+  );
+
+embeddings
+  .command("retry")
+  .description("Вернуть retryable/permanent error jobs в pending (§13.6)")
+  .option("--space <slug>", "только один embedding space")
+  .action(
+    handle(async (options: { space?: string }) => {
+      const cfg = loadConfig();
+      const db = await connectDb(cfg);
+      try {
+        const n = await retryFailedJobs(db, options.space);
+        console.log(`возвращено в pending: ${n} jobs`);
+      } finally {
+        await db.close();
+      }
+    }),
+  );
+
+embeddings
+  .command("cancel")
+  .description("Отменить pending/retryable jobs (status = cancelled)")
+  .option("--space <slug>", "только один embedding space")
+  .action(
+    handle(async (options: { space?: string }) => {
+      const cfg = loadConfig();
+      const db = await connectDb(cfg);
+      try {
+        const n = await cancelPendingJobs(db, options.space);
+        console.log(`отменено: ${n} jobs`);
+      } finally {
+        await db.close();
+      }
+    }),
+  );
+
+embeddings
+  .command("space:create")
+  .description("Создать embedding space + vector-таблицу с HNSW + backfill jobs (§13.1)")
+  .option("--slug <slug>", "slug space (по умолчанию <provider>_<model>_<dims>_v1)")
+  .option("--provider <name>", "provider", "openai")
+  .option("--model <name>", "модель", "text-embedding-3-large")
+  .option("--dimensions <n>", "размерность", Number, 1024)
+  .option("--activate", "сразу сделать active (прежний active снимается)")
+  .action(
+    handle(
+      async (options: {
+        slug?: string;
+        provider: string;
+        model: string;
+        dimensions: number;
+        activate?: boolean;
+      }) => {
+        const cfg = loadConfig();
+        await assertPreflight(cfg);
+        const release = await acquireLock(cfg.archiveRoot, "embeddings space:create");
+        const db = await connectDb(cfg);
+        try {
+          const result = await createSpace(db, {
+            slug: options.slug,
+            provider: options.provider,
+            model: options.model,
+            dimensions: options.dimensions,
+            activate: options.activate ?? false,
+          });
+          console.log(
+            `space ${result.space.slug}: таблица ${result.space.physical_table} ` +
+              `(HNSW ${result.space.dimensions}d F32 COSINE), backfill jobs: ${result.backfilledJobs}` +
+              (result.existingJobs > 0 ? ` (уже было ${result.existingJobs})` : "") +
+              (result.space.active ? ", active" : ""),
+          );
+        } finally {
+          await db.close();
+          await release();
+        }
+      },
+    ),
+  );
+
+embeddings
+  .command("space:activate <slug>")
+  .description("Сделать space активным (старый space не уничтожается, §13.1)")
+  .action(
+    handle(async (slug: string) => {
+      const cfg = loadConfig();
+      const db = await connectDb(cfg);
+      try {
+        const space = await activateSpace(db, slug);
+        console.log(`active space: ${space.slug}`);
+      } finally {
+        await db.close();
+      }
+    }),
+  );
+
+embeddings
+  .command("space:list")
+  .description("Список embedding spaces")
+  .option("--json", "вывести результат в JSON")
+  .action(
+    handle(async (options: { json?: boolean }) => {
+      const cfg = loadConfig();
+      const db = await connectDb(cfg);
+      try {
+        const spaces = await listSpaces(db);
+        if (options.json) {
+          console.log(JSON.stringify(spaces, null, 2));
+          return;
+        }
+        if (spaces.length === 0) {
+          console.log("embedding spaces: нет");
+          return;
+        }
+        for (const s of spaces) {
+          console.log(
+            `${s.slug}${s.active ? " (active)" : ""}: ${s.provider}/${s.model} ${s.dimensions}d ` +
+              `${s.distance}/${s.vector_type}, таблица ${s.physical_table}, segmentation v${s.segmentation_version}`,
+          );
+        }
+      } finally {
+        await db.close();
+      }
+    }),
+  );
+
+embeddings
+  .command("rebuild")
+  .description("Stale jobs (смена extraction/segmentation) обратно в pending + удалить их vectors (§13.5)")
+  .requiredOption("--space <slug>", "embedding space")
+  .action(
+    handle(async (options: { space: string }) => {
+      const cfg = loadConfig();
+      const db = await connectDb(cfg);
+      try {
+        const summary = await rebuildStaleJobs(db, options.space);
+        console.log(
+          `rebuild: stale jobs → pending ${summary.resetToPending}, ` +
+            `orphan jobs удалено ${summary.orphansDeleted}, stale vectors удалено ${summary.vectorsDeleted}`,
+        );
+      } finally {
+        await db.close();
+      }
     }),
   );
 

@@ -2,7 +2,7 @@
 
 ## Статус проекта
 
-Реализованы этапы 0–6 из [`docs/plan.md`](docs/plan.md) (раздел «Порядок
+Реализованы этапы 0–7 из [`docs/plan.md`](docs/plan.md) (раздел «Порядок
 реализации»): инфраструктура, schema migrations, source snapshot layer
 (discovery `baka discover`, complete/partial scan, immutable raw snapshots,
 SQLite через `VACUUM INTO`, deletion/rename/reconcile-логика), parser
@@ -13,13 +13,21 @@ EXTRACTOR_VERSION = 1), SurrealDB writer и structured sync
 (`src/db/repositories/corpus.ts`), orchestrator `src/sync/sync-run.ts`.
 Этап 6: segmenter длинных документов (`src/search/segmenter.ts`,
 segmentation_version = "1", target 6000–7000 / hard < 8192 токенов,
-эвристика chars/3.5 с seam под точный tokenizer этапа 7), BM25 full-text
+эвристика chars/3.5 с seam под точный tokenizer), BM25 full-text
 поиск (`src/search/fulltext.ts`, CLI `baka search`) и forensic search по
 chunk.content (--include-reasoning/--include-tools/--all-revisions),
 пересоздание projection — `baka search:rebuild` (`src/search/rebuild.ts`).
-Embeddings пока не вызываются: embedding jobs создаются только при
-существовании active `embedding_space` (появится на этапе 7); режимы
-поиска vector/hybrid — тоже этап 7.
+Этап 7: embedding pipeline (`src/embeddings/`) — provider abstraction +
+OpenAI provider (batch, dimensions, retry/backoff на 429/5xx) + mock
+provider для тестов; embedding spaces с физическими vector-таблицами
+`search_embedding_<slug>` и HNSW (динамический DDL рантаймом, schema-файлы
+не меняются); jobs worker с lease/retry/backoff и приватность-фильтрами
+(§13.7, env `EMBEDDINGS_EXCLUDE_*`/`EMBEDDINGS_MAX_DOCUMENT_BYTES`);
+vector search и hybrid RRF (`src/search/hybrid.ts`, CLI
+`baka search --mode vector|hybrid`) с деградацией по §14; команды
+`baka embeddings plan|run|status|retry|cancel|space:create|space:activate|
+space:list|rebuild`. Решение о боевом space и полный backfill — этап 11
+(после relevance evaluation).
 Авторитетный источник требований — `docs/plan.md`; при расхождении кода
 с планом сначала сверяйся с ним.
 
@@ -48,6 +56,31 @@ Embeddings пока не вызываются: embedding jobs создаются
   human_authored/visible_to_user хранятся bool, поэтому исходное
   "unknown" при rebuild трактуется как false (см. комментарий в
   src/search/rebuild.ts).
+
+Ключевые решения этапа 7:
+
+- синтаксис KNN/HNSW в SurrealDB 3.2.3 (проверено на живой базе):
+  `WHERE vector <|K, EF|> $q` (без EF оператор `<|K|>` отвергается как
+  legacy KTree/M-Tree) + `vector::distance::knn()` в SELECT; EXPLAIN FULL
+  показывает operator "KnnScan" с именем индекса — это проверка сценария
+  №24; brute-force без индекса — `<|K, COSINE|>` (KnnTopK);
+- физические vector-таблицы создаются DDL рантаймом в space:create
+  (`DEFINE TABLE ... SCHEMAFULL` + `DEFINE INDEX ... HNSW DIMENSION n
+  TYPE F32 DIST COSINE`); смены current revision каскадно удаляют vectors
+  (§8.1): corpus.ts получает список таблиц через listEmbeddingTables;
+- worker (src/embeddings/jobs.ts): lease одним BEGIN/LET/UPDATE/COMMIT
+  (UPDATE — третий результат query), backoff base 10s × 2^(n-1) (потолок
+  1ч), MAX_ATTEMPTS 8, lease timeout 5 мин; dimension каждого вектора
+  проверяется worker'ом до записи (№23); id vector-записи
+  детерминирован (vec_<sha256(doc:space)>) → повторный run идемпотентен;
+- приватность (§13.7) проверяется worker'ом в момент вызова API:
+  исключённый job → cancelled ("privacy_excluded: ..."), в provider не
+  уходит; конфиг — env (EMBEDDINGS_EXCLUDE_*, см. .env.example);
+- RRF — клиентский (k=60, src/search/hybrid.ts), не search::rrf():
+  проще и детерминированно; vector-фильтры §14 применяются при гидратации
+  search_document (post-filter top-50 ANN, без over-fetch);
+- цена для `embeddings plan` — только из env
+  OPENAI_EMBEDDING_PRICE_PER_1M_TOKENS, в коде не захардкожена.
 
 ## Стек
 

@@ -45,6 +45,8 @@ export interface SearchHit {
   /** Forensic: kind/role чанка. */
   kind?: string;
   role?: string;
+  /** Исходное сообщение (dedup в hybrid mode, §14). */
+  messageId?: string;
   dialogueId: string;
   dialogueTitle?: string;
   revisionId: string;
@@ -84,7 +86,7 @@ interface FilterClause {
 }
 
 /** Общие фильтры §14 (пути полей одинаковы для search_document и chunk). */
-function buildFilterClauses(filters: SearchFilters): FilterClause {
+export function buildFilterClauses(filters: SearchFilters): FilterClause {
   const clauses: string[] = [];
   const vars: Record<string, unknown> = {};
   if (filters.harness) {
@@ -131,6 +133,7 @@ interface HitRow {
   segment_no?: number;
   kind?: string;
   role?: string;
+  message_id?: unknown;
   dialogue_id: unknown;
   dialogue_title?: string;
   revision_id: unknown;
@@ -150,6 +153,7 @@ function toHit(row: HitRow): SearchHit {
     segmentNo: row.segment_no,
     kind: row.kind,
     role: row.role,
+    messageId: row.message_id ? String(row.message_id) : undefined,
     dialogueId: String(row.dialogue_id),
     dialogueTitle: row.dialogue_title,
     revisionId: String(row.revision_id),
@@ -162,6 +166,7 @@ function toHit(row: HitRow): SearchHit {
 }
 
 const CONTEXT_SELECT = `
+  message.id AS message_id,
   dialogue.id AS dialogue_id,
   dialogue.title AS dialogue_title,
   dialogue_revision.id AS revision_id,

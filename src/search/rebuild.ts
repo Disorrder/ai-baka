@@ -31,6 +31,7 @@ import {
   replaceSearchProjection,
 } from "../db/repositories/corpus.ts";
 import { HARNESS_TOOLS } from "../sync/harness-tools.ts";
+import { listEmbeddingTables } from "../embeddings/spaces.ts";
 
 export interface RebuildSummary {
   revisions: number;
@@ -134,6 +135,9 @@ export async function rebuildSearchProjection(
     const activeSpaces = opts.enqueueEmbeddings
       ? (await listActiveEmbeddingSpaces(db)).map((s) => s.id)
       : [];
+    // Физические vector-таблицы — каскадное удаление vectors вместе с
+    // projection (§8.1).
+    const embeddingTables = await listEmbeddingTables(db);
 
     for (const revision of revisions) {
       const tools = Object.values(HARNESS_TOOLS).find(
@@ -171,6 +175,7 @@ export async function rebuildSearchProjection(
         extractors: tools.extractors,
         activeEmbeddingSpaces: activeSpaces,
         enqueueEmbeddings: opts.enqueueEmbeddings,
+        embeddingTables,
       });
       summary.revisions += 1;
       summary.searchDocuments += result.searchDocumentCount;

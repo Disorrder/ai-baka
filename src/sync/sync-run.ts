@@ -63,6 +63,7 @@ import {
   updateSourceRevisionParse,
   type LocationRow,
 } from "../db/repositories/provenance.ts";
+import { listEmbeddingTables } from "../embeddings/spaces.ts";
 import type { PresenceStatus } from "./deletion-detector.ts";
 
 export interface SyncOptions {
@@ -211,6 +212,9 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
     const activeSpaces = enqueueEmbeddings
       ? (await listActiveEmbeddingSpaces(db)).map((s) => s.id)
       : [];
+    // Физические vector-таблицы всех spaces — для каскадного удаления
+    // vectors при смене current revision (§8.1).
+    const embeddingTables = await listEmbeddingTables(db);
     if (enqueueEmbeddings && activeSpaces.length === 0) {
       log({
         event: "embedding_jobs_skipped",
@@ -229,6 +233,7 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
           deletionConfirmations,
           enqueueEmbeddings,
           activeSpaces,
+          embeddingTables,
           fullRescan: options.fullRescan ?? false,
           dryRun,
           log,
@@ -289,6 +294,7 @@ interface ProcessRootArgs {
   deletionConfirmations: number;
   enqueueEmbeddings: boolean;
   activeSpaces: RecordId[];
+  embeddingTables: string[];
   fullRescan: boolean;
   dryRun: boolean;
   log: Logger;
@@ -478,6 +484,7 @@ async function processSourceRoot(
     extractors: tools.extractors,
     activeEmbeddingSpaces: args.activeSpaces,
     enqueueEmbeddings: args.enqueueEmbeddings,
+    embeddingTables: args.embeddingTables,
   };
 
   const applyOutcomeToRevision = async (

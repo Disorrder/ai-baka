@@ -56,6 +56,12 @@ export interface DialogueTxInput {
   modelIds: Map<string, RecordId>;
   activeEmbeddingSpaces: RecordId[];
   enqueueEmbeddings: boolean;
+  /**
+   * Физические vector-таблицы всех embedding spaces (search_embedding_*).
+   * Нужны для каскадного удаления vectors при смене projection (§8.1);
+   * заполняется из listEmbeddingTables (src/embeddings/spaces.ts).
+   */
+  embeddingTables?: string[];
 }
 
 export interface DialogueWriteResult {
@@ -299,8 +305,20 @@ function dialogueUpsertStatement(tx: TxBuilder, input: DialogueTxInput): string 
   );
 }
 
-/** Удаление search projection (docs + jobs) указанных revisions. */
-function addProjectionDelete(tx: TxBuilder, revisionExpr: string): void {
+/** Удаление search projection (vectors + jobs + docs) указанных revisions. */
+function addProjectionDelete(tx: TxBuilder, revisionExpr: string, embeddingTables: string[] = []): void {
+  // §8.1: при смене current revision удаляются и vectors физических таблиц
+  // (иначе они сиротеют — инварианты §23.11–12). Таблицы динамические
+  // (search_embedding_<slug>), имена приходят из embedding_space records.
+  for (const table of embeddingTables) {
+    if (!/^[a-zA-Z0-9_]+$/.test(table)) {
+      throw new Error(`небезопасное имя vector-таблицы: ${table}`);
+    }
+    tx.add(
+      `DELETE ${table} WHERE search_document INSIDE ` +
+        `(SELECT VALUE id FROM search_document WHERE dialogue_revision = ${revisionExpr});`,
+    );
+  }
   tx.add(
     `DELETE embedding_job WHERE search_document INSIDE ` +
       `(SELECT VALUE id FROM search_document WHERE dialogue_revision = ${revisionExpr});`,
@@ -362,10 +380,10 @@ export async function writeDialogueRevision(
     tx.add(`LET $revId = ${tx.param(revisionRid)};`);
     tx.add("LET $oldRev = (SELECT VALUE current_revision FROM ONLY $dlgId);");
     tx.add("IF $oldRev != NONE AND $oldRev != $revId {");
-    addProjectionDelete(tx, "$oldRev");
+    addProjectionDelete(tx, "$oldRev", input.embeddingTables);
     tx.add("};");
     // Leftovers этой revision (на случай прошлого сбоя) — тоже пересоздаём.
-    addProjectionDelete(tx, "$revId");
+    addProjectionDelete(tx, "$revId", input.embeddingTables);
     const jobCount = addSearchProjection(tx, docs, input, revisionKey, (seq) =>
       tx.param(new RecordId("message", messageRecordId(revisionKey, seq))),
     );
@@ -459,7 +477,7 @@ export async function writeDialogueRevision(
   const jobCount = addSearchProjection(tx, docs, input, revisionKey, (seq) => `$m${seq}`);
   tx.add("LET $oldRev = (SELECT VALUE current_revision FROM ONLY $dlgId);");
   tx.add("IF $oldRev != NONE AND $oldRev != $revId {");
-  addProjectionDelete(tx, "$oldRev");
+  addProjectionDelete(tx, "$oldRev", input.embeddingTables);
   tx.add("};");
   tx.add(
     `UPDATE ONLY $dlgId SET ` +
@@ -512,13 +530,15 @@ export async function replaceSearchProjection(
     extractors: HarnessExtractors;
     activeEmbeddingSpaces: RecordId[];
     enqueueEmbeddings: boolean;
+    /** Физические vector-таблицы для каскадного удаления vectors (§8.1). */
+    embeddingTables?: string[];
   },
 ): Promise<{ searchDocumentCount: number; embeddingJobCount: number }> {
   const tx = new TxBuilder();
   tx.add("BEGIN;");
   tx.add(`LET $dlgId = ${tx.param(input.dialogueId)};`);
   tx.add(`LET $revId = ${tx.param(input.revisionId)};`);
-  addProjectionDelete(tx, "$revId");
+  addProjectionDelete(tx, "$revId", input.embeddingTables);
   const jobCount = addSearchProjection(tx, input.docs, input, input.revisionKey, (seq) =>
     tx.param(new RecordId("message", messageRecordId(input.revisionKey, seq))),
   );

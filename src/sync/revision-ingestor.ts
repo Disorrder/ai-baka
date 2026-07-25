@@ -40,6 +40,8 @@ export interface IngestContext {
   extractors: HarnessExtractors;
   activeEmbeddingSpaces: RecordId[];
   enqueueEmbeddings: boolean;
+  /** Физические vector-таблицы для каскадного удаления vectors (§8.1). */
+  embeddingTables?: string[];
 }
 
 export interface IngestOptions {
@@ -176,6 +178,7 @@ export async function ingestSourceRevision(
         modelIds,
         activeEmbeddingSpaces: ctx.activeEmbeddingSpaces,
         enqueueEmbeddings: ctx.enqueueEmbeddings,
+        embeddingTables: ctx.embeddingTables,
       });
       outcome.dialoguesWritten += 1;
       if (result.created || result.switched) {

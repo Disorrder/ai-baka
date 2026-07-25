@@ -6,15 +6,20 @@
 с нуля: SurrealDB становится канонической моделью и индексом поверх неизменяемого
 raw-архива, а не местом, куда напрямую перекладываются прежние таблицы SQLite.
 
-**Статус:** этап 6 плана (search documents и full-text) завершён:
-segmenter длинных документов (§13.4, segmentation_version = "1"),
-BM25-поиск по search_document с highlights, forensic search по chunk
-(reasoning/tools/all-revisions), `baka search` / `baka search:rebuild`.
-Ранее — этап 5: репозитории поверх SDK, атомарная транзакция диалога
-(§10.4), immutable dialogue revisions с current pointers, quarantine через
-ingest_error, `baka sync` / `baka status` / `baka validate`. Живой sync по
-kimi-code пройден на боевой базе; повторный sync идемпотентен. Схема БД —
-миграции в [`schema/`](schema/) (применяются `bun run db:migrate`, runner —
+**Статус:** этап 7 плана (embedding pipeline) завершён: embedding spaces
+с физическими vector-таблицами и HNSW (динамический DDL, §13.1–13.3),
+jobs worker с lease/retry/backoff и приватность-фильтрами (§13.5–13.7),
+OpenAI provider (batch, dimensions, retry на 429/5xx) + mock provider для
+тестов, vector search и hybrid RRF (§14) с деградацией в lexical.
+Ранее — этап 6: segmenter длинных документов (§13.4,
+segmentation_version = "1"), BM25-поиск по search_document с highlights,
+forensic search по chunk (reasoning/tools/all-revisions),
+`baka search` / `baka search:rebuild`. Ранее — этап 5: репозитории поверх
+SDK, атомарная транзакция диалога (§10.4), immutable dialogue revisions с
+current pointers, quarantine через ingest_error, `baka sync` /
+`baka status` / `baka validate`. Живой sync по kimi-code пройден на боевой
+базе; повторный sync идемпотентен. Схема БД — миграции в
+[`schema/`](schema/) (применяются `bun run db:migrate`, runner —
 `src/db/migrations.ts`). Авторитетным источником требований остаётся
 [`docs/plan.md`](docs/plan.md).
 
@@ -26,12 +31,27 @@ kimi-code пройден на боевой базе; повторный sync и�
   транзакции диалогов → search_documents → embedding jobs (только при
   active embedding space; сам OpenAI не вызывается). Лог событий — JSON
   lines в stderr;
-- `baka search <query> [--mode text] [--harness] [--host] [--workspace]
-  [--model] [--document-type] [--from] [--to] [--deleted-only] [--limit]
-  [--include-reasoning] [--include-tools] [--all-revisions] [--json]` —
-  BM25 по search_document (только current revisions) с highlights;
-  forensic-флаги переключают поиск на chunk.content (§12.1); режимы
-  vector/hybrid — этап 7;
+- `baka search <query> [--mode text|vector|hybrid] [--harness] [--host]
+  [--workspace] [--model] [--document-type] [--from] [--to] [--deleted-only]
+  [--limit] [--include-reasoning] [--include-tools] [--all-revisions]
+  [--json]` — BM25 по search_document (только current revisions) с
+  highlights; forensic-флаги переключают поиск на chunk.content (§12.1);
+  vector — ANN по active embedding space (HNSW), hybrid — BM25 top 50 +
+  vector top 50 → RRF k=60 → dedup по message → top 20 (§14). Без active
+  space или OPENAI_API_KEY vector сообщает о недоступности, hybrid
+  деградирует в text с предупреждением;
+- `baka embeddings plan [--json]` — read-only оценка backfill: документы,
+  сегменты, токены (эвристика segmenter'а), over-target, pending jobs,
+  vector storage, цена из `OPENAI_EMBEDDING_PRICE_PER_1M_TOKENS` (§13.6);
+- `baka embeddings run [--limit <n>] [--space <slug>]` — worker: lease
+  pending jobs → provider → проверка dimension → транзакция vector + usage
+  + job completed; retryable ошибки с exponential backoff, permanent —
+  сразу; stuck jobs возвращаются в pending по lease timeout (§13.6);
+- `baka embeddings status|retry|cancel [--space]`, `baka embeddings
+  space:create [--slug --provider --model --dimensions --activate]`,
+  `space:activate <slug>`, `space:list`, `baka embeddings rebuild --space
+  <slug>` (stale jobs → pending после смены extraction/segmentation
+  versions, их vectors удаляются, §13.5);
 - `baka search:rebuild [--no-enqueue-embeddings] [--json]` — пересоздать
   search projection для всех current revisions (после смены
   segmenter/extractor versions, §8.1);
