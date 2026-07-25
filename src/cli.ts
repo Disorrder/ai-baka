@@ -11,6 +11,10 @@ import {
 } from "./infra/compose.ts";
 import { ejectDisk } from "./infra/disk-eject.ts";
 import { connectDb, serverVersion } from "./db/client.ts";
+import { applyMigrations, checkSchemaVersion } from "./db/migrations.ts";
+import { assertPreflight } from "./infra/preflight.ts";
+import { acquireLock } from "./infra/lock.ts";
+import { readSentinel } from "./infra/sentinel.ts";
 
 const program = new Command();
 
@@ -101,12 +105,49 @@ db.command("status")
         try {
           const db = await connectDb(cfg);
           await db.query("RETURN 1");
+          const schemaVersion = await checkSchemaVersion(db);
           await db.close();
           console.log("подключение: ok");
+          console.log(
+            schemaVersion > 0
+              ? `версия схемы: ${schemaVersion}`
+              : "версия схемы: не инициализирована (baka db migrate)",
+          );
         } catch (error) {
           console.error(`подключение: FAIL (${error instanceof Error ? error.message : error})`);
           process.exitCode = 1;
         }
+      }
+    }),
+  );
+
+db.command("migrate")
+  .description("Применить недостающие schema migrations (docs/plan.md §6)")
+  .action(
+    handle(async () => {
+      const cfg = loadConfig();
+      await assertPreflight(cfg);
+      const release = await acquireLock(cfg.archiveRoot, "db migrate");
+      try {
+        const sentinel = await readSentinel(cfg.archiveRoot);
+        const db = await connectDb(cfg);
+        try {
+          const version = (await serverVersion(cfg)) ?? "unknown";
+          const result = await applyMigrations(db, {
+            sentinel,
+            surrealdbVersion: version,
+          });
+          if (result.applied.length === 0) {
+            console.log(`схема актуальна, версия: ${result.version}`);
+          } else {
+            console.log(`применены миграции: ${result.applied.join(", ")}`);
+            console.log(`версия схемы: ${result.version}`);
+          }
+        } finally {
+          await db.close();
+        }
+      } finally {
+        await release();
       }
     }),
   );

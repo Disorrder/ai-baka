@@ -13,6 +13,7 @@
     "db:up": "bun run src/cli.ts db up",
     "db:down": "bun run src/cli.ts db down",
     "db:status": "bun run src/cli.ts db status",
+    "db:migrate": "bun run src/cli.ts db migrate",
     "db:logs": "bun run src/cli.ts db logs",
     "disk:eject": "bun run src/cli.ts disk eject",
     "test": "bun test",

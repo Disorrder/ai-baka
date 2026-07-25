@@ -14,6 +14,10 @@
   docker-compose, только `127.0.0.1:8901`.
 - Архив на внешнем диске: `BAKA_ARCHIVE_ROOT`
   (по умолчанию `/Volumes/Archive/Conversations`).
+- Схема БД — миграции в `schema/*.surql` (0001–0004, строго по
+  `docs/plan.md` §7/§8/§12/§13/§15); migration runner —
+  `src/db/migrations.ts` (`baka db migrate`, версия схемы видна в
+  `baka db status`).
 
 ## Жёсткие ограничения
 
