@@ -108,6 +108,21 @@ beforeAll(async () => {
   db.run(`INSERT INTO thread_records VALUES (5, 4, 4, 0, '')`);
   // t5: вообще без записей → quarantined
   db.run(`INSERT INTO threads VALUES (5, 1, 'd5')`);
+  // t6: битый agent_id — тред НЕ теряется (orphan agent), но фиксируется
+  db.run(`INSERT INTO threads VALUES (6, 999, 'd6')`);
+  db.run(`INSERT INTO thread_records VALUES (6, 6, 1, 0, '{"f":6}')`);
+  // t7: часть записей без source_file_id (null_file) — связь тред→raw
+  // неполная, from_raw заблокирован; payload валиден → from payload
+  db.run(`INSERT INTO threads VALUES (7, 1, 'd7')`);
+  db.run(`INSERT INTO thread_records VALUES (7, 7, 1, 0, '{"g":7}')`);
+  db.run(`INSERT INTO thread_records VALUES (8, 7, NULL, 1, '{"h":8}')`);
+  // orphan-строки без родителя: record/message/chunk/raw backup/project
+  db.run(`INSERT INTO thread_records VALUES (100, 999, 1, 0, '{"orphan":1}')`);
+  db.run(`INSERT INTO messages VALUES (99, 999, 0)`);
+  db.run(`INSERT INTO message_chunks VALUES (99, 999, 0)`);
+  db.run(`INSERT INTO raw_backups VALUES (3, 999, '${rawBackupFile}', 'active')`);
+  db.run(`INSERT INTO projects VALUES (1, 1, 'p1')`);
+  db.run(`INSERT INTO projects VALUES (2, 999, 'p-orphan')`);
   db.close();
 });
 
@@ -128,7 +143,7 @@ describe("legacy snapshot (§15.3)", () => {
 
     // snapshot — валидная SQLite с теми же данными
     const snap = new Database(first.snapshotPath, { readonly: true });
-    expect(snap.query<{ c: number }, []>(`SELECT COUNT(*) AS c FROM threads`).get()?.c).toBe(5);
+    expect(snap.query<{ c: number }, []>(`SELECT COUNT(*) AS c FROM threads`).get()?.c).toBe(7);
     snap.close();
 
     const second = await ensureLegacySnapshot(legacyDbPath, archiveRoot);
@@ -180,11 +195,11 @@ describe("migration preflight report (§15.2)", () => {
   test("counts и соответствие схемы плану §15.5", () => {
     expect(report.counts).toEqual({
       sourceFiles: 4,
-      rawBackups: 2,
-      dialogues: 5,
-      messages: 2,
-      chunks: 1,
-      threadRecords: 5,
+      rawBackups: 3,
+      dialogues: 7,
+      messages: 3,
+      chunks: 2,
+      threadRecords: 9,
     });
     for (const present of Object.values(report.schema.expected)) {
       expect(present).toBe(true);
@@ -192,26 +207,58 @@ describe("migration preflight report (§15.2)", () => {
   });
 
   test("payload coverage: present/missing/valid/invalid", () => {
-    expect(report.payload.present).toBe(4);
+    expect(report.payload.present).toBe(8);
     expect(report.payload.missing).toBe(1);
-    expect(report.payload.validJson).toBe(3);
+    expect(report.payload.validJson).toBe(7);
     expect(report.payload.invalidJson).toBe(1);
-    expect(report.payload.threadsFullyCovered).toBe(2); // t1, t2
-    expect(report.payload.threadsUncovered).toBe(2); // t3 (невалиден), t4 (пустой)
+    expect(report.payload.threadsFullyCovered).toBe(4); // t1, t2, t6, t7
+    // t3 (невалиден), t4 (пустой), t5 (вообще без thread_records)
+    expect(report.payload.threadsUncovered).toBe(3);
     expect(report.payload.coversAllDialogues).toBe(false);
   });
 
-  test("классификация по приоритету §15.4 и reconciliation", () => {
-    expect(report.reconstructable.fromRaw).toBe(1); // t1
-    expect(report.reconstructable.fromPayload).toBe(1); // t2
+  test("классификация по приоритету §15.4", () => {
+    expect(report.reconstructable.fromRaw).toBe(2); // t1, t6
+    expect(report.reconstructable.fromPayload).toBe(2); // t2, t7
     expect(report.reconstructable.onlyNormalized).toBe(1); // t3
     expect(report.reconstructable.quarantined).toBe(2); // t4, t5
-    expect(report.reconciliation).toEqual({
-      legacyTotal: 5,
-      reconstructable: 3,
-      quarantined: 2,
-      ok: true,
-    });
+  });
+
+  test("null_file блокирует from_raw (неполная связь тред→raw)", () => {
+    // t7: все payload валидны и sf1 имеет raw backup на диске, но один
+    // thread_record без source_file_id → не from_raw, а from_payload
+    const analysis = report.reconstructable;
+    expect(analysis.fromRaw).toBe(2); // без t7
+    expect(analysis.fromPayload).toBe(2); // t7 здесь
+  });
+
+  test("reconciliation §15.9: legacyTotal честный, каждая строка учтена", () => {
+    const r = report.reconciliation;
+    // Полное число legacy rows по всем таблицам (до фильтрации):
+    // 1 agent + 2 projects + 4 source_files + 3 raw_backups + 7 threads
+    // + 9 thread_records + 3 messages + 2 message_chunks
+    expect(r.legacyTotal).toBe(31);
+    expect(r.accounted).toBe(31);
+    expect(r.lost).toBe(0);
+    expect(r.ok).toBe(true);
+    expect(r.tables.threads).toEqual({ total: 7, accounted: 7, withProblems: 3, lost: 0 });
+    expect(r.tables.thread_records).toEqual({ total: 9, accounted: 9, withProblems: 1, lost: 0 });
+    expect(r.tables.messages).toEqual({ total: 3, accounted: 3, withProblems: 1, lost: 0 });
+    expect(r.tables.message_chunks).toEqual({ total: 2, accounted: 2, withProblems: 1, lost: 0 });
+    expect(r.tables.raw_backups).toEqual({ total: 3, accounted: 3, withProblems: 2, lost: 0 });
+    expect(r.tables.projects).toEqual({ total: 2, accounted: 2, withProblems: 1, lost: 0 });
+  });
+
+  test("orphan-строки учтены с record ID, не потеряны бесшумно", () => {
+    const byKey = new Map(report.problems.map((p) => [`${p.table}:${p.recordId}`, p.reason]));
+    expect(byKey.get("thread_records:100")).toContain("orphan");
+    expect(byKey.get("messages:99")).toContain("orphan");
+    expect(byKey.get("message_chunks:99")).toContain("orphan");
+    expect(byKey.get("raw_backups:3")).toContain("orphan");
+    expect(byKey.get("projects:2")).toContain("orphan");
+    // битый agent_id: тред не выпал из анализа
+    expect(byKey.get("threads:6")).toContain("agent_id=999");
+    expect(report.counts.dialogues).toBe(7); // t6 посчитан
   });
 
   test("deleted_in_source и missing raw backup", () => {
@@ -225,6 +272,8 @@ describe("migration preflight report (§15.2)", () => {
     const keys = new Set(report.problems.map(key));
     expect(keys.has("threads:4")).toBe(true); // quarantine
     expect(keys.has("threads:5")).toBe(true);
+    expect(keys.has("threads:6")).toBe(true); // битый agent_id
+    expect(keys.has("thread_records:100")).toBe(true); // orphan record
     expect(keys.has("raw_backups:2")).toBe(true); // файл отсутствует на диске
     expect(keys.has("source_files:3")).toBe(true); // нет raw_backups
     expect(keys.has("source_files:4")).toBe(true);
@@ -258,8 +307,9 @@ describe("migration preflight report (§15.2)", () => {
     expect(noLive.duplicates.vsLiveCorpus.available).toBe(false);
     expect(noLive.missingRawBackup.fileMissingOnDisk).toBe(0);
     // без проверки файлов t2 классифицируется как from_raw (backup row есть)
-    expect(noLive.reconstructable.fromRaw).toBe(2);
+    expect(noLive.reconstructable.fromRaw).toBe(3); // t1, t2, t6
     expect(noLive.reconciliation.ok).toBe(true);
+    expect(noLive.reconciliation.lost).toBe(0);
   });
 });
 

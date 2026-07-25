@@ -1,7 +1,6 @@
-import { beforeAll, describe, expect, test } from "bun:test";
+import { describe, expect } from "bun:test";
 import { cp, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { Surreal } from "surrealdb";
 import {
   applyMigrations,
   checkSchemaVersion,
@@ -11,64 +10,10 @@ import {
 } from "../src/db/migrations.ts";
 import type { ArchiveSentinel } from "../src/infra/sentinel.ts";
 import { withTempDir } from "./config.test.ts";
+import { createTestDb, dbTest, dropTestDb, TEST_NAMESPACE } from "./db-test-utils.ts";
 
-const SURREAL_URL = process.env.SURREAL_URL ?? "ws://127.0.0.1:8901/rpc";
-const SURREAL_USER = process.env.SURREAL_USER ?? "root";
-const SURREAL_PASS = process.env.SURREAL_PASS ?? "root";
-const TEST_NAMESPACE = "baka_test";
-
-let dbAvailable = false;
-
-beforeAll(async () => {
-  const probe = new Surreal();
-  try {
-    // connect к мёртвому URL может висеть дольше таймаута хука — ограничиваем сами
-    await Promise.race([
-      probe.connect(SURREAL_URL),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("connect timeout")), 2000),
-      ),
-    ]);
-    dbAvailable = true;
-  } catch {
-    dbAvailable = false;
-  } finally {
-    await probe.close().catch(() => {});
-  }
-});
-
-function skipIfNoDb(): boolean {
-  if (!dbAvailable) {
-    console.warn("SKIP: SurrealDB недоступен (docker не поднят)");
-    return true;
-  }
-  return false;
-}
-
-interface TestDb {
-  db: Surreal;
-  name: string;
-}
-
-async function createTestDb(): Promise<TestDb> {
-  const db = new Surreal();
-  await db.connect(SURREAL_URL);
-  await db.signin({ username: SURREAL_USER, password: SURREAL_PASS });
-  await db.use({ namespace: TEST_NAMESPACE });
-  const name = `test_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  await db.query(`DEFINE DATABASE ${name}`);
-  await db.use({ namespace: TEST_NAMESPACE, database: name });
-  return { db, name };
-}
-
-async function dropTestDb(t: TestDb): Promise<void> {
-  try {
-    await t.db.use({ namespace: TEST_NAMESPACE });
-    await t.db.query(`REMOVE DATABASE ${t.name}`);
-  } finally {
-    await t.db.close();
-  }
-}
+// Явный skip в отчёте, если SurrealDB не поднят (вместо молчаливого return).
+const testDb = await dbTest();
 
 function sentinelFor(dbName: string): ArchiveSentinel {
   return {
@@ -81,9 +26,8 @@ function sentinelFor(dbName: string): ArchiveSentinel {
 }
 
 describe("migrations (integration, живой SurrealDB)", () => {
-  test("пустая база создаётся с нуля, archive_meta:main заполнен", async () => {
-    if (skipIfNoDb()) return;
-    const t = await createTestDb();
+  testDb("пустая база создаётся с нуля, archive_meta:main заполнен", async () => {
+    const t = await createTestDb(false);
     try {
       const result = await applyMigrations(t.db, {
         sentinel: sentinelFor(t.name),
@@ -131,9 +75,8 @@ describe("migrations (integration, живой SurrealDB)", () => {
     }
   });
 
-  test("повторное применение идемпотентно", async () => {
-    if (skipIfNoDb()) return;
-    const t = await createTestDb();
+  testDb("повторное применение идемпотентно", async () => {
+    const t = await createTestDb(false);
     try {
       await applyMigrations(t.db, { sentinel: sentinelFor(t.name), bakaCommit: "c", surrealdbVersion: "v" });
       const second = await applyMigrations(t.db, {
@@ -152,9 +95,8 @@ describe("migrations (integration, живой SurrealDB)", () => {
     }
   });
 
-  test("tampered-файл миграции детектируется", async () => {
-    if (skipIfNoDb()) return;
-    const t = await createTestDb();
+  testDb("tampered-файл миграции детектируется", async () => {
+    const t = await createTestDb(false);
     try {
       await withTempDir(async (dir) => {
         await cp(SCHEMA_DIR, dir, { recursive: true });
@@ -173,9 +115,8 @@ describe("migrations (integration, живой SurrealDB)", () => {
     }
   });
 
-  test("неизвестная более новая версия в БД отклоняется", async () => {
-    if (skipIfNoDb()) return;
-    const t = await createTestDb();
+  testDb("неизвестная более новая версия в БД отклоняется", async () => {
+    const t = await createTestDb(false);
     try {
       await applyMigrations(t.db, { schemaDir: SCHEMA_DIR });
       await t.db.query(

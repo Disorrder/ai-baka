@@ -1748,6 +1748,14 @@ dialogue revision
 ANN-запросы проверяются через `EXPLAIN FULL`, чтобы integration-тест
 подтверждал реальное использование HNSW, а не brute-force.
 
+> Примечание по реализации (2026-07-25): грамматика HNSW в SurrealDB 3.2.3
+> не поддерживает partial-index `WHERE`, поэтому фильтры §14 применяются
+> после ANN при гидратации `search_document`. Чтобы фильтр по редкому
+> harness/workspace/model не давал ложный пустой результат, при активных
+> фильтрах выполняется over-fetch: ANN запрашивает
+> `min(max(K×4, 200), 1000)` кандидатов (EF = max(200, K)), затем
+> post-filter и slice до K. Diversification: не более 3 hits на dialogue.
+
 ---
 
 # 15. Миграция legacy SQLite

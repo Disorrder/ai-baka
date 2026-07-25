@@ -8,17 +8,18 @@
  * raw manifest по БД сходится с файловой системой.
  */
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runLogicalBackup, type BackupManifest } from "../src/backup/backup.ts";
 import { RESTORE_NAMESPACE, runRestoreTest } from "../src/backup/restore-test.ts";
-import { buildRawManifest, verifyRawFiles } from "../src/backup/raw-verify.ts";
+import { buildRawManifest, hashRawManifest, verifyRawFiles } from "../src/backup/raw-verify.ts";
 import { loadConfig, type AppConfig } from "../src/config.ts";
 import { hashFile } from "../src/sources/snapshot/hashing.ts";
 import {
   createTestDb,
+  dbTest,
   dropTestDb,
   isDbAvailable,
   TEST_NAMESPACE,
@@ -27,6 +28,9 @@ import {
   SURREAL_USER,
   type TestDb,
 } from "./db-test-utils.ts";
+
+// Явный skip в отчёте, если SurrealDB не поднят (вместо молчаливого return).
+const testDb = await dbTest();
 
 let t: TestDb;
 let archiveRoot: string;
@@ -85,8 +89,7 @@ afterAll(async () => {
 });
 
 describe("backup → restore:test → raw:verify", () => {
-  test("logical backup: export + manifest", async () => {
-    if (!(await isDbAvailable())) return;
+  testDb("logical backup: export + manifest", async () => {
     const result = await runLogicalBackup(cfg);
     const manifest: BackupManifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
     expect(manifest.schemaVersion).toBe(4);
@@ -98,10 +101,14 @@ describe("backup → restore:test → raw:verify", () => {
     // exportSha256 должен совпадать с фактическим файлом
     const hashes = await hashFile(result.exportPath);
     expect(hashes.sha256).toBe(manifest.exportSha256);
+    expect(hashes.sizeBytes).toBe(manifest.exportBytes);
+    // rawManifestSha256 (§16.1) посчитан по живой БД в момент backup
+    expect(manifest.rawManifestSha256).toMatch(/^[0-9a-f]{64}$/);
+    const rawManifest = await buildRawManifest(t.db);
+    expect(manifest.rawManifestSha256).toBe(hashRawManifest(rawManifest));
   });
 
-  test("restore drill: counts, инварианты, search-probe, cleanup", async () => {
-    if (!(await isDbAvailable())) return;
+  testDb("restore drill: counts, инварианты, search-probe, cleanup", async () => {
     const backup = await runLogicalBackup(cfg);
     const report = await runRestoreTest(cfg, { exportPath: backup.exportPath });
     for (const check of report.checks) {
@@ -118,8 +125,16 @@ describe("backup → restore:test → raw:verify", () => {
     }
   });
 
-  test("raw manifest по БД сходится с файловой системой", async () => {
-    if (!(await isDbAvailable())) return;
+  testDb("restore drill отклоняет битый export ДО импорта", async () => {
+    const backup = await runLogicalBackup(cfg);
+    // «Портим» export, не трогая manifest
+    await writeFile(backup.exportPath, "corrupted");
+    await expect(runRestoreTest(cfg, { exportPath: backup.exportPath })).rejects.toThrow(
+      /exportSha256 не совпадает/,
+    );
+  });
+
+  testDb("raw manifest по БД сходится с файловой системой", async () => {
     const manifest = await buildRawManifest(t.db);
     expect(manifest.count).toBe(1);
     expect(manifest.entries[0]!.harness).toBe("codex");

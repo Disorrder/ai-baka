@@ -10,6 +10,7 @@
 
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import type { Surreal } from "surrealdb";
 import type { AppConfig } from "../config.ts";
 import { connectDb } from "../db/client.ts";
@@ -73,6 +74,23 @@ export async function buildRawManifest(db: Surreal): Promise<RawManifest> {
       harness: row.harness ?? null,
     })),
   };
+}
+
+/**
+ * Канонический SHA-256 содержимого raw manifest'а (поле rawManifestSha256
+ * в backup manifest'е, §16.1). Хэшируются только записи (createdAt
+ * недетерминирован и исключён); порядок уже канонический — buildRawManifest
+ * сортирует по raw_archive_path.
+ */
+export function hashRawManifest(manifest: RawManifest): string {
+  const canonical = manifest.entries.map((e) => [
+    e.revisionId,
+    e.path,
+    e.sha256,
+    e.sizeBytes,
+    e.harness,
+  ]);
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
 async function listRawFiles(rawDir: string): Promise<string[]> {

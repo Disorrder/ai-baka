@@ -6,17 +6,18 @@
 реализации»): инфраструктура, schema migrations, source snapshot layer
 (discovery `baka discover`, complete/partial scan, immutable raw snapshots,
 SQLite через `VACUUM INTO`, deletion/rename/reconcile-логика), parser
-contract + parsers/extractors всех 7 harness'ов (parser_version = 1,
-EXTRACTOR_VERSION = 1), SurrealDB writer и structured sync
+contract + parsers/extractors всех 7 harness'ов (parser_version = 2,
+EXTRACTOR_VERSION = 2), SurrealDB writer и structured sync
 (`baka sync` / `baka status` / `baka validate`): репозитории
 `src/db/repositories/`, транзакция диалога по §10.4
 (`src/db/repositories/corpus.ts`), orchestrator `src/sync/sync-run.ts`.
 Этап 6: segmenter длинных документов (`src/search/segmenter.ts`,
-segmentation_version = "1", target 6000–7000 / hard < 8192 токенов,
+segmentation_version = "2", target 6000–7000 / hard < 8192 токенов,
 эвристика chars/3.5 с seam под точный tokenizer), BM25 full-text
 поиск (`src/search/fulltext.ts`, CLI `baka search`) и forensic search по
-chunk.content (--include-reasoning/--include-tools/--all-revisions),
-пересоздание projection — `baka search:rebuild` (`src/search/rebuild.ts`).
+chunk.content (--include-reasoning/--include-tools/--include-system/
+--all-revisions), пересоздание projection — `baka search:rebuild`
+(`src/search/rebuild.ts`).
 Этап 7: embedding pipeline (`src/embeddings/`) — provider abstraction +
 OpenAI provider (batch, dimensions, retry/backoff на 429/5xx) + mock
 provider для тестов; embedding spaces с физическими vector-таблицами
@@ -36,7 +37,13 @@ drill `baka restore:test` — импорт в отдельный namespace
 `baka_restore_test` (import сам создаёт ns/db), сверка counts/инвариантов/
 search-probes, REMOVE NAMESPACE в finally, боевой ns не трогается;
 `baka raw:verify` — raw manifest по source_revision + сверка файлов
-(§16.1/§16.2/§16.4). Полный backup-модуль с rawManifestSha256 — этап 12.
+(§16.1/§16.2/§16.4); rawManifestSha256 в manifest'е backup заполняется
+(hashRawManifest по живой БД в том же lock-окне, что и export).
+Off-device backup и полный backup-модуль — этап 12.
+Этап 9 (частично): legacy snapshot (`src/migration/legacy-snapshot.ts`)
+и preflight migration report (`src/migration/preflight.ts`,
+`baka migration plan`) с построчной reconciliation §15.9 по всем
+legacy-таблицам; `migration run` — этап 10.
 Авторитетный источник требований — `docs/plan.md`; при расхождении кода
 с планом сначала сверяйся с ним.
 
@@ -87,7 +94,17 @@ search-probes, REMOVE NAMESPACE в finally, боевой ns не трогает�
   уходит; конфиг — env (EMBEDDINGS_EXCLUDE_*, см. .env.example);
 - RRF — клиентский (k=60, src/search/hybrid.ts), не search::rrf():
   проще и детерминированно; vector-фильтры §14 применяются при гидратации
-  search_document (post-filter top-50 ANN, без over-fetch);
+  search_document, но при активных фильтрах ANN делает over-fetch
+  (K = min(max(50×4, 200), 1000), EF = max(200, K)) — HNSW в SurrealDB не
+  поддерживает partial WHERE, иначе редкий harness/workspace давал бы
+  ложный пустой результат; pipeline §14: RRF → dedup по message →
+  diversification (≤3 hits на dialogue) → limit;
+- provider worker'а создаётся по space.provider через
+  defaultProviderFactory (src/embeddings/jobs.ts) ДО lease — ошибка (нет
+  ключа, неизвестный provider) оставляет jobs в pending; activateSpace
+  догоняет missing jobs (идемпотентный enqueue); stale job — по всем
+  факторам §13.5 (content hash, extraction/segmentation versions,
+  provider, model, dimensions);
 - цена для `embeddings plan` — только из env
   OPENAI_EMBEDDING_PRICE_PER_1M_TOKENS, в коде не захардкожена.
 
@@ -105,8 +122,83 @@ search-probes, REMOVE NAMESPACE в finally, боевой ns не трогает�
   (инварианты, BM25 probes), а не с константами;
 - `baka backup` берёт preflight + lock (консистентный snapshot относительно
   sync), `restore:test` и `raw:verify` — read-only по архиву, без lock'а;
+- тело /export стримится на диск (`Bun.write(tmp, response)`), НЕ
+  arrayBuffer в память; export и manifest пишутся атомарно: tmp-файл с
+  суффиксом `.part` (не матчится latestExportPath) + fsync + rename;
+- recordCounts и rawManifestSha256 (`hashRawManifest`, src/backup/raw-verify.ts)
+  собираются сразу после export'а при открытом SDK-соединении — то же
+  lock-окно; оставшееся допущение: HTTP /export и SELECT count() — не одна
+  транзакция, drift возможен только от writer'ов мимо baka;
+- restore drill: exportSha256/exportBytes из manifest'а проверяются ДО
+  импорта (несовпадение — ошибка); referential-проверки — dangling
+  references через `record::exists()` (3.2.3) с критерием НОЛЬ нарушений в
+  restored (боевая база — только informational, не критерий); шаг
+  §16.4 п.7 — raw references: verifyRawFiles по restored source_revision +
+  сверка rawManifestSha256, если поле есть;
 - orphan raw-файлы в raw:verify — предупреждение, не failure (их разбор —
   validate/doctor).
+
+Ключевые решения этапа 9 (migration preflight):
+
+- reconciliation §15.9 «ни одна исходная строка не потеряна» — построчная
+  по ВСЕМ legacy-таблицам: threads читаются БЕЗ join'а с agent_systems
+  (тред с битым agent_id не теряется — orphan с record ID в problems),
+  orphan-строки thread_records/messages/message_chunks/raw_backups/projects
+  перечисляются с record ID; per-table {total, accounted, withProblems,
+  lost}, ok = (lost == 0 по всем таблицам), legacyTotal — полное число
+  строк до всякой фильтрации (accounted == legacyTotal);
+- null_file (thread_record без source_file_id) блокирует классификацию
+  from_raw — связь тред→raw backup неполная; threads вообще без
+  thread_records попадают в threadsUncovered;
+- quarantine-записи preflight'а: table/recordId/reason; raw payload,
+  parser version и retry — зона этапа 10 (migration run);
+- checkpoint анализа — formatVersion 2 (checkpoint'ы v1 пересчитываются).
+
+Фиксы код-ревью (приватные отчёты в reports/reviews/):
+
+- head_hash (§10.3): при совпавших size/mtime с прежней revision scanner
+  сверяет быстрый fingerprint (sha256 первых 64 КБ + size,
+  src/sync/head-hash.ts); читается ТОЛЬКО при совпадении size/mtime;
+- process lock атомарен: запись во временный файл + link(2) (EEXIST =
+  занят), stale-takeover — unlink+link до 5 попыток (сценарий №29);
+- last_successful_revision (§23.3): partial ≠ успех; при переводе
+  revision в parse_error указатель очищается (один UPDATE с IF);
+  `baka validate` проверяет указатель (last_successful_not_parsed);
+- canonical hash покрывает message/chunk metadata и usageEvents.raw
+  (детерминированная нормализация ключей) — иначе revision id коллидирует
+  при различиях только в этих полях;
+- primary_model = NONE при revision без модели (assignments() отбрасывал
+  undefined); dry-run sync НИЧЕГО не пишет в БД;
+- kimi-code: snapshot failure любого файла сессии → сессия не
+  пересобирается и не переключается (§9.3/§23.4), retry на следующем sync;
+- rename detection: 2+ отсутствующих источника с тем же SHA →
+  неоднозначность, новый файл — независимый location (§10.7);
+- unknown-события сохраняются ПОЛНОСТЬЮ (без slice(0, 4000)) во всех 7
+  parser'ах (§7.3) — parser_version = 2 у всех; EXTRACTOR_VERSION = 2:
+  граница turn'а — последний user message с humanAuthored true/unknown
+  (общий findLastTurnBoundary), codex final_answer ищется только после
+  неё; kimi raw role → role="unknown" + rawRole; cachedInputTokens =
+  ТОЛЬКО cache read (cache creation — в raw события); claude-desktop
+  дедуплицирует streaming-записи по message.id;
+- segmenter: packBlocks учитывает разделители "\n\n", splitOversized
+  режет по переданному counter'у (hard limit < 8192 соблюдается);
+- integration-тесты без живой БД — явный skip (dbTest() в
+  tests/db-test-utils.ts), не молчаливый pass;
+- замечено на живой 3.2.3: HNSW-граф вырождается на большом числе
+  идентичных векторов (ANN недетерминированно теряет точки) — учесть при
+  relevance evaluation (этап 11).
+
+Отложено осознанно (не входит в фиксы ревью):
+
+- уникальные индексы workspace/workspace_location не добавлены: на боевой
+  базе возможны существующие дубли, UNIQUE-миграция упала бы; защита —
+  process lock + транзакционный ensureWorkspace (repository_identity
+  побеждает path);
+- snapshot provider/model/dimensions на embedding_job невозможен без
+  новой миграции схемы: recorded-сторона stale-проверки — текущие поля
+  space (по конвенции §13.1 они неизменны в рамках space);
+- `migration run` и поля quarantine raw payload/parser version/retry —
+  этап 10.
 
 Найденные live acceptance баги (исправлены с тестами):
 

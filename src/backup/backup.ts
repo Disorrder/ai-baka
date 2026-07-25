@@ -2,14 +2,28 @@
  * Logical backup (docs/plan.md §16.1): HTTP /export боевой базы в
  * `backups/surreal/<timestamp>__schema-<v>__surreal-<ver>.surql.zst` +
  * manifest JSON в `backups/manifests/` (createdAt, версии, bakaCommit,
- * recordCounts по таблицам, exportSha256 сжатого артефакта).
- * Поле rawManifestSha256 из §16.1 — этап 12, здесь не заполняется.
+ * recordCounts по таблицам, rawManifestSha256, exportSha256 сжатого
+ * артефакта).
+ *
+ * Гарантии записи:
+ * - тело /export стримится на диск (НЕ arrayBuffer в память): большой
+ *   export не должен целиком занимать RAM и создавать риск OOM
+ *   (симметрично потоковому /import через Bun.file в restore-test);
+ * - export и manifest пишутся атомарно: tmp-файл в том же каталоге +
+ *   fsync + rename — авария не оставляет частичного файла под финальным
+ *   именем (tmp-суффикс `.part` не матчится latestExportPath);
+ * - recordCounts и rawManifestSha256 собираются в одной точке,
+ *   непосредственно примыкающей к export'у, при открытом SDK-соединении
+ *   (то же lock-окно, что берёт CLI). Оставшееся допущение: HTTP /export
+ *   и SELECT count() — не одна транзакция, SurrealDB не даёт общего
+ *   snapshot'а между вызовами; drift возможен только от writer'ов мимо
+ *   baka — lock не пускает sync на время backup.
  *
  * Preflight/lock не выполняются внутри — это обязанность CLI-обёртки
  * (integration-тесты гоняют backup против временных баз без sentinel).
  */
 
-import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Surreal } from "surrealdb";
 import type { AppConfig } from "../config.ts";
@@ -20,6 +34,7 @@ import { listEmbeddingTables } from "../embeddings/spaces.ts";
 import { hashFile } from "../sources/snapshot/hashing.ts";
 import { compressFile, detectCompression, type Compression } from "./compress.ts";
 import { httpBaseUrl, httpHeaders } from "./http.ts";
+import { buildRawManifest, hashRawManifest } from "./raw-verify.ts";
 
 /** Таблицы схемы 0001–0004; динамические search_embedding_* добавляются из БД. */
 export const CORE_TABLES = [
@@ -58,6 +73,11 @@ export interface BackupManifest {
   namespace: string;
   database: string;
   recordCounts: Record<string, number>;
+  /**
+   * SHA-256 канонического содержимого raw manifest'а (§16.1/§16.2).
+   * Опционально: manifest'ы, записанные до введения поля, его не имеют.
+   */
+  rawManifestSha256?: string;
   exportFile: string;
   compression: Compression;
   exportBytes: number;
@@ -123,40 +143,79 @@ export async function latestExportPath(archiveRoot: string): Promise<string> {
   return path.join(dir, last);
 }
 
+/** fsync файла или каталога (после записи/rename — долговечность). */
+async function fsyncPath(filePath: string): Promise<void> {
+  const handle = await open(filePath, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Атомарная запись: tmp в том же каталоге + fsync + rename + fsync каталога. */
+async function writeFileAtomic(filePath: string, content: string): Promise<void> {
+  const tmp = `${filePath}.tmp-${process.pid}.part`;
+  await writeFile(tmp, content);
+  await fsyncPath(tmp);
+  await rename(tmp, filePath);
+  await fsyncPath(path.dirname(filePath));
+}
+
 export async function runLogicalBackup(cfg: AppConfig): Promise<BackupResult> {
   const surrealDir = path.join(cfg.archiveRoot, "backups", "surreal");
   const manifestsDir = path.join(cfg.archiveRoot, "backups", "manifests");
   await mkdir(surrealDir, { recursive: true });
   await mkdir(manifestsDir, { recursive: true });
 
-  const db = await connectDb(cfg);
-  let schemaVersion: number;
-  let counts: Record<string, number>;
-  try {
-    schemaVersion = await checkSchemaVersion(db);
-    counts = await recordCounts(db);
-  } finally {
-    await db.close();
-  }
   const surrealVersion = (await serverVersion(cfg)) ?? "unknown";
   const compression = await detectCompression();
 
-  const base = exportBaseName(backupTimestamp(), schemaVersion, surrealVersion);
+  const db = await connectDb(cfg);
+  let schemaVersion: number;
+  let base: string;
+  let counts: Record<string, number>;
+  let rawHash: string;
+  let rawTmp: string;
+  try {
+    schemaVersion = await checkSchemaVersion(db);
+    base = exportBaseName(backupTimestamp(), schemaVersion, surrealVersion);
+    const fileName = exportFileName(base, compression);
+    // Суффикс .part: tmp-файлы не матчатся latestExportPath (`.surql.zst|gz`).
+    rawTmp = path.join(surrealDir, `.tmp-${process.pid}-${base}.surql.part`);
+
+    // Тело /export стримится на диск (см. заголовок файла); SDK-соединение
+    // остаётся открытым — counts ниже собираются в том же lock-окне.
+    const response = await fetch(`${httpBaseUrl(cfg)}/export`, {
+      headers: httpHeaders(cfg, cfg.surrealNamespace, cfg.surrealDatabase),
+    });
+    if (!response.ok) {
+      throw new Error(`export: HTTP ${response.status}: ${await response.text()}`);
+    }
+    await Bun.write(rawTmp, response);
+    await fsyncPath(rawTmp);
+
+    // Единая точка, непосредственно примыкающая к export'у (допущение —
+    // в заголовке файла): counts и raw manifest из одного состояния БД.
+    counts = await recordCounts(db);
+    rawHash = hashRawManifest(await buildRawManifest(db));
+  } finally {
+    await db.close();
+  }
+
   const fileName = exportFileName(base, compression);
   const exportPath = path.join(surrealDir, fileName);
-  const tmpPath = path.join(surrealDir, `.tmp-${process.pid}-${fileName.replace(/\.(zst|gz)$/, "")}`);
-
-  const response = await fetch(`${httpBaseUrl(cfg)}/export`, {
-    headers: httpHeaders(cfg, cfg.surrealNamespace, cfg.surrealDatabase),
-  });
-  if (!response.ok) {
-    throw new Error(`export: HTTP ${response.status}: ${await response.text()}`);
-  }
-  await writeFile(tmpPath, Buffer.from(await response.arrayBuffer()));
+  const compressedTmp = path.join(surrealDir, `.tmp-${process.pid}-${fileName}.part`);
   try {
-    await compressFile(tmpPath, exportPath, compression);
+    // Сжатие в tmp + fsync + atomic rename: частичный export никогда
+    // не появляется под финальным именем.
+    await compressFile(rawTmp, compressedTmp, compression);
+    await fsyncPath(compressedTmp);
+    await rename(compressedTmp, exportPath);
+    await fsyncPath(surrealDir);
   } finally {
-    await rm(tmpPath, { force: true });
+    await rm(rawTmp, { force: true });
+    await rm(compressedTmp, { force: true });
   }
 
   const hashes = await hashFile(exportPath);
@@ -168,12 +227,13 @@ export async function runLogicalBackup(cfg: AppConfig): Promise<BackupResult> {
     namespace: cfg.surrealNamespace,
     database: cfg.surrealDatabase,
     recordCounts: counts,
+    rawManifestSha256: rawHash,
     exportFile: fileName,
     compression,
     exportBytes: hashes.sizeBytes,
     exportSha256: hashes.sha256,
   };
   const manifestPath = path.join(manifestsDir, `${base}.json`);
-  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  await writeFileAtomic(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   return { exportPath, manifestPath, manifest };
 }

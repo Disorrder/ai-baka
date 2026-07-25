@@ -11,10 +11,11 @@ import {
   backupTimestamp,
   exportBaseName,
   exportFileName,
+  latestExportPath,
   manifestPathForExport,
 } from "../src/backup/backup.ts";
 import { compressFile, decompressFile, detectCompression } from "../src/backup/compress.ts";
-import { verifyRawFiles, type RawManifest } from "../src/backup/raw-verify.ts";
+import { hashRawManifest, verifyRawFiles, type RawManifest } from "../src/backup/raw-verify.ts";
 import { hashFile } from "../src/sources/snapshot/hashing.ts";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
@@ -47,6 +48,58 @@ describe("backup naming", () => {
         "/archive/backups/manifests/ts__schema-4__surreal-3.2.3.json",
       );
     }
+  });
+
+  test("latestExportPath игнорирует tmp .part (частичный export не «последний»)", async () => {
+    await withTempDir(async (dir) => {
+      const surreal = path.join(dir, "backups", "surreal");
+      await mkdir(surreal, { recursive: true });
+      const good = path.join(surreal, "2026-07-24T120000Z__schema-4__surreal-3.2.3.surql.zst");
+      await writeFile(good, "x");
+      // остаток аварийно прерванного backup'а с более поздним timestamp
+      await writeFile(
+        path.join(surreal, ".tmp-1-2026-07-25T120000Z__schema-4__surreal-3.2.3.surql.zst.part"),
+        "partial",
+      );
+      expect(await latestExportPath(dir)).toBe(good);
+    });
+  });
+});
+
+describe("hashRawManifest (rawManifestSha256, §16.1)", () => {
+  const entries: RawManifest["entries"] = [
+    {
+      revisionId: "source_revision:a",
+      path: "raw/codex/a.jsonl",
+      sha256: "a".repeat(64),
+      sizeBytes: 10,
+      harness: "codex",
+    },
+    {
+      revisionId: "source_revision:b",
+      path: "raw/kimi/b.jsonl",
+      sha256: "b".repeat(64),
+      sizeBytes: 20,
+      harness: null,
+    },
+  ];
+
+  test("детерминирован; createdAt не влияет на hash", () => {
+    const m1: RawManifest = { createdAt: "2026-07-24T00:00:00Z", count: 2, entries };
+    const m2: RawManifest = { createdAt: "2026-07-25T00:00:00Z", count: 2, entries };
+    const hash = hashRawManifest(m1);
+    expect(hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(hashRawManifest(m2)).toBe(hash);
+  });
+
+  test("изменение любой записи меняет hash", () => {
+    const base: RawManifest = { createdAt: "x", count: 2, entries };
+    const changed: RawManifest = {
+      createdAt: "x",
+      count: 2,
+      entries: [entries[0]!, { ...entries[1]!, sizeBytes: 21 }],
+    };
+    expect(hashRawManifest(changed)).not.toBe(hashRawManifest(base));
   });
 });
 

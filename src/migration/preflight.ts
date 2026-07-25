@@ -7,12 +7,19 @@
  *
  * Классификация каждого legacy-диалога (threads) по приоритету
  * восстановления §15.4:
- *   from_raw      — все source files диалога имеют raw backup, файл на диске;
+ *   from_raw      — все source files диалога имеют raw backup, файл на диске
+ *                   и НИ один thread_record не оборван (source_file_id NULL);
  *   from_payload  — все thread_records диалога имеют валидный JSON payload;
  *   from_normalized — есть нормализованные messages/message_chunks;
  *   quarantined   — ничего из перечисленного (§15.9: с record ID и причиной).
  *
- * Reconciliation (критерий этапа 9): legacy total = reconstructable + quarantined.
+ * Reconciliation (§15.9 «ни одна исходная строка не потеряна») ведётся
+ * ПОСТРОЧНО по всем legacy-таблицам: для каждой таблицы total (COUNT(*))
+ * сопоставляется с числом строк, реально увиденных анализом — штатно
+ * (классификация, агрегации) или через запись в problems (orphan,
+ * quarantine, missing file). ok = true только когда accounted == legacyTotal,
+ * т.е. lost == 0 по каждой таблице; бесшумное отсечение строк (например,
+ * INNER JOIN'ом) даёт lost > 0 и ok = false.
  *
  * Анализ большого snapshot'а (json_valid по всем payload) может быть долгим,
  * поэтому результат кэшируется в checkpoint-файл,
@@ -44,10 +51,31 @@ const EXPECTED_TABLES = [
   "message_chunks",
 ] as const;
 
+/**
+ * Проблемная строка (§15.9): таблица, primary key, причина.
+ * Raw payload, parser version и retry-механизм quarantine-записей —
+ * зона этапа 10 (migration run); preflight-отчёт только фиксирует scope
+ * проблемы, чтобы ни одна строка не потерялась бесшумно.
+ */
 export interface PreflightProblem {
   table: string;
   recordId: string;
   reason: string;
+}
+
+/** Построчный учёт одной legacy-таблицы (§15.9). */
+export interface TableReconciliation {
+  /** COUNT(*) таблицы в snapshot'е. */
+  total: number;
+  /**
+   * Строки, реально увиденные анализом: штатная классификация/агрегация
+   * плюс orphan-строки, перечисленные в problems с record ID.
+   */
+  accounted: number;
+  /** Из accounted — строки с записью в problems. */
+  withProblems: number;
+  /** total - accounted; > 0 означает бесшумную потерю строк. */
+  lost: number;
 }
 
 export interface LiveCorpusProbe {
@@ -65,7 +93,7 @@ export interface LiveCorpusProbe {
  * входит: она зависит от текущего состояния SurrealDB.
  */
 export interface LegacyAnalysis {
-  formatVersion: 1;
+  formatVersion: 2;
   snapshotSha256?: string;
   checkRawFiles: boolean;
   schema: PreflightReport["schema"];
@@ -111,6 +139,7 @@ export interface PreflightReport {
     /** диалоги, где ВСЕ thread_records имеют валидный payload */
     threadsFullyCovered: number;
     threadsPartiallyCovered: number;
+    /** включая диалоги вообще без thread_records */
     threadsUncovered: number;
     /** ответ на ключевой вопрос §15.2: покрывает ли payload все диалоги */
     coversAllDialogues: boolean;
@@ -154,11 +183,17 @@ export interface PreflightReport {
     uncertain: Record<string, number>;
     note: string;
   };
+  /**
+   * §15.9: ok = true только когда КАЖДАЯ строка каждой legacy-таблицы
+   * учтена (accounted == legacyTotal, lost == 0 по всем таблицам).
+   */
   reconciliation: {
+    /** Полное число legacy rows по всем таблицам (до всякой фильтрации). */
     legacyTotal: number;
-    reconstructable: number;
-    quarantined: number;
+    accounted: number;
+    lost: number;
     ok: boolean;
+    tables: Record<string, TableReconciliation>;
   };
   problems: PreflightProblem[];
 }
@@ -239,6 +274,15 @@ function count(db: Database, table: string): number {
 }
 
 /**
+ * Учёт строк одной таблицы (§15.9): seen — сколько строк анализ реально
+ * наблюдал (штатная классификация/агрегация + orphan-строки, увиденные
+ * при построении problems). lost = total - seen — бесшумная потеря.
+ */
+function tableRecon(total: number, seen: number, withProblems: number): TableReconciliation {
+  return { total, accounted: seen, withProblems, lost: total - seen };
+}
+
+/**
  * Полный анализ snapshot'а (единственная тяжёлая часть preflight):
  * сканы legacy SQLite + stat raw backup файлов. Результат детерминирован
  * относительно содержимого snapshot'а — кэшируется checkpoint'ом.
@@ -271,14 +315,47 @@ export async function analyzeLegacySnapshot(
       (t) => !(EXPECTED_TABLES as readonly string[]).includes(t) && !t.startsWith("message_search"),
     );
 
-    // --- Диалоги + agent slug (для dedup-ключей против live) ---
-    const threads = db
-      .query<{ id: number; external_id: string; slug: string }, []>(
-        `SELECT t.id, t.external_id, a.slug
-         FROM threads t JOIN agent_systems a ON a.id = t.agent_id`,
-      )
+    // --- agent_systems: slug для dedup-ключей + родитель orphan-проверок ---
+    const agentRows = db
+      .query<{ id: number; slug: string }, []>(`SELECT id, slug FROM agent_systems`)
       .all();
+    const agentSlugById = new Map(agentRows.map((r) => [r.id, r.slug]));
+
+    // --- projects: orphan agent_id ---
+    const projectRows = db
+      .query<{ id: number; agent_id: number }, []>(`SELECT id, agent_id FROM projects`)
+      .all();
+    const projectProblems = new Set<number>();
+    for (const p of projectRows) {
+      if (!agentSlugById.has(p.agent_id)) {
+        projectProblems.add(p.id);
+        problems.push({
+          table: "projects",
+          recordId: String(p.id),
+          reason: `agent_id=${p.agent_id} отсутствует в agent_systems (orphan project)`,
+        });
+      }
+    }
+
+    // --- Диалоги: LEFT JOIN-семантика — тред с битым agent_id НЕ теряется ---
+    const threads = db
+      .query<{ id: number; external_id: string; agent_id: number }, []>(
+        `SELECT id, external_id, agent_id FROM threads`,
+      )
+      .all()
+      .map((t) => ({ ...t, slug: agentSlugById.get(t.agent_id) ?? null }));
     const threadById = new Map(threads.map((t) => [t.id, t]));
+    const threadProblems = new Set<number>();
+    for (const t of threads) {
+      if (t.slug === null) {
+        threadProblems.add(t.id);
+        problems.push({
+          table: "threads",
+          recordId: String(t.id),
+          reason: `agent_id=${t.agent_id} отсутствует в agent_systems (orphan thread, harness неизвестен)`,
+        });
+      }
+    }
 
     // --- Один проход по thread_records: payload coverage + привязка к source files ---
     const coverage = db
@@ -312,18 +389,28 @@ export async function analyzeLegacySnapshot(
     let payloadPresent = 0;
     let payloadValid = 0;
     let threadRecordsTotal = 0;
+    let orphanRecordRows = 0; // строки thread_records с thread_id вне threads
     for (const row of coverage) {
       threadRecordsTotal += row.total;
       payloadPresent += row.present;
       payloadValid += row.valid;
-      if (!threadById.has(row.thread_id)) {
-        problems.push({
-          table: "thread_records",
-          recordId: `thread_id=${row.thread_id}`,
-          reason: "thread_id отсутствует в threads (orphan records)",
-        });
-      }
+      if (!threadById.has(row.thread_id)) orphanRecordRows += row.total;
       coverageByThread.set(row.thread_id, row);
+    }
+    // Orphan thread_records — каждая строка с record ID (§15.9)
+    const recordProblems = new Set<number>();
+    for (const row of db
+      .query<{ id: number }, []>(
+        `SELECT tr.id FROM thread_records tr
+         LEFT JOIN threads t ON t.id = tr.thread_id WHERE t.id IS NULL`,
+      )
+      .all()) {
+      recordProblems.add(row.id);
+      problems.push({
+        table: "thread_records",
+        recordId: String(row.id),
+        reason: "thread_id отсутствует в threads (orphan record)",
+      });
     }
 
     // --- Raw backup файлы на диске (один stat на уникальный archive_path) ---
@@ -332,6 +419,10 @@ export async function analyzeLegacySnapshot(
         `SELECT id, source_file_id, archive_path FROM raw_backups`,
       )
       .all();
+    const sourceFileIds = new Set(
+      db.query<{ id: number }, []>(`SELECT id FROM source_files`).all().map((r) => r.id),
+    );
+    const backupProblems = new Set<number>();
     const fileExists = new Map<string, boolean>();
     const backupFileOk = new Map<number, boolean>(); // source_file_id → файл есть
     if (checkRawFiles) {
@@ -348,6 +439,7 @@ export async function analyzeLegacySnapshot(
         }
         backupFileOk.set(rb.source_file_id, ok);
         if (!ok) {
+          backupProblems.add(rb.id);
           problems.push({
             table: "raw_backups",
             recordId: String(rb.id),
@@ -357,6 +449,17 @@ export async function analyzeLegacySnapshot(
       }
     } else {
       for (const rb of backupPaths) backupFileOk.set(rb.source_file_id, true);
+    }
+    // raw_backups на несуществующий source_file — orphan с record ID
+    for (const rb of backupPaths) {
+      if (!sourceFileIds.has(rb.source_file_id)) {
+        backupProblems.add(rb.id);
+        problems.push({
+          table: "raw_backups",
+          recordId: String(rb.id),
+          reason: `source_file_id=${rb.source_file_id} отсутствует в source_files (orphan raw backup)`,
+        });
+      }
     }
     const backupOkByFile = new Map<number, boolean>();
     for (const rb of backupPaths) {
@@ -376,14 +479,57 @@ export async function analyzeLegacySnapshot(
       filesByThread.set(row.thread_id, list);
     }
 
-    // --- Нормализованные сообщения ---
+    // --- Нормализованные сообщения + orphan-учёт ---
     const messagesByThread = new Map<number, number>();
+    let messagesTotal = 0;
+    let orphanMessageRows = 0;
     for (const row of db
       .query<{ thread_id: number; c: number }, []>(
         `SELECT thread_id, COUNT(*) AS c FROM messages GROUP BY thread_id`,
       )
       .all()) {
       messagesByThread.set(row.thread_id, row.c);
+      messagesTotal += row.c;
+      if (!threadById.has(row.thread_id)) orphanMessageRows += row.c;
+    }
+    const messageProblems = new Set<number>();
+    for (const row of db
+      .query<{ id: number }, []>(
+        `SELECT m.id FROM messages m
+         LEFT JOIN threads t ON t.id = m.thread_id WHERE t.id IS NULL`,
+      )
+      .all()) {
+      messageProblems.add(row.id);
+      problems.push({
+        table: "messages",
+        recordId: String(row.id),
+        reason: "thread_id отсутствует в threads (orphan message)",
+      });
+    }
+
+    // --- message_chunks: orphan message_id ---
+    const chunksTotal = count(db, "message_chunks");
+    const orphanChunkRows =
+      db
+        .query<{ n: number }, []>(
+          `SELECT COALESCE(SUM(c), 0) AS n FROM (
+             SELECT message_id, COUNT(*) AS c FROM message_chunks GROUP BY message_id
+           ) WHERE message_id NOT IN (SELECT id FROM messages)`,
+        )
+        .get()?.n ?? 0;
+    const chunkProblems = new Set<number>();
+    for (const row of db
+      .query<{ id: number }, []>(
+        `SELECT mc.id FROM message_chunks mc
+         LEFT JOIN messages m ON m.id = mc.message_id WHERE m.id IS NULL`,
+      )
+      .all()) {
+      chunkProblems.add(row.id);
+      problems.push({
+        table: "message_chunks",
+        recordId: String(row.id),
+        reason: "message_id отсутствует в messages (orphan chunk)",
+      });
     }
 
     // --- Классификация диалогов (приоритет §15.4) ---
@@ -400,10 +546,16 @@ export async function analyzeLegacySnapshot(
         if (cov.valid === cov.total) threadsFullyCovered += 1;
         else if (cov.valid > 0) threadsPartiallyCovered += 1;
         else threadsUncovered += 1;
+      } else {
+        // тред вообще без thread_records — тоже без payload-покрытия
+        threadsUncovered += 1;
       }
       const files = filesByThread.get(thread.id) ?? [];
+      // null_file (thread_record без source_file_id) разрывает связь
+      // тред → raw backup: такой тред НЕ полностью восстанавливается из raw.
       const rawOk =
         cov !== undefined &&
+        cov.null_file === 0 &&
         files.length > 0 &&
         files.every((f) => backupOkByFile.get(f) === true);
       if (rawOk) {
@@ -414,6 +566,7 @@ export async function analyzeLegacySnapshot(
         onlyNormalized += 1;
       } else {
         quarantined += 1;
+        threadProblems.add(thread.id);
         const reason = !cov
           ? "нет thread_records и нет messages"
           : "raw backup неполон, payload невалиден/отсутствует, messages нет";
@@ -434,6 +587,7 @@ export async function analyzeLegacySnapshot(
       .get()?.c ?? 0;
 
     // --- source_files без raw_backups ---
+    const sourceFileProblems = new Set<number>();
     const withoutBackup = db
       .query<{ id: number }, []>(
         `SELECT sf.id FROM source_files sf
@@ -442,6 +596,7 @@ export async function analyzeLegacySnapshot(
       )
       .all();
     for (const row of withoutBackup) {
+      sourceFileProblems.add(row.id);
       problems.push({
         table: "source_files",
         recordId: String(row.id),
@@ -499,9 +654,44 @@ export async function analyzeLegacySnapshot(
       }
     }
 
-    const reconstructableTotal = fromRaw + fromPayload + onlyNormalized;
+    // --- Reconciliation §15.9: построчный учёт по ВСЕМ legacy-таблицам ---
+    const reconTables: Record<string, TableReconciliation> = {
+      agent_systems: tableRecon(count(db, "agent_systems"), agentRows.length, 0),
+      projects: tableRecon(count(db, "projects"), projectRows.length, projectProblems.size),
+      source_files: tableRecon(
+        count(db, "source_files"),
+        Object.keys(sourceFileSha256).length,
+        sourceFileProblems.size,
+      ),
+      raw_backups: tableRecon(count(db, "raw_backups"), backupPaths.length, backupProblems.size),
+      threads: tableRecon(count(db, "threads"), threads.length, threadProblems.size),
+      thread_records: tableRecon(
+        count(db, "thread_records"),
+        threadRecordsTotal - orphanRecordRows + recordProblems.size,
+        recordProblems.size,
+      ),
+      messages: tableRecon(
+        count(db, "messages"),
+        messagesTotal - orphanMessageRows + messageProblems.size,
+        messageProblems.size,
+      ),
+      message_chunks: tableRecon(
+        chunksTotal,
+        chunksTotal - orphanChunkRows + chunkProblems.size,
+        chunkProblems.size,
+      ),
+    };
+    let legacyTotal = 0;
+    let accounted = 0;
+    let lost = 0;
+    for (const t of Object.values(reconTables)) {
+      legacyTotal += t.total;
+      accounted += t.accounted;
+      lost += t.lost;
+    }
+
     return {
-      formatVersion: 1,
+      formatVersion: 2,
       snapshotSha256: options.snapshotSha256,
       checkRawFiles,
       schema: { tables, expected, extra },
@@ -509,8 +699,8 @@ export async function analyzeLegacySnapshot(
         sourceFiles: count(db, "source_files"),
         rawBackups: count(db, "raw_backups"),
         dialogues: threads.length,
-        messages: count(db, "messages"),
-        chunks: count(db, "message_chunks"),
+        messages: messagesTotal,
+        chunks: chunksTotal,
         threadRecords: threadRecordsTotal,
       },
       payload: {
@@ -552,15 +742,10 @@ export async function analyzeLegacySnapshot(
         uncertain: Object.fromEntries([...uncertain.entries()].sort()),
         note: "legacy metadata не содержит идентификатора машины (§15.6 п.2 неприменим): атрибуция только по original_path",
       },
-      reconciliation: {
-        legacyTotal: threads.length,
-        reconstructable: reconstructableTotal,
-        quarantined,
-        ok: threads.length === reconstructableTotal + quarantined,
-      },
+      reconciliation: { legacyTotal, accounted, lost, ok: lost === 0, tables: reconTables },
       problems,
       sourceFileSha256,
-      threadKeys: threads.map((t) => `${t.slug}:${t.external_id}`),
+      threadKeys: threads.map((t) => `${t.slug ?? "?"}:${t.external_id}`),
     };
   } finally {
     db.close();
@@ -656,7 +841,7 @@ export async function loadAnalysisCheckpoint(
   }
   try {
     const parsed = JSON.parse(raw) as LegacyAnalysis;
-    if (parsed.formatVersion !== 1) return null;
+    if (parsed.formatVersion !== 2) return null;
     if (parsed.snapshotSha256 !== snapshotSha256) return null;
     if (parsed.checkRawFiles !== checkRawFiles) return null;
     return parsed;
@@ -713,10 +898,17 @@ export function formatPreflightSummary(report: PreflightReport): string {
   for (const [prefix, n] of Object.entries(report.hostMapping.uncertain)) {
     p(`host mapping: uncertain ${prefix}`, n);
   }
+  const r = report.reconciliation;
   p(
-    "reconciliation",
-    `${report.reconciliation.legacyTotal} = ${report.reconciliation.reconstructable} reconstructable + ${report.reconciliation.quarantined} quarantined → ${report.reconciliation.ok ? "ok" : "FAIL"}`,
+    "reconciliation (§15.9)",
+    `${r.legacyTotal} legacy rows = ${r.accounted} учтено + ${r.lost} потеряно → ${r.ok ? "ok" : "FAIL"}`,
   );
+  for (const [table, tr] of Object.entries(r.tables)) {
+    p(
+      `  ${table}`,
+      `total ${tr.total}, accounted ${tr.accounted}, problems ${tr.withProblems}, lost ${tr.lost}`,
+    );
+  }
   p("problems", report.problems.length);
   return lines.join("\n");
 }
