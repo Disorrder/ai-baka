@@ -159,8 +159,10 @@ legacy-таблицам; `migration run` — этап 10.
 - head_hash (§10.3): при совпавших size/mtime с прежней revision scanner
   сверяет быстрый fingerprint (sha256 первых 64 КБ + size,
   src/sync/head-hash.ts); читается ТОЛЬКО при совпадении size/mtime;
-- process lock атомарен: запись во временный файл + link(2) (EEXIST =
-  занят), stale-takeover — unlink+link до 5 попыток (сценарий №29);
+- process lock атомарен: open(2) с флагом "wx" (O_EXCL; том архива НЕ
+  поддерживает hardlink — ENOTSUP), нечитаемый lock перечитывается с
+  паузами прежде чем считаться stale, stale-takeover — unlink+wx до 5
+  попыток (сценарий №29);
 - last_successful_revision (§23.3): partial ≠ успех; при переводе
   revision в parse_error указатель очищается (один UPDATE с IF);
   `baka validate` проверяет указатель (last_successful_not_parsed);

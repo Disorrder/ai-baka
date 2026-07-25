@@ -1,4 +1,4 @@
-import { link, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { open, readFile, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
@@ -40,16 +40,24 @@ export async function readLock(archiveRoot: string): Promise<LockInfo | null> {
 /** Ограничение попыток stale-takeover при гонке за освобождённый lock. */
 const MAX_ATTEMPTS = 5;
 
+/** Паузы перед признанием нечитаемого lock'а stale (см. acquireLock). */
+const BROKEN_REREAD_MS = [50, 100, 200, 400];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Захватывает process lock. Броском LockError отказывает, если lock держит
  * живой процесс; stale lock (мёртвый PID) перезаписывается.
  *
- * Атомарность (сценарий §19.2 №29): содержимое пишется во временный файл
- * и появляется на месте lock-файла через link(2) — атомарно и с отказом
- * EEXIST, если lock уже существует. Окон «пустой lock-файл» и read-check-
- * write гонки нет. Stale-takeover (unlink → link) повторяется ограниченное
- * число раз: проигравший гонку видит живой PID победителя и получает
- * LockError.
+ * Атомарность (сценарий §19.2 №29): lock создаётся open(2) с флагом "wx"
+ * (O_EXCL) — атомарный exclusive create, работает на томе архива (hardlink
+ * там не поддерживается, ENOTSUP). Между create и записью содержимого есть
+ * окно «пустой lock-файл»: конкурент, увидевший нечитаемый lock, повторяет
+ * чтение с паузами (BROKEN_REREAD_MS) и лишь затем считает его stale.
+ * Stale-takeover (unlink → wx) повторяется ограниченное число раз:
+ * проигравший гонку видит живой PID победителя и получает LockError.
  */
 export async function acquireLock(
   archiveRoot: string,
@@ -62,13 +70,20 @@ export async function acquireLock(
     startedAt: new Date().toISOString(),
   };
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    await writeFile(tmp, JSON.stringify(info), "utf8");
     try {
-      await link(tmp, file);
+      const handle = await open(file, "wx");
+      await handle.writeFile(JSON.stringify(info), "utf8");
+      await handle.close();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const existing = await readLock(archiveRoot);
+      let existing = await readLock(archiveRoot);
+      // Окно create→write у держателя: нечитаемый lock перечитываем с
+      // паузами, прежде чем считать его битым/stale.
+      for (const pause of BROKEN_REREAD_MS) {
+        if (existing) break;
+        await sleep(pause);
+        existing = await readLock(archiveRoot);
+      }
       if (existing && pidAlive(existing.pid)) {
         throw new LockError(
           `lock уже захвачен: pid=${existing.pid} ` +
@@ -76,12 +91,10 @@ export async function acquireLock(
         );
       }
       // Stale или битый lock: убираем и пробуем снова. Если параллельный
-      // процесс успеет создать свой lock раньше — следующий link даст
+      // процесс успеет создать свой lock раньше — следующий wx даст
       // EEXIST, и мы увидим его живой PID.
       await unlink(file).catch(() => {});
       continue;
-    } finally {
-      await rm(tmp, { force: true });
     }
     let released = false;
     return async () => {
