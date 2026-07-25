@@ -1,0 +1,9 @@
+{"type":"metadata","protocol_version":"1.4","created_at":1783600000000}
+{"type":"turn.prompt","input":[{"type":"text","text":""}],"origin":{"kind":"user"},"time":1783600001000}
+{"type":"llm.request","kind":"loop","provider":"kimi","model":"k3","modelAlias":"kimi-code/k3","thinkingEffort":"low","messageCount":1,"time":1783600001001}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"u-step-1","turnId":"1","step":1},"time":1783600001002}
+{"type":"context.append_loop_event","event":{"type":"quantum.entangle","uuid":"u-ev-1","turnId":"1","step":1,"qubits":2},"time":1783600001100}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"u-part-1","turnId":"1","step":1,"stepUuid":"u-step-1","part":{"type":"hologram","frames":7}},"time":1783600001200}
+{"type":"time_travel","destination":"1985-10-26","time":1783600001300}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"u-step-end-1","turnId":"1","step":1,"usage":{"inputOther":100,"output":0,"inputCacheRead":50,"inputCacheCreation":0},"finishReason":"stop","messageId":"chatcmpl-fixture5"},"time":1783600001400}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"u-part-2","turnId":"1","step":2,"part":{"type":"text","text":"Обрезанный ответ, не успел дописа

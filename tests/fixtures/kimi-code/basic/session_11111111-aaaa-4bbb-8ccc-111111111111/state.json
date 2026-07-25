@@ -1,0 +1,16 @@
+{
+  "createdAt": "2026-07-10T12:00:00.000Z",
+  "updatedAt": "2026-07-10T12:05:00.000Z",
+  "title": "Объясни работу кэша в src/cache.ts",
+  "isCustomTitle": false,
+  "agents": {
+    "main": {
+      "homedir": "agents/main",
+      "type": "main",
+      "parentAgentId": null
+    }
+  },
+  "custom": {},
+  "workDir": "/Users/example/projects/demo-app",
+  "lastPrompt": "Объясни работу кэша в src/cache.ts"
+}

@@ -9,6 +9,14 @@ SQLite через `VACUUM INTO`, deletion/rename/reconcile-логика). Зап
 из sync пока нет (этап 5). Авторитетный источник требований — `docs/plan.md`;
 при расхождении кода с планом сначала сверяйся с ним.
 
+Этап 4 реализован частично (4a): parser contract (`src/domain/`), общие
+нормализаторы model/usage и базовый интерфейс parser'а
+(`src/parsers/shared/`), reference-parser'ы `src/parsers/codex/` и
+`src/parsers/kimi-code/` (parser_version = 1), extractor'ы
+user_prompt/assistant_final (`src/search/extractors/`) для тех же двух
+harness'ов, обезличенные golden fixtures в `tests/fixtures/`. Parser'ы
+остальных 5 harness'ов добавляются по этому образцу.
+
 ## Стек
 
 - Bun + TypeScript, CLI `baka`.

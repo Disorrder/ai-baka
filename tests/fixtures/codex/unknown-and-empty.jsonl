@@ -1,0 +1,8 @@
+{"timestamp":"2026-07-04T18:00:00.000Z","type":"session_meta","payload":{"id":"44444444-5555-4666-8777-888888888888","timestamp":"2026-07-04T18:00:00.000Z","cwd":"/Users/example/projects/notes","originator":"codex_cli_rs","cli_version":"0.51.0","source":"cli","model_provider":"openai"}}
+{"timestamp":"2026-07-04T18:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Покажи список заметок."}]}}
+{"timestamp":"2026-07-04T18:00:01.100Z","type":"event_msg","payload":{"type":"user_message","message":"Покажи список заметок.","images":[],"local_images":[]}}
+{"timestamp":"2026-07-04T18:00:02.000Z","type":"response_item","payload":{"type":"quantum_flux_capacitor","id":"qf_001","flux":42}}
+{"timestamp":"2026-07-04T18:00:03.000Z","type":"event_msg","payload":{"type":"hologram_rendered","hologram":{"frames":12}}}
+{"timestamp":"2026-07-04T18:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-07-04T18:00:05.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Вот список заметок: одна, две, три."}]}}
+{"timestamp":"2026-07-04T18:00:05.100Z","type":"event_msg","payload":{"type":"agent_message","message":"Вот список заметок: одна, две, три.","phase":"final_answer"}}

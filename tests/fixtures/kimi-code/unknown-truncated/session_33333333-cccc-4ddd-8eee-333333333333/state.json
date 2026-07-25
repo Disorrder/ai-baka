@@ -1,0 +1,11 @@
+{
+  "createdAt": "2026-07-12T20:00:00.000Z",
+  "updatedAt": "2026-07-12T20:01:00.000Z",
+  "title": "Пустой ответ",
+  "isCustomTitle": false,
+  "agents": {
+    "main": { "homedir": "agents/main", "type": "main", "parentAgentId": null }
+  },
+  "custom": {},
+  "workDir": "/Users/example/projects/notes"
+}

@@ -1,0 +1,22 @@
+{
+  "createdAt": "2026-07-11T09:00:00.000Z",
+  "updatedAt": "2026-07-11T09:20:00.000Z",
+  "title": "Найди утечку памяти в воркере",
+  "isCustomTitle": false,
+  "agents": {
+    "main": {
+      "homedir": "agents/main",
+      "type": "main",
+      "parentAgentId": null
+    },
+    "agent-0": {
+      "homedir": "agents/agent-0",
+      "type": "sub",
+      "parentAgentId": "main"
+    }
+  },
+  "custom": {},
+  "workDir": "/Users/example/projects/shop",
+  "lastPrompt": "Найди утечку памяти в воркере",
+  "forkedFrom": "session_00000000-dead-4eef-8000-000000000000"
+}

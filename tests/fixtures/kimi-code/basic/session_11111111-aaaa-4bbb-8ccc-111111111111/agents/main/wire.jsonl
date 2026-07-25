@@ -1,0 +1,13 @@
+{"type":"metadata","protocol_version":"1.4","created_at":1783400000000}
+{"type":"config.update","profileName":"agent","systemPrompt":"You are a synthetic fixture agent.","time":1783400000000}
+{"type":"config.update","modelAlias":"kimi-code/k3","thinkingEffort":"high","time":1783400000001}
+{"type":"permission.set_mode","mode":"yolo","time":1783400000002}
+{"type":"tools.set_active_tools","names":["Read","Grep","Bash"],"time":1783400000003}
+{"type":"turn.prompt","input":[{"type":"text","text":"Объясни работу кэша в src/cache.ts"}],"origin":{"kind":"user"},"time":1783400001000}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"Объясни работу кэша в src/cache.ts"}],"toolCalls":[],"origin":{"kind":"user"}},"time":1783400001001}
+{"type":"llm.request","kind":"loop","provider":"kimi","model":"k3","modelAlias":"kimi-code/k3","thinkingEffort":"high","maxTokens":1048576,"messageCount":1,"time":1783400001002}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"step-uuid-1","turnId":"1","step":1},"time":1783400001003}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"part-uuid-1","turnId":"1","step":1,"stepUuid":"step-uuid-1","part":{"type":"think","think":"Сначала прочитаю src/cache.ts, чтобы понять механизм кэширования."}},"time":1783400001500}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"part-uuid-2","turnId":"1","step":1,"stepUuid":"step-uuid-1","part":{"type":"text","text":"Кэш в src/cache.ts устроен как in-memory Map с TTL."}},"time":1783400002000}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"step-end-uuid-1","turnId":"1","step":1,"usage":{"inputOther":800,"output":120,"inputCacheRead":4200,"inputCacheCreation":0},"finishReason":"stop","messageId":"chatcmpl-fixture1"},"time":1783400002100}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":800,"output":120,"inputCacheRead":4200,"inputCacheCreation":0},"usageScope":"turn","time":1783400002101}

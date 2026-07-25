@@ -1,0 +1,4 @@
+{"timestamp":"2026-07-05T08:00:00.000Z","type":"session_meta","payload":{"id":"55555555-6666-4777-8888-999999999999","timestamp":"2026-07-05T08:00:00.000Z","cwd":"/Users/example/projects/broken","originator":"codex_cli_rs","cli_version":"0.51.0","source":"cli","model_provider":"openai"}}
+{"timestamp":"2026-07-05T08:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Прочитай README."}]}}
+{"timestamp":"2026-07-05T08:00:01.100Z","type":"event_msg","payload":{"type":"user_message","message":"Прочитай README.","images":[],"local_images":[]}}
+{"timestamp":"2026-07-05T08:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"README прочитан: проект — утилита для замето

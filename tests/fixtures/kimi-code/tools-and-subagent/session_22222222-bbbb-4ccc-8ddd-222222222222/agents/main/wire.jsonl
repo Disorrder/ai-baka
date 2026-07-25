@@ -1,0 +1,19 @@
+{"type":"metadata","protocol_version":"1.4","created_at":1783500000000}
+{"type":"config.update","modelAlias":"kimi-code/k3","thinkingEffort":"high","time":1783500000001}
+{"type":"turn.prompt","input":[{"type":"text","text":"Найди утечку памяти в воркере"}],"origin":{"kind":"user"},"time":1783500001000}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"Найди утечку памяти в воркере"}],"toolCalls":[],"origin":{"kind":"user"}},"time":1783500001001}
+{"type":"llm.request","kind":"loop","provider":"kimi","model":"k3","modelAlias":"kimi-code/k3","thinkingEffort":"high","messageCount":1,"time":1783500001002}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"m-step-1","turnId":"1","step":1},"time":1783500001003}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"m-part-1","turnId":"1","step":1,"stepUuid":"m-step-1","part":{"type":"think","think":"Запущу субагента для статического анализа воркера."}},"time":1783500001100}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"m-part-2","turnId":"1","step":1,"stepUuid":"m-step-1","part":{"type":"text","text":"Сначала соберу профиль памяти и запущу статический анализ."}},"time":1783500001200}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"tool_call_aaa111","turnId":"1","step":1,"stepUuid":"m-step-1","toolCallId":"tool_call_aaa111","name":"Bash","args":{"command":"node --expose-gc scripts/profile-worker.js","description":"Профилирование воркера"}},"time":1783500001300}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"tool_call_bbb222","turnId":"1","step":1,"stepUuid":"m-step-1","toolCallId":"tool_call_bbb222","name":"Agent","args":{"description":"Статический анализ воркера","prompt":"Найди подозрительные замыкания в src/worker.ts"}},"time":1783500001400}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"m-step-end-1","turnId":"1","step":1,"usage":{"inputOther":1500,"output":300,"inputCacheRead":8000,"inputCacheCreation":500},"finishReason":"tool_use","messageId":"chatcmpl-fixture2"},"time":1783500001500}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"tool_call_aaa111","toolCallId":"tool_call_aaa111","result":{"output":"heap grew 12MB over 60s"}},"time":1783500004000}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"tool_call_bbb222","toolCallId":"tool_call_bbb222","result":{"output":"Подозрительное замыкание в src/worker.ts:48 — таймер держит ссылку на буфер."}},"time":1783500009000}
+{"type":"llm.request","kind":"loop","provider":"kimi","model":"k3","modelAlias":"kimi-code/k3","thinkingEffort":"high","messageCount":4,"time":1783500009001}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"m-step-2","turnId":"1","step":2},"time":1783500009002}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"m-part-3","turnId":"1","step":2,"stepUuid":"m-step-2","part":{"type":"text","text":"Профиль показывает рост heap на 12MB в минуту."}},"time":1783500009100}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"m-part-4","turnId":"1","step":2,"stepUuid":"m-step-2","part":{"type":"text","text":"Причина: таймер в src/worker.ts:48 удерживает буфер. Очищайте ссылку в callback."}},"time":1783500009200}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"m-step-end-2","turnId":"1","step":2,"usage":{"inputOther":2300,"output":180,"inputCacheRead":9600,"inputCacheCreation":0},"finishReason":"stop","messageId":"chatcmpl-fixture3"},"time":1783500009300}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":3800,"output":480,"inputCacheRead":17600,"inputCacheCreation":500},"usageScope":"turn","time":1783500009301}
