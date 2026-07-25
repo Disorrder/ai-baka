@@ -90,8 +90,13 @@ export function chunkRecordId(revisionId: string, messageSequence: number, chunk
   return deterministicId("chk", `${revisionId}:${messageSequence}:${chunkSequence}`);
 }
 
-export function searchDocumentRecordId(revisionId: string, documentType: string, segmentNo: number): string {
-  return deterministicId("sdoc", `${revisionId}:${documentType}:${segmentNo}`);
+export function searchDocumentRecordId(
+  revisionId: string,
+  documentType: string,
+  docIndex: number,
+  segmentNo: number,
+): string {
+  return deterministicId("sdoc", `${revisionId}:${documentType}:${docIndex}:${segmentNo}`);
 }
 
 export function embeddingJobRecordId(searchDocumentId: string, embeddingSpaceId: string): string {

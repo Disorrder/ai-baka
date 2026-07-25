@@ -69,8 +69,14 @@ describe("deterministic ids", () => {
 
   test("message/search doc id пространства revision", () => {
     expect(messageRecordId("r", 0)).not.toBe(messageRecordId("r", 1));
-    expect(searchDocumentRecordId("r", "user_prompt", 0)).not.toBe(
-      searchDocumentRecordId("r", "assistant_final", 0),
+    expect(searchDocumentRecordId("r", "user_prompt", 0, 0)).not.toBe(
+      searchDocumentRecordId("r", "assistant_final", 0, 0),
+    );
+    expect(searchDocumentRecordId("r", "user_prompt", 0, 0)).not.toBe(
+      searchDocumentRecordId("r", "user_prompt", 0, 1),
+    );
+    expect(searchDocumentRecordId("r", "user_prompt", 0, 0)).not.toBe(
+      searchDocumentRecordId("r", "user_prompt", 1, 0),
     );
     expect(deterministicId("p", "k")).toBe(`p_${"0".repeat(0)}`.slice(0, 2) + deterministicId("p", "k").slice(2));
   });

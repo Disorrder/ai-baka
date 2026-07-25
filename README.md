@@ -6,12 +6,15 @@
 с нуля: SurrealDB становится канонической моделью и индексом поверх неизменяемого
 raw-архива, а не местом, куда напрямую перекладываются прежние таблицы SQLite.
 
-**Статус:** этап 5 плана (SurrealDB writer и structured sync) завершён:
-репозитории поверх SDK, атомарная транзакция диалога (§10.4), immutable
-dialogue revisions с current pointers, quarantine через ingest_error,
-`baka sync` / `baka status` / `baka validate`. Первый живой sync по kimi-code
-пройден на боевой базе; повторный sync идемпотентен. Схема БД — миграции
-в [`schema/`](schema/) (применяются `bun run db:migrate`, runner —
+**Статус:** этап 6 плана (search documents и full-text) завершён:
+segmenter длинных документов (§13.4, segmentation_version = "1"),
+BM25-поиск по search_document с highlights, forensic search по chunk
+(reasoning/tools/all-revisions), `baka search` / `baka search:rebuild`.
+Ранее — этап 5: репозитории поверх SDK, атомарная транзакция диалога
+(§10.4), immutable dialogue revisions с current pointers, quarantine через
+ingest_error, `baka sync` / `baka status` / `baka validate`. Живой sync по
+kimi-code пройден на боевой базе; повторный sync идемпотентен. Схема БД —
+миграции в [`schema/`](schema/) (применяются `bun run db:migrate`, runner —
 `src/db/migrations.ts`). Авторитетным источником требований остаётся
 [`docs/plan.md`](docs/plan.md).
 
@@ -23,6 +26,15 @@ dialogue revisions с current pointers, quarantine через ingest_error,
   транзакции диалогов → search_documents → embedding jobs (только при
   active embedding space; сам OpenAI не вызывается). Лог событий — JSON
   lines в stderr;
+- `baka search <query> [--mode text] [--harness] [--host] [--workspace]
+  [--model] [--document-type] [--from] [--to] [--deleted-only] [--limit]
+  [--include-reasoning] [--include-tools] [--all-revisions] [--json]` —
+  BM25 по search_document (только current revisions) с highlights;
+  forensic-флаги переключают поиск на chunk.content (§12.1); режимы
+  vector/hybrid — этап 7;
+- `baka search:rebuild [--no-enqueue-embeddings] [--json]` — пересоздать
+  search projection для всех current revisions (после смены
+  segmenter/extractor versions, §8.1);
 - `baka status [--json]` — сводка архива (§17.2);
 - `baka validate [--json]` — проверка инвариантов (§17.3): orphan raw,
   missing/hash mismatch raw, dialogue без current / current не ready,

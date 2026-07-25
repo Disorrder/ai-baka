@@ -20,6 +20,10 @@ import { runSync } from "./sync/sync-run.ts";
 import { HARNESSES, type HarnessSlug } from "./sources/adapters/harnesses.ts";
 import { collectStatus, formatStatus } from "./status.ts";
 import { runValidation } from "./validate.ts";
+import { isForensic, searchForensic, searchText, type SearchHit } from "./search/fulltext.ts";
+import { rebuildSearchProjection } from "./search/rebuild.ts";
+import { localIdentity } from "./sync/host-identity.ts";
+import { ensureHost } from "./db/repositories/identity.ts";
 
 const program = new Command();
 
@@ -263,9 +267,162 @@ program
     ),
   );
 
+function formatHit(index: number, hit: SearchHit): string {
+  const meta = [
+    hit.documentType ?? hit.kind,
+    hit.segmentNo !== undefined ? `seg ${hit.segmentNo}` : undefined,
+    hit.harness,
+    hit.host,
+    hit.workspace,
+    hit.model,
+    hit.timestamp,
+  ]
+    .filter(Boolean)
+    .join(" | ");
+  const title = hit.dialogueTitle ?? "(без названия)";
+  return (
+    `[${index + 1}] score ${hit.score.toFixed(3)} — ${title}\n` +
+    `    ${meta}\n` +
+    `    ${hit.snippet}\n` +
+    `    ${hit.dialogueId} ${hit.revisionId}`
+  );
+}
+
 program
-  .command("status")
-  .description("Сводка состояния архива (docs/plan.md §17.2)")
+  .command("search <query>")
+  .description("Full-text поиск по архиву (docs/plan.md §12, §14)")
+  .option("--mode <mode>", "text|vector|hybrid", "text")
+  .option("--harness <slug>", "только один harness")
+  .option("--host <label|hostname>", "только одна машина")
+  .option("--workspace <name>", "только один проект")
+  .option("--model <name>", "модель (raw или canonical name)")
+  .option("--document-type <type>", "user_prompt|assistant_final")
+  .option("--from <date>", "не раньше (ISO date)")
+  .option("--to <date>", "не позже (ISO date)")
+  .option("--deleted-only", "только диалоги, удалённые из источника")
+  .option("--include-reasoning", "forensic: включить thought-чанки (поиск по chunk)")
+  .option("--include-tools", "forensic: включить tool_call/tool_result (поиск по chunk)")
+  .option("--all-revisions", "forensic: искать по всем revisions, не только current")
+  .option("--limit <n>", "максимум результатов", Number)
+  .option("--json", "вывести результат в JSON")
+  .action(
+    handle(
+      async (
+        query: string,
+        options: {
+          mode: string;
+          harness?: string;
+          host?: string;
+          workspace?: string;
+          model?: string;
+          documentType?: string;
+          from?: string;
+          to?: string;
+          deletedOnly?: boolean;
+          includeReasoning?: boolean;
+          includeTools?: boolean;
+          allRevisions?: boolean;
+          limit?: number;
+          json?: boolean;
+        },
+      ) => {
+        if (options.mode !== "text") {
+          console.error(
+            `режим ${options.mode} недоступен до этапа 7 (embedding pipeline); используйте --mode text`,
+          );
+          process.exitCode = 1;
+          return;
+        }
+        const parseDate = (value: string | undefined, flag: string): Date | undefined => {
+          if (!value) return undefined;
+          const date = new Date(value);
+          if (Number.isNaN(date.getTime())) throw new Error(`${flag}: некорректная дата "${value}"`);
+          return date;
+        };
+        const filters = {
+          harness: options.harness,
+          host: options.host,
+          workspace: options.workspace,
+          model: options.model,
+          documentType: options.documentType,
+          from: parseDate(options.from, "--from"),
+          to: parseDate(options.to, "--to"),
+          deletedOnly: options.deletedOnly ?? false,
+          includeReasoning: options.includeReasoning ?? false,
+          includeTools: options.includeTools ?? false,
+          allRevisions: options.allRevisions ?? false,
+          limit: options.limit && options.limit > 0 ? options.limit : 20,
+        };
+        const cfg = loadConfig();
+        const db = await connectDb(cfg);
+        try {
+          const forensic = isForensic(filters);
+          const hits = forensic
+            ? await searchForensic(db, query, filters)
+            : await searchText(db, query, filters);
+          if (options.json) {
+            console.log(JSON.stringify({ mode: forensic ? "forensic" : "text", query, hits }, null, 2));
+            return;
+          }
+          if (forensic) console.log(`forensic mode (поиск по chunk.content)`);
+          if (hits.length === 0) {
+            console.log("ничего не найдено");
+            return;
+          }
+          for (const [index, hit] of hits.entries()) console.log(formatHit(index, hit));
+        } finally {
+          await db.close();
+        }
+      },
+    ),
+  );
+
+program
+  .command("search:rebuild")
+  .description("Пересоздать search projection для всех current revisions (docs/plan.md §8.1)")
+  .option("--no-enqueue-embeddings", "не создавать embedding jobs")
+  .option("--json", "итоговая сводка в JSON")
+  .action(
+    handle(async (options: { enqueueEmbeddings?: boolean; json?: boolean }) => {
+      const cfg = loadConfig();
+      await assertPreflight(cfg);
+      const release = await acquireLock(cfg.archiveRoot, "search:rebuild");
+      const db = await connectDb(cfg);
+      try {
+        const schemaVersion = await checkSchemaVersion(db);
+        if (schemaVersion === 0) {
+          throw new Error("схема не инициализирована: сначала baka db migrate");
+        }
+        const identity = await localIdentity({});
+        const hostId = await ensureHost(db, {
+          hostUuid: identity.hostUuid,
+          hostname: identity.hostname,
+          platform: identity.platform,
+          arch: identity.arch,
+        });
+        const summary = await rebuildSearchProjection(db, {
+          host: hostId,
+          schemaVersion,
+          enqueueEmbeddings: options.enqueueEmbeddings ?? true,
+          logger: (event) => console.error(JSON.stringify(event)),
+        });
+        if (options.json) {
+          console.log(JSON.stringify(summary, null, 2));
+        } else {
+          console.log(
+            `search:rebuild готов: revisions ${summary.revisions}, search_documents ${summary.searchDocuments}` +
+              `, embedding_jobs ${summary.embeddingJobs}, skipped ${summary.skipped}`,
+          );
+        }
+      } finally {
+        await db.close();
+        await release();
+      }
+    }),
+  );
+
+program
+  .command("status")  .description("Сводка состояния архива (docs/plan.md §17.2)")
   .option("--json", "вывести результат в JSON")
   .action(
     handle(async (options: { json?: boolean }) => {

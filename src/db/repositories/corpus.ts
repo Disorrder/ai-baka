@@ -28,6 +28,7 @@ import type {
   ParsedMessage,
 } from "../../domain/canonical-types.ts";
 import type { HarnessExtractors } from "../../search/extractors/types.ts";
+import { SEGMENTATION_VERSION, segmentDocument } from "../../search/segmenter.ts";
 import { normalizeUsageEvents } from "../../parsers/shared/usage-normalization.ts";
 import {
   canonicalDialogueHash,
@@ -39,11 +40,6 @@ import {
 } from "../../sync/canonical-hash.ts";
 import { sha256hex } from "../transactions.ts";
 import { clean, selectOne } from "./helpers.ts";
-
-/** Сегментация длинных документов — этап 6; до неё один сегмент. */
-export const SEGMENTATION_VERSION = "0";
-/** Токены embedding-модели посчитает embedding pipeline (этап 7). */
-export const TOKEN_COUNT = 0;
 
 export interface DialogueTxInput {
   identityKey: string;
@@ -105,18 +101,29 @@ export function modelKeyOf(message: ParsedMessage): string | undefined {
     : undefined;
 }
 
-interface PreparedSearchDoc {
+export interface PreparedSearchDoc {
   recordKey: string;
   documentType: "user_prompt" | "assistant_final";
   messageSequence?: number;
+  /** Номер сегмента внутри извлечённого документа (§13.4). */
+  segmentNo: number;
   content: string;
   contentSha256: string;
+  /** Оценка embedding-токенов сегмента (эвристика segmenter'а, этап 6). */
+  tokenCount: number;
   method: string;
   chunkIds: RecordId[];
 }
 
-/** Извлечение search documents через extractors (§8.2–8.3), до транзакции. */
-function prepareSearchDocuments(
+/**
+ * Извлечение search documents через extractors (§8.2–8.3) + сегментация
+ * (§13.4), до транзакции. Простое правило source_chunks: каждый сегмент
+ * ссылается на ВСЕ chunks исходного извлечённого документа (они покрывают
+ * его целиком; точное отображение сегмент→chunk — избыточно).
+ * Детерминированный id включает documentType + порядковый номер документа
+ * + segment_no.
+ */
+export function prepareSearchDocuments(
   parsed: ParsedDialogue,
   revisionKey: string,
   extractors: HarnessExtractors,
@@ -124,32 +131,37 @@ function prepareSearchDocuments(
   const docs: PreparedSearchDoc[] = [];
   const chunkId = (messageSeq: number, chunkSeq: number): RecordId =>
     new RecordId("chunk", chunkRecordId(revisionKey, messageSeq, chunkSeq));
-  const makeDoc = (
+  const pushDoc = (
     documentType: PreparedSearchDoc["documentType"],
-    index: number,
+    docIndex: number,
     messageSequence: number | undefined,
     extracted: { content: string; extractionMethod: string; sourceChunks: Array<{ messageSequence: number; chunkSequence: number }> },
-  ): PreparedSearchDoc => ({
-    recordKey: searchDocumentRecordId(revisionKey, documentType, index),
-    documentType,
-    messageSequence,
-    content: extracted.content,
-    contentSha256: sha256hex(extracted.content),
-    method: extracted.extractionMethod,
-    chunkIds: extracted.sourceChunks.map((ref) => chunkId(ref.messageSequence, ref.chunkSequence)),
-  });
+  ): void => {
+    const chunkIds = extracted.sourceChunks.map((ref) => chunkId(ref.messageSequence, ref.chunkSequence));
+    for (const [segmentNo, segment] of segmentDocument(extracted.content).entries()) {
+      docs.push({
+        recordKey: searchDocumentRecordId(revisionKey, documentType, docIndex, segmentNo),
+        documentType,
+        messageSequence,
+        segmentNo,
+        content: segment.content,
+        contentSha256: sha256hex(segment.content),
+        tokenCount: segment.tokenCount,
+        method: extracted.extractionMethod,
+        chunkIds,
+      });
+    }
+  };
 
   let userPromptIndex = 0;
   for (const message of parsed.messages) {
     const extracted = extractors.extractUserPrompt(message);
     if (!extracted || extracted.content.trim().length === 0) continue;
-    docs.push(makeDoc("user_prompt", userPromptIndex++, message.sequence, extracted));
+    pushDoc("user_prompt", userPromptIndex++, message.sequence, extracted);
   }
   const final = extractors.extractAssistantFinal(parsed.messages);
   if (final && final.content.trim().length > 0) {
-    docs.push(
-      makeDoc("assistant_final", 0, final.sourceChunks[0]?.messageSequence, final),
-    );
+    pushDoc("assistant_final", 0, final.sourceChunks[0]?.messageSequence, final);
   }
   return docs;
 }
@@ -206,7 +218,11 @@ function messageFields(
 function addSearchProjection(
   tx: TxBuilder,
   docs: PreparedSearchDoc[],
-  input: DialogueTxInput,
+  input: {
+    extractors: HarnessExtractors;
+    activeEmbeddingSpaces: RecordId[];
+    enqueueEmbeddings: boolean;
+  },
   revisionKey: string,
   messageRef: (sequence: number) => string,
 ): number {
@@ -224,10 +240,10 @@ function addSearchProjection(
           messageLink,
           ...[
             ["document_type", doc.documentType],
-            ["segment_no", 0],
+            ["segment_no", doc.segmentNo],
             ["content", doc.content],
             ["content_sha256", doc.contentSha256],
-            ["token_count", TOKEN_COUNT],
+            ["token_count", doc.tokenCount],
             ["source_chunks", doc.chunkIds],
             ["extraction_method", doc.method],
             ["extraction_version", String(input.extractors.extractorVersion)],
@@ -477,4 +493,44 @@ export async function writeDialogueRevision(
     searchDocumentCount: docs.length,
     embeddingJobCount: jobCount,
   };
+}
+
+/**
+ * Пересоздать search projection существующей revision (baka search:rebuild):
+ * в одной транзакции удалить старые search_document + embedding_job revision
+ * и создать новые из подготовленных docs. Canonical corpus не трогается
+ * (search projection полностью производна, §8.1).
+ */
+export async function replaceSearchProjection(
+  db: Surreal,
+  input: {
+    dialogueId: RecordId;
+    revisionId: RecordId;
+    /** Строковый ключ revision (id-часть record id) — база детерминированных id. */
+    revisionKey: string;
+    docs: PreparedSearchDoc[];
+    extractors: HarnessExtractors;
+    activeEmbeddingSpaces: RecordId[];
+    enqueueEmbeddings: boolean;
+  },
+): Promise<{ searchDocumentCount: number; embeddingJobCount: number }> {
+  const tx = new TxBuilder();
+  tx.add("BEGIN;");
+  tx.add(`LET $dlgId = ${tx.param(input.dialogueId)};`);
+  tx.add(`LET $revId = ${tx.param(input.revisionId)};`);
+  addProjectionDelete(tx, "$revId");
+  const jobCount = addSearchProjection(tx, input.docs, input, input.revisionKey, (seq) =>
+    tx.param(new RecordId("message", messageRecordId(input.revisionKey, seq))),
+  );
+  tx.add("COMMIT;");
+  tx.add("RETURN { revision: $revId };");
+  const result = await db.query<unknown[]>(tx.statements.join("\n"), tx.vars);
+  const returned = result.at(-1) as { revision?: RecordId } | undefined;
+  if (!returned?.revision) {
+    // Та же защита от молчаливого обрыва транзакции, что в writeDialogueRevision.
+    throw new Error(
+      `projection transaction оборвалась: RETURN не выполнен (получено ${result.length} результатов из ${tx.statements.length} statements)`,
+    );
+  }
+  return { searchDocumentCount: input.docs.length, embeddingJobCount: jobCount };
 }

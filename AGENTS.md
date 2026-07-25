@@ -2,7 +2,7 @@
 
 ## Статус проекта
 
-Реализованы этапы 0–5 из [`docs/plan.md`](docs/plan.md) (раздел «Порядок
+Реализованы этапы 0–6 из [`docs/plan.md`](docs/plan.md) (раздел «Порядок
 реализации»): инфраструктура, schema migrations, source snapshot layer
 (discovery `baka discover`, complete/partial scan, immutable raw snapshots,
 SQLite через `VACUUM INTO`, deletion/rename/reconcile-логика), parser
@@ -11,8 +11,15 @@ EXTRACTOR_VERSION = 1), SurrealDB writer и structured sync
 (`baka sync` / `baka status` / `baka validate`): репозитории
 `src/db/repositories/`, транзакция диалога по §10.4
 (`src/db/repositories/corpus.ts`), orchestrator `src/sync/sync-run.ts`.
+Этап 6: segmenter длинных документов (`src/search/segmenter.ts`,
+segmentation_version = "1", target 6000–7000 / hard < 8192 токенов,
+эвристика chars/3.5 с seam под точный tokenizer этапа 7), BM25 full-text
+поиск (`src/search/fulltext.ts`, CLI `baka search`) и forensic search по
+chunk.content (--include-reasoning/--include-tools/--all-revisions),
+пересоздание projection — `baka search:rebuild` (`src/search/rebuild.ts`).
 Embeddings пока не вызываются: embedding jobs создаются только при
-существовании active `embedding_space` (появится на этапе 7).
+существовании active `embedding_space` (появится на этапе 7); режимы
+поиска vector/hybrid — тоже этап 7.
 Авторитетный источник требований — `docs/plan.md`; при расхождении кода
 с планом сначала сверяйся с ним.
 
@@ -27,6 +34,20 @@ Embeddings пока не вызываются: embedding jobs создаются
 - kimi-code: диалог = каталог сессии; sync собирает parse-view из immutable
   raw-файлов (hardlink'и в staging) и парсит его целиком; session_index.jsonl
   архивируется, но не парсится (parse_status = unsupported).
+
+Ключевые решения этапа 6:
+
+- синтаксис BM25 в SurrealDB 3.2.3: `content @0@ $q` в WHERE +
+  `search::score(0)` / `search::highlight('<em>', '</em>', 0)` в SELECT
+  (0 — номер matches-предиката); highlight возвращает ВЕСЬ контент,
+  snippet усечётся клиентом вокруг первого матча;
+- search_document id детерминирован: sha256(revision + document_type +
+  doc_index + segment_no); source_chunks каждого сегмента = все chunks
+  исходного извлечённого документа;
+- rebuild пересоздаёт projection из canonical messages/chunks в БД;
+  human_authored/visible_to_user хранятся bool, поэтому исходное
+  "unknown" при rebuild трактуется как false (см. комментарий в
+  src/search/rebuild.ts).
 
 ## Стек
 
