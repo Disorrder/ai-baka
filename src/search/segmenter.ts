@@ -28,8 +28,14 @@
  * search_document id, §8.1).
  */
 
-/** Версия логики сегментации (search_document.segmentation_version). */
-export const SEGMENTATION_VERSION = "1";
+/**
+ * Версия логики сегментации (search_document.segmentation_version).
+ * v2: при упаковке блоков учитываются разделители "\n\n" и splitOversized
+ * режет по переданному counter'у, а не по эвристике chars — без этого
+ * сегмент из тысяч мелких блоков уходил за hard limit (§13.4). По §13.5
+ * bump инвалидирует embedding jobs (их сбрасывает search:rebuild).
+ */
+export const SEGMENTATION_VERSION = "2";
 
 /** Эвристика: символов на embedding-токен (см. шапку файла). */
 export const CHARS_PER_TOKEN = 3.5;
@@ -105,9 +111,31 @@ function splitBlocks(content: string): Block[] {
 }
 
 /**
+ * Разрезать строку на куски ≤ maxTokens по ПЕРЕДАННОМУ counter'у
+ * (token-based split последнего уровня). Длина куска оценивается
+ * пропорционально токенам и ужимается вдвое, пока кусок не влезет:
+ * counter не обязан быть равномерным по строке. Если дорог даже один
+ * символ (вырожденный counter), строка остаётся целиком — резать
+ * дальше бессмысленно.
+ */
+function cutByTokens(line: string, maxTokens: number, counter: TokenCounter): string[] {
+  const out: string[] = [];
+  let rest = line;
+  while (counter(rest) > maxTokens) {
+    let len = Math.max(1, Math.floor((rest.length * maxTokens) / counter(rest)));
+    while (len > 1 && counter(rest.slice(0, len)) > maxTokens) len = Math.floor(len / 2);
+    if (counter(rest.slice(0, len)) > maxTokens) break;
+    out.push(rest.slice(0, len));
+    rest = rest.slice(len);
+  }
+  if (rest.length > 0 || out.length === 0) out.push(rest);
+  return out;
+}
+
+/**
  * Разрезать блок, превышающий MAX_TOKENS, на подблоки ≤ MAX_TOKENS:
- * сначала по строкам, слишком длинную строку — посимвольно. Fence-блок
- * переворачивается маркерами ``` в каждом подблоке.
+ * сначала по строкам, слишком длинную строку — по counter'у посимвольно.
+ * Fence-блок переворачивается маркерами ``` в каждом подблоке.
  */
 function splitOversized(block: Block, counter: TokenCounter): Block[] {
   let lines = block.text.split("\n");
@@ -120,13 +148,10 @@ function splitOversized(block: Block, counter: TokenCounter): Block[] {
   }
   // Запас на fence-маркеры, чтобы перевёрнутый подблок тоже был ≤ MAX.
   const reserve = fenceOpen ? counter(`${fenceOpen}\n\n${fenceClose}`) : 0;
-  const maxChars = Math.floor((MAX_TOKENS - reserve) * CHARS_PER_TOKEN);
+  const maxTokens = MAX_TOKENS - reserve;
 
   // Посимвольная резка экстремально длинных строк (token-based split).
-  const cut: string[] = [];
-  for (const line of lines) {
-    for (let i = 0; i < line.length; i += maxChars) cut.push(line.slice(i, i + maxChars));
-  }
+  const cut = lines.flatMap((line) => cutByTokens(line, maxTokens, counter));
 
   const out: Block[] = [];
   let current: string[] = [];
@@ -153,6 +178,9 @@ function splitOversized(block: Block, counter: TokenCounter): Block[] {
 
 /** Жадная сборка блоков в сегменты с предпочтением heading-границ. */
 function packBlocks(blocks: Block[], counter: TokenCounter): string[] {
+  // Разделители "\n\n" между блоками — тоже токены сегмента: без их учёта
+  // сегмент из тысяч мелких блоков уходил за hard limit (§13.4).
+  const sepTokens = counter("\n\n");
   const segments: string[] = [];
   let current: Block[] = [];
   let currentTokens = 0;
@@ -166,7 +194,10 @@ function packBlocks(blocks: Block[], counter: TokenCounter): string[] {
 
   for (const block of blocks) {
     const blockTokens = counter(block.text);
-    if (current.length > 0 && currentTokens + blockTokens > TARGET_TOKENS) {
+    if (
+      current.length > 0 &&
+      currentTokens + sepTokens + blockTokens > TARGET_TOKENS
+    ) {
       // Последний heading внутри сегмента (не первый блок) — лучшая граница.
       let headingIndex = -1;
       for (let i = current.length - 1; i >= 1; i--) {
@@ -179,12 +210,18 @@ function packBlocks(blocks: Block[], counter: TokenCounter): string[] {
         const tail = current.splice(headingIndex);
         flush();
         current = tail;
-        currentTokens = tail.reduce((sum, b) => sum + counter(b.text), 0);
+        currentTokens =
+          tail.reduce((sum, b) => sum + counter(b.text), 0) + sepTokens * (tail.length - 1);
       }
-      if (current.length > 0 && currentTokens + blockTokens > MAX_TOKENS) flush();
+      if (
+        current.length > 0 &&
+        currentTokens + sepTokens + blockTokens > MAX_TOKENS
+      ) {
+        flush();
+      }
     }
+    currentTokens += (current.length > 0 ? sepTokens : 0) + blockTokens;
     current.push(block);
-    currentTokens += blockTokens;
   }
   flush();
   return segments;

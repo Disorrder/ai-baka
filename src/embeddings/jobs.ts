@@ -3,19 +3,23 @@
  *
  * Worker:
  * 1. возвращает stuck jobs в pending (lease timeout, план §19.2 сценарий 22);
- * 2. получает lease на pending/retryable jobs (locked_by/locked_at);
- * 3. фильтрует по политике приватности (§13.7, src/embeddings/privacy.ts) —
+ * 2. создаёт provider'ы spaces с доступными jobs (ProviderFactory выбирает
+ *    реализацию по space.provider) — строго ДО lease: ошибка конфигурации
+ *    (нет API key, неизвестный provider) прерывает worker, а jobs остаются
+ *    pending, а не висят в processing до lease timeout;
+ * 3. получает lease на pending/retryable jobs (locked_by/locked_at);
+ * 4. фильтрует по политике приватности (§13.7, src/embeddings/privacy.ts) —
  *    исключённые jobs → cancelled, в provider не уходят;
- * 4. батчит inputs одного space → provider.embed;
- * 5. проверяет dimension каждого вектора (сценарий 23) — mismatch =
+ * 5. батчит inputs одного space → provider.embed;
+ * 6. проверяет dimension каждого вектора (сценарий 23) — mismatch =
  *    permanent_error, vector не пишется (инварианты §23.11–13);
- * 6. в одной транзакции на батч: UPSERT vector в физическую таблицу space
+ * 7. в одной транзакции на батч: UPSERT vector в физическую таблицу space
  *    (детерминированный id → повторный run идемпотентен) + фактический
  *    token usage + job → completed;
- * 7. временная ошибка → retryable_error с exponential backoff
+ * 8. временная ошибка → retryable_error с exponential backoff
  *    (next_attempt_at), после MAX_ATTEMPTS → permanent_error;
  *    постоянная ошибка → permanent_error сразу;
- * 8. canonical corpus не затрагивается — только embedding_job и
+ * 9. canonical corpus не затрагивается — только embedding_job и
  *    физические vector-таблицы (search projection).
  *
  * Логи — только id/hash/счётчики, без полного текста документов (§13.7).
@@ -24,10 +28,12 @@
 import { RecordId, type Surreal } from "surrealdb";
 import { selectAll, selectOne } from "../db/repositories/helpers.ts";
 import { sha256hex } from "../db/transactions.ts";
-import { TARGET_TOKENS } from "../search/segmenter.ts";
+import { SEGMENTATION_VERSION, TARGET_TOKENS } from "../search/segmenter.ts";
+import { EXTRACTOR_VERSION } from "../search/extractors/types.ts";
 import type { EmbeddingsConfig } from "../config.ts";
 import type { EmbeddingProvider } from "./provider.ts";
 import { EmbeddingProviderError } from "./provider.ts";
+import { OpenAIEmbeddingProvider } from "./openai-provider.ts";
 import { privacyExclusion, type PrivacyPolicy } from "./privacy.ts";
 import { getSpaceBySlug, listSpaces, type EmbeddingSpace } from "./spaces.ts";
 
@@ -47,9 +53,62 @@ export function backoffMs(attempt: number): number {
   return Math.min(BACKOFF_BASE_MS * 2 ** Math.max(0, attempt - 1), BACKOFF_MAX_MS);
 }
 
-/** Stale job: content документа изменился после постановки job (§13.5). */
-export function isJobStale(inputSha256: string, docContentSha256: string | undefined): boolean {
-  return docContentSha256 === undefined || inputSha256 !== docContentSha256;
+/**
+ * Факторы свежести embedding job (§13.5): job становится устаревшим и
+ * возвращается в pending при изменении любого из них.
+ */
+export interface JobStaleFactors {
+  /** Content hash входа (job.input_sha256 / search_document.content_sha256). */
+  contentSha256: string;
+  /** search_document.extraction_version / актуальный EXTRACTOR_VERSION. */
+  extractionVersion: string;
+  /** search_document.segmentation_version / актуальный SEGMENTATION_VERSION. */
+  segmentationVersion: string;
+  /** embedding_space.provider. */
+  provider: string;
+  /** embedding_space.model. */
+  model: string;
+  /** embedding_space.dimensions. */
+  dimensions: number;
+}
+
+/**
+ * Stale job (§13.5): актуальные факторы отличаются от зафиксированных job'ом.
+ * recorded === undefined — документ удалён сменой projection (job-сирота).
+ */
+export function isJobStale(
+  recorded: JobStaleFactors | undefined,
+  current: JobStaleFactors,
+): boolean {
+  if (recorded === undefined) return true;
+  return (
+    recorded.contentSha256 !== current.contentSha256 ||
+    recorded.extractionVersion !== current.extractionVersion ||
+    recorded.segmentationVersion !== current.segmentationVersion ||
+    recorded.provider !== current.provider ||
+    recorded.model !== current.model ||
+    recorded.dimensions !== current.dimensions
+  );
+}
+
+/**
+ * Распределение фактического token usage батча по документам (§13.6 п.5):
+ * пропорционально весам (эвристическая оценка токенов документа), остаток
+ * округления — последнему элементу. Инварианты: сумма распределённого строго
+ * равна totalTokens (фактический usage API), значения ≥ 0.
+ */
+export function distributePromptTokens(totalTokens: number, weights: number[]): number[] {
+  const weightSum = weights.reduce((sum, weight) => sum + weight, 0);
+  let distributed = 0;
+  return weights.map((weight, index) => {
+    if (index === weights.length - 1) return totalTokens - distributed;
+    const proportional = weightSum > 0 ? Math.round((totalTokens * weight) / weightSum) : 0;
+    // round-half-up суммарно может превысить totalTokens — обрезаем,
+    // недостача уйдёт в остаток последнего элемента.
+    const share = Math.min(proportional, totalTokens - distributed);
+    distributed += share;
+    return share;
+  });
 }
 
 export interface EmbeddingJobRow {
@@ -87,6 +146,9 @@ export async function releaseStaleLeases(db: Surreal, now = new Date()): Promise
   return rows.length;
 }
 
+/** WHERE-условие доступных для lease jobs (pending или подошедший retry). */
+const DUE_JOBS_WHERE = `(status = "pending" OR (status = "retryable_error" AND (next_attempt_at IS NONE OR next_attempt_at <= $now)))`;
+
 /**
  * Lease pending/retryable jobs одному worker'у. Выборка и UPDATE — в одной
  * транзакции; локально workers не конкурируют, но lease-поля оставляют
@@ -101,7 +163,7 @@ export async function leaseJobs(
   const rows = await db.query<[unknown, unknown, EmbeddingJobRow[]]>(
     `BEGIN;
      LET $ids = (SELECT VALUE id FROM embedding_job
-       WHERE (status = "pending" OR (status = "retryable_error" AND (next_attempt_at IS NONE OR next_attempt_at <= $now)))
+       WHERE ${DUE_JOBS_WHERE}
        ${spaceClause} ORDER BY created_at LIMIT $limit);
      UPDATE embedding_job SET status = "processing", locked_by = $worker, locked_at = $now
        WHERE id INSIDE $ids AND status INSIDE ["pending", "retryable_error"];
@@ -134,8 +196,33 @@ export interface WorkerOptions {
   logger?: (event: Record<string, unknown>) => void;
 }
 
-/** Provider конкретного space (model/dimensions берутся из space record). */
+/**
+ * Provider конкретного space: фабрика выбирает реализацию по space.provider,
+ * model/dimensions берутся из space record. Неизвестный provider или
+ * отсутствующая конфигурация (API key) → понятная ошибка.
+ */
 export type ProviderFactory = (space: EmbeddingSpace) => EmbeddingProvider;
+
+/**
+ * Production-фабрика worker'а (подключается в CLI): provider по
+ * space.provider (§13.1). Тесты используют MockEmbeddingProvider
+ * (mock-provider.ts) — живой OpenAI здесь не вызывается.
+ */
+export function defaultProviderFactory(opts: { openaiApiKey?: string }): ProviderFactory {
+  return (space) => {
+    if (space.provider === "openai") {
+      if (!opts.openaiApiKey) {
+        throw new Error("OPENAI_API_KEY не задан — worker не может вызвать provider");
+      }
+      return new OpenAIEmbeddingProvider({
+        apiKey: opts.openaiApiKey,
+        model: space.model,
+        dimensions: space.dimensions,
+      });
+    }
+    throw new Error(`неизвестный embedding provider "${space.provider}" (space "${space.slug}")`);
+  };
+}
 
 /**
  * Прогон worker'а (§13.6): пока есть доступные jobs — lease батч, embed,
@@ -169,6 +256,17 @@ export async function runEmbeddingWorker(
     spaces.set(String(id), space);
     return space;
   };
+  // Provider создаётся лениво по space, но строго ДО lease (см. цикл ниже):
+  // фабрика может кинуть (нет API key, неизвестный provider), и тогда worker
+  // должен упасть, оставив jobs в pending, а не в processing.
+  const providers = new Map<string, EmbeddingProvider>();
+  const providerFor = async (spaceId: RecordId): Promise<EmbeddingProvider> => {
+    const cached = providers.get(String(spaceId));
+    if (cached) return cached;
+    const provider = providerFactory(await spaceOf(spaceId));
+    providers.set(String(spaceId), provider);
+    return provider;
+  };
   const filterSpace = opts.spaceSlug ? await getSpaceBySlug(db, opts.spaceSlug) : undefined;
   if (opts.spaceSlug && !filterSpace) throw new Error(`embedding space "${opts.spaceSlug}" не найден`);
 
@@ -177,6 +275,16 @@ export async function runEmbeddingWorker(
     summary.releasedStale += await releaseStaleLeases(db, now());
     const remaining = opts.limit === undefined ? batchSize : Math.min(batchSize, opts.limit - processed);
     if (remaining <= 0) break;
+    // Spaces с доступными jobs: провайдеры создаются ДО lease.
+    for (const row of await selectAll<{ embedding_space: RecordId }>(
+      db,
+      `SELECT embedding_space FROM embedding_job
+       WHERE ${DUE_JOBS_WHERE} ${filterSpace ? "AND embedding_space = $space" : ""}
+       GROUP BY embedding_space`,
+      { now: now(), space: filterSpace?.id },
+    )) {
+      await providerFor(row.embedding_space);
+    }
     const jobs = await leaseJobs(db, {
       spaceId: filterSpace?.id,
       limit: remaining,
@@ -207,7 +315,7 @@ export async function runEmbeddingWorker(
 
     for (const spaceJobs of bySpace.values()) {
       const space = await spaceOf(spaceJobs[0]!.embedding_space);
-      const provider = providerFactory(space);
+      const provider = await providerFor(spaceJobs[0]!.embedding_space);
       const runnable: Array<{ job: EmbeddingJobRow; doc: DocRow }> = [];
       for (const job of spaceJobs) {
         const doc = docs.get(String(job.search_document));
@@ -308,11 +416,13 @@ async function completeBatch(
   const table = space.physical_table;
   const statements: string[] = ["BEGIN;"];
   const vars: Record<string, unknown> = { now, spaceId: space.id };
-  // Фактический usage батча распределяется пропорционально token_count документов.
-  const totalEstimated = runnable.reduce((sum, r) => sum + Math.max(1, Math.ceil(r.doc.content.length / 3.5)), 0);
+  // Фактический usage батча распределяется по документам так, чтобы сумма
+  // строго сошлась с ответом API (эвристика chars/3.5 — только веса).
+  const shares = distributePromptTokens(
+    promptTokens,
+    runnable.map((r) => Math.ceil(r.doc.content.length / 3.5)),
+  );
   runnable.forEach(({ job, doc }, i) => {
-    const estimated = Math.max(1, Math.ceil(doc.content.length / 3.5));
-    const tokens = Math.max(1, Math.round((promptTokens * estimated) / totalEstimated));
     statements.push(
       `UPSERT ONLY type::record("${table}", $vk${i}) SET ` +
         `search_document = $d${i}, embedding_space = $spaceId, input_sha256 = $h${i}, ` +
@@ -324,7 +434,7 @@ async function completeBatch(
     vars[`d${i}`] = doc.id;
     vars[`h${i}`] = job.input_sha256;
     vars[`v${i}`] = vectors[i];
-    vars[`t${i}`] = tokens;
+    vars[`t${i}`] = shares[i];
     vars[`j${i}`] = job.id;
   });
   statements.push("COMMIT;");
@@ -403,7 +513,7 @@ export async function cancelPendingJobs(db: Surreal, spaceSlug?: string): Promis
 }
 
 export interface RebuildJobsSummary {
-  /** Jobs, возвращённые в pending (hash изменился). */
+  /** Jobs, возвращённые в pending (факторы §13.5 изменились). */
   resetToPending: number;
   /** Jobs без документа (projection удалена) — удалены. */
   orphansDeleted: number;
@@ -412,22 +522,61 @@ export interface RebuildJobsSummary {
 }
 
 /**
- * `baka embeddings rebuild` (§13.5): после смены extraction/segmentation
- * versions content документов меняется — jobs с устаревшим input_sha256
- * возвращаются в pending с актуальным hash, их vectors удаляются.
+ * `baka embeddings rebuild` (§13.5): stale jobs возвращаются в pending
+ * с актуальным hash, их vectors удаляются.
+ *
+ * Stale-факторы (isJobStale): content hash (job.input_sha256 vs
+ * search_document.content_sha256), extraction/segmentation versions
+ * (версии, записанные в search_document, vs актуальные EXTRACTOR_VERSION /
+ * SEGMENTATION_VERSION кода — версии читаются из документа, не хардкодятся),
+ * provider/model/dimensions embedding_space. Snapshot'а space-параметров у
+ * job нет: по конвенции §13.1 они неизменны в рамках space (смена модели =
+ * новое space), поэтому recorded-сторона для них — текущие поля space.
+ *
+ * Stale по versions снимается пересозданием projection (`baka search:rebuild`):
+ * документы получают актуальные versions (и новый hash при смене content).
  */
 export async function rebuildStaleJobs(db: Surreal, spaceSlug: string): Promise<RebuildJobsSummary> {
   const space = await getSpaceBySlug(db, spaceSlug);
   if (!space) throw new Error(`embedding space "${spaceSlug}" не найден`);
-  const jobs = await selectAll<EmbeddingJobRow & { doc_hash?: string }>(
+  const jobs = await selectAll<
+    EmbeddingJobRow & {
+      doc_hash?: string;
+      doc_extraction_version?: string;
+      doc_segmentation_version?: string;
+    }
+  >(
     db,
-    `SELECT *, search_document.content_sha256 AS doc_hash FROM embedding_job
+    `SELECT *,
+       search_document.content_sha256 AS doc_hash,
+       search_document.extraction_version AS doc_extraction_version,
+       search_document.segmentation_version AS doc_segmentation_version
+     FROM embedding_job
      WHERE embedding_space = $space AND status != "cancelled"`,
     { space: space.id },
   );
   const summary: RebuildJobsSummary = { resetToPending: 0, orphansDeleted: 0, vectorsDeleted: 0 };
   for (const job of jobs) {
-    if (!isJobStale(job.input_sha256, job.doc_hash)) continue;
+    const recorded: JobStaleFactors | undefined =
+      job.doc_hash === undefined
+        ? undefined
+        : {
+            contentSha256: job.input_sha256,
+            extractionVersion: job.doc_extraction_version ?? "",
+            segmentationVersion: job.doc_segmentation_version ?? "",
+            provider: space.provider,
+            model: space.model,
+            dimensions: space.dimensions,
+          };
+    const current: JobStaleFactors = {
+      contentSha256: job.doc_hash ?? "",
+      extractionVersion: String(EXTRACTOR_VERSION),
+      segmentationVersion: SEGMENTATION_VERSION,
+      provider: space.provider,
+      model: space.model,
+      dimensions: space.dimensions,
+    };
+    if (!isJobStale(recorded, current)) continue;
     if (job.doc_hash === undefined) {
       await db.query("DELETE ONLY $id", { id: job.id });
       summary.orphansDeleted += 1;

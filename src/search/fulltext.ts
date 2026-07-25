@@ -7,7 +7,8 @@
  *
  * Forensic режим (§12.1) — BM25 по chunk.content; включается явными
  * флагами: --include-reasoning (kind=thought), --include-tools
- * (tool_call/tool_result), --all-revisions (не только current revision).
+ * (tool_call/tool_result), --include-system (system/developer),
+ * --all-revisions (не только current revision).
  *
  * Проверенный на SurrealDB 3.2.3 синтаксис BM25:
  *   WHERE content @0@ $q            — matches operator, 0 = номер предиката
@@ -31,6 +32,7 @@ export interface SearchFilters {
   deletedOnly?: boolean;
   includeReasoning?: boolean;
   includeTools?: boolean;
+  includeSystem?: boolean;
   allRevisions?: boolean;
   limit: number;
 }
@@ -58,8 +60,8 @@ export interface SearchHit {
 }
 
 /** Forensic mode включается любым из явных флагов §12.1. */
-export function isForensic(filters: Pick<SearchFilters, "includeReasoning" | "includeTools" | "allRevisions">): boolean {
-  return Boolean(filters.includeReasoning || filters.includeTools || filters.allRevisions);
+export function isForensic(filters: Pick<SearchFilters, "includeReasoning" | "includeTools" | "includeSystem" | "allRevisions">): boolean {
+  return Boolean(filters.includeReasoning || filters.includeTools || filters.includeSystem || filters.allRevisions);
 }
 
 /** Усечь highlight-контент вокруг первого матча (highlight возвращает ВЕСЬ текст). */
@@ -212,6 +214,7 @@ export async function searchForensic(
   const kinds = ["text"];
   if (filters.includeReasoning) kinds.push("thought");
   if (filters.includeTools) kinds.push("tool_call", "tool_result");
+  if (filters.includeSystem) kinds.push("system", "developer");
   const { clause, vars } = buildFilterClauses(filters);
   const revisionClause = filters.allRevisions
     ? ""

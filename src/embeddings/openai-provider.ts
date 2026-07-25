@@ -116,7 +116,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     await this.sleep(overrideMs ?? this.baseDelayMs * 2 ** (attempt - 1));
   }
 
-  /** Проверка размерности каждого вектора — отклонение = permanent error (№23). */
+  /** Валидация ответа: длина, уникальные index в [0, batchSize), размерность (№23). */
   private parsePayload(payload: OpenAIEmbeddingResponse, expected: number): EmbedResult {
     const data = payload.data ?? [];
     if (data.length !== expected) {
@@ -126,7 +126,23 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
       );
     }
     const vectors: number[][] = new Array<number[]>(expected);
+    const seenIndexes = new Set<number>();
     for (const item of data) {
+      // index обязан покрывать [0, batchSize) без дубликатов: иначе в
+      // vectors остаются holes и батч уходит в безликий retryable-сбой.
+      if (
+        !Number.isInteger(item.index) ||
+        item.index < 0 ||
+        item.index >= expected ||
+        seenIndexes.has(item.index)
+      ) {
+        throw new EmbeddingProviderError(
+          `openai embeddings: некорректный data[].index ${item.index} ` +
+            `(ожидались уникальные целые 0..${expected - 1})`,
+          false,
+        );
+      }
+      seenIndexes.add(item.index);
       if (item.embedding.length !== this.dimensions) {
         throw new EmbeddingProviderError(
           `openai embeddings: dimension mismatch — ожидалось ${this.dimensions}, получено ${item.embedding.length}`,

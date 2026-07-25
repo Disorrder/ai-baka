@@ -12,7 +12,7 @@
  * удаление vectors при смене projection (§8.1), rebuild stale jobs (§13.5).
  */
 
-import { beforeAll, describe, expect, test } from "bun:test";
+import { describe, expect } from "bun:test";
 import { RecordId } from "surrealdb";
 import type { ParsedDialogue, ParsedMessage } from "../src/domain/canonical-types.ts";
 import {
@@ -59,14 +59,16 @@ import {
   retryFailedJobs,
   runEmbeddingWorker,
   LEASE_TIMEOUT_MS,
+  type ProviderFactory,
   type WorkerSummary,
 } from "../src/embeddings/jobs.ts";
-import { createTestDb, dropTestDb, isDbAvailable, type TestDb } from "./db-test-utils.ts";
+import { SEGMENTATION_VERSION } from "../src/search/segmenter.ts";
+import { EXTRACTOR_VERSION } from "../src/search/extractors/types.ts";
+import { createTestDb, dbTest, dropTestDb, type TestDb } from "./db-test-utils.ts";
 
-let dbReady = false;
-beforeAll(async () => {
-  dbReady = await isDbAvailable();
-});
+// Доступность SurrealDB проверяется один раз на файл: без живой БД все
+// integration-тесты — ЯВНЫЙ skip (test.skip), а не молчаливый pass.
+const testDb = await dbTest();
 
 const SPACE_SLUG = "mock_test_16_v1";
 const DIMS = 16;
@@ -251,8 +253,7 @@ const vectorCount = async (t: TestDb): Promise<number> =>
   (await selectOne<{ n: number }>(t.db, `SELECT count() AS n FROM ${physicalTableName(SPACE_SLUG)} GROUP ALL`))?.n ?? 0;
 
 describe("embedding spaces (integration)", () => {
-  test("space:create создаёт таблицу + HNSW-индекс и backfill jobs; activate — один active", async () => {
-    if (!dbReady) return;
+  testDb("space:create создаёт таблицу + HNSW-индекс и backfill jobs; activate — один active", async () => {
     const t = await createTestDb();
     try {
       await seed(t);
@@ -299,11 +300,45 @@ describe("embedding spaces (integration)", () => {
       await dropTestDb(t);
     }
   });
+
+  testDb("(ре)активация догоняет backfill документов, появившихся в inactive (идемпотентно)", async () => {
+    const t = await createTestDb();
+    try {
+      await seed(t);
+      await makeSpace(t, false);
+      expect(await allJobs(t)).toHaveLength(4);
+
+      // Новый диалог → новые search_documents; jobs для inactive space не ставятся.
+      const ctx = await makeCtx(t);
+      const keyC = dialogueIdentityKey(ctx.installation.toString(), "emb_c", "fb");
+      await writeDialogueRevision(
+        t.db,
+        txInput(ctx, dialogue("emb_c", "третий диалог про логические бэкапы", "Ответ третьего диалога."), keyC),
+      );
+      expect(await allJobs(t)).toHaveLength(4);
+
+      // Активация создаёт недостающие jobs только для новых документов.
+      const activated = await activateSpace(t.db, SPACE_SLUG);
+      expect(activated.active).toBe(true);
+      expect(activated.enqueuedJobs).toBe(2);
+      expect(activated.existingJobs).toBe(4);
+      const jobs = await allJobs(t);
+      expect(jobs).toHaveLength(6);
+      expect(new Set(jobs.map((j) => j.status))).toEqual(new Set(["pending"]));
+
+      // Повторная активация — no-op (детерминированные id + UNIQUE).
+      const again = await activateSpace(t.db, SPACE_SLUG);
+      expect(again.enqueuedJobs).toBe(0);
+      expect(again.existingJobs).toBe(6);
+      expect(await allJobs(t)).toHaveLength(6);
+    } finally {
+      await dropTestDb(t);
+    }
+  });
 });
 
 describe("embedding worker (integration)", () => {
-  test("run завершает jobs и пишет векторы; повторный run идемпотентен", async () => {
-    if (!dbReady) return;
+  testDb("run завершает jobs и пишет векторы; повторный run идемпотентен", async () => {
     const t = await createTestDb();
     try {
       await seed(t);
@@ -332,6 +367,13 @@ describe("embedding worker (integration)", () => {
       );
       expect(vectors.every((v) => v.vector.length === DIMS && v.prompt_tokens > 0)).toBe(true);
 
+      // Сумма распределённых prompt_tokens строго равна фактическому usage API (§13.6).
+      const tokenSum = await selectOne<{ total: number }>(
+        t.db,
+        `SELECT math::sum(prompt_tokens) AS total FROM ${physicalTableName(SPACE_SLUG)} GROUP ALL`,
+      );
+      expect(tokenSum?.total).toBe(summary.promptTokens);
+
       // Повторный run: нечего брать — ничего не меняется.
       const again = await runEmbeddingWorker(t.db, mockFactory(provider), {
         privacy: EMPTY_PRIVACY_POLICY,
@@ -343,8 +385,7 @@ describe("embedding worker (integration)", () => {
     }
   });
 
-  test("wrong dimension отклоняется: permanent_error, vector не пишется (№23)", async () => {
-    if (!dbReady) return;
+  testDb("wrong dimension отклоняется: permanent_error, vector не пишется (№23)", async () => {
     const t = await createTestDb();
     try {
       await seed(t);
@@ -367,8 +408,7 @@ describe("embedding worker (integration)", () => {
     }
   });
 
-  test("stuck job возвращается в pending после lease timeout (№22)", async () => {
-    if (!dbReady) return;
+  testDb("stuck job возвращается в pending после lease timeout (№22)", async () => {
     const t = await createTestDb();
     try {
       await seed(t);
@@ -391,8 +431,7 @@ describe("embedding worker (integration)", () => {
     }
   });
 
-  test("retryable ошибка → retryable_error с backoff; retry → pending; успех", async () => {
-    if (!dbReady) return;
+  testDb("retryable ошибка → retryable_error с backoff; retry → pending; успех", async () => {
     const t = await createTestDb();
     try {
       await seed(t);
@@ -428,8 +467,7 @@ describe("embedding worker (integration)", () => {
     }
   });
 
-  test("permanent ошибка provider → permanent_error без backoff", async () => {
-    if (!dbReady) return;
+  testDb("permanent ошибка provider → permanent_error без backoff", async () => {
     const t = await createTestDb();
     try {
       await seed(t);
@@ -450,8 +488,7 @@ describe("embedding worker (integration)", () => {
     }
   });
 
-  test("приватность (§13.7): исключённый harness → cancelled, provider не вызывается", async () => {
-    if (!dbReady) return;
+  testDb("приватность (§13.7): исключённый harness → cancelled, provider не вызывается", async () => {
     const t = await createTestDb();
     try {
       await seed(t);
@@ -469,6 +506,29 @@ describe("embedding worker (integration)", () => {
       await dropTestDb(t);
     }
   });
+
+  testDb("ошибка фабрики provider ДО lease: worker падает, jobs остаются pending", async () => {
+    const t = await createTestDb();
+    try {
+      await seed(t);
+      await makeSpace(t, true);
+      const failingFactory: ProviderFactory = () => {
+        throw new Error("OPENAI_API_KEY не задан — worker не может вызвать provider");
+      };
+      await expect(
+        runEmbeddingWorker(t.db, failingFactory, { privacy: EMPTY_PRIVACY_POLICY }),
+      ).rejects.toThrow("OPENAI_API_KEY не задан");
+      // Jobs не переведены в processing и не залочены — повторный run с
+      // рабочей фабрикой сможет их взять без ожидания lease timeout.
+      const jobs = await allJobs(t);
+      expect(jobs).toHaveLength(4);
+      expect(new Set(jobs.map((j) => j.status))).toEqual(new Set(["pending"]));
+      const locked = await selectAll(t.db, "SELECT id FROM embedding_job WHERE locked_by IS NOT NONE");
+      expect(locked).toHaveLength(0);
+    } finally {
+      await dropTestDb(t);
+    }
+  });
 });
 
 describe("vector/hybrid search (integration)", () => {
@@ -480,8 +540,7 @@ describe("vector/hybrid search (integration)", () => {
     return { space, provider };
   }
 
-  test("vector search находит ближайший документ по mock-векторам", async () => {
-    if (!dbReady) return;
+  testDb("vector search находит ближайший документ по mock-векторам", async () => {
     const t = await createTestDb();
     try {
       const { provider } = await seededSpace(t);
@@ -502,8 +561,7 @@ describe("vector/hybrid search (integration)", () => {
     }
   });
 
-  test("EXPLAIN FULL подтверждает HNSW (KnnScan, №24)", async () => {
-    if (!dbReady) return;
+  testDb("EXPLAIN FULL подтверждает HNSW (KnnScan, №24)", async () => {
     const t = await createTestDb();
     try {
       await seededSpace(t);
@@ -520,8 +578,7 @@ describe("vector/hybrid search (integration)", () => {
     }
   });
 
-  test("hybrid выдаёт объединённый результат BM25 + vector", async () => {
-    if (!dbReady) return;
+  testDb("hybrid выдаёт объединённый результат BM25 + vector", async () => {
     const t = await createTestDb();
     try {
       const { provider } = await seededSpace(t);
@@ -536,8 +593,7 @@ describe("vector/hybrid search (integration)", () => {
     }
   });
 
-  test("rrfFuse + dedupByMessage на реальных списках", async () => {
-    if (!dbReady) return;
+  testDb("rrfFuse + dedupByMessage на реальных списках", async () => {
     const t = await createTestDb();
     try {
       const { provider } = await seededSpace(t);
@@ -550,8 +606,7 @@ describe("vector/hybrid search (integration)", () => {
     }
   });
 
-  test("деградация (§14): нет active space → VectorSearchUnavailable", async () => {
-    if (!dbReady) return;
+  testDb("деградация (§14): нет active space → VectorSearchUnavailable", async () => {
     const t = await createTestDb();
     try {
       await seed(t);
@@ -571,8 +626,7 @@ describe("vector/hybrid search (integration)", () => {
 });
 
 describe("инвалидация projection и rebuild (integration)", () => {
-  test("смена current revision удаляет vectors старых docs (§8.1)", async () => {
-    if (!dbReady) return;
+  testDb("смена current revision удаляет vectors старых docs (§8.1)", async () => {
     const t = await createTestDb();
     try {
       const ctx = await makeCtx(t);
@@ -610,8 +664,7 @@ describe("инвалидация projection и rebuild (integration)", () => {
     }
   });
 
-  test("embeddings rebuild: stale jobs → pending, их vectors удалены (§13.5)", async () => {
-    if (!dbReady) return;
+  testDb("embeddings rebuild: stale jobs → pending, их vectors удалены (§13.5)", async () => {
     const t = await createTestDb();
     try {
       await seed(t);
@@ -640,8 +693,51 @@ describe("инвалидация projection и rebuild (integration)", () => {
     }
   });
 
-  test("embeddings plan/status: счётчики и storage-оценка", async () => {
-    if (!dbReady) return;
+  testDb("rebuild: устаревшие extraction/segmentation versions → pending (§13.5)", async () => {
+    const t = await createTestDb();
+    try {
+      await seed(t);
+      await makeSpace(t, true);
+      const provider = new MockEmbeddingProvider({ dimensions: DIMS, model: "mock-embedding" });
+      await runEmbeddingWorker(t.db, mockFactory(provider), { privacy: EMPTY_PRIVACY_POLICY });
+      expect(await vectorCount(t)).toBe(4);
+
+      // Документы извлечены/сегментированы старыми версиями кода; content hash
+      // не менялся — по одному hash такой stale не поймать.
+      const docs = await selectAll<{ id: RecordId }>(
+        t.db,
+        "SELECT id FROM search_document ORDER BY id LIMIT 2",
+      );
+      expect(docs).toHaveLength(2);
+      await t.db.query(`UPDATE ONLY $id SET segmentation_version = "0"`, { id: docs[0]!.id });
+      await t.db.query(`UPDATE ONLY $id SET extraction_version = "0"`, { id: docs[1]!.id });
+
+      const summary = await rebuildStaleJobs(t.db, SPACE_SLUG);
+      expect(summary.resetToPending).toBe(2);
+      expect(summary.vectorsDeleted).toBe(2);
+      expect(await vectorCount(t)).toBe(2);
+      const jobs = await allJobs(t);
+      expect(jobs.filter((j) => j.status === "pending")).toHaveLength(2);
+      expect(jobs.filter((j) => j.status === "completed")).toHaveLength(2);
+
+      // Projection пересобрана актуальным кодом (versions документов совпали
+      // с EXTRACTOR_VERSION/SEGMENTATION_VERSION) — повторный rebuild чист.
+      await t.db.query(`UPDATE ONLY $id SET segmentation_version = $v`, {
+        id: docs[0]!.id,
+        v: SEGMENTATION_VERSION,
+      });
+      await t.db.query(`UPDATE ONLY $id SET extraction_version = $v`, {
+        id: docs[1]!.id,
+        v: String(EXTRACTOR_VERSION),
+      });
+      const again = await rebuildStaleJobs(t.db, SPACE_SLUG);
+      expect(again.resetToPending).toBe(0);
+    } finally {
+      await dropTestDb(t);
+    }
+  });
+
+  testDb("embeddings plan/status: счётчики и storage-оценка", async () => {
     const t = await createTestDb();
     try {
       await seed(t);

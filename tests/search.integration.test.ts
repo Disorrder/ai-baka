@@ -2,8 +2,13 @@
  * Integration-тесты full-text search (этап 6, docs/plan.md §12, §14) на
  * живом SurrealDB: BM25 по search_document находит известные фразы,
  * фильтры работают, сегментированный длинный документ находится по фразе
- * из середины, старые revisions не в обычной выдаче, reasoning/tool —
- * только через forensic mode, rebuild пересоздаёт projection.
+ * из середины, старые revisions не в обычной выдаче, reasoning/tool/system
+ * контент — только через forensic mode, rebuild пересоздаёт projection.
+ * Плюс: vector over-fetch при активных фильтрах §14 (документ вне
+ * глобального top-50 находится с --harness), vector mode уважает limit,
+ * provider ↔ space сопоставляется включая provider.
+ * Без живой БД integration-тесты ЯВНО skip'аются (dbTest), unit-тесты
+ * hybrid pipeline (diversification) выполняются всегда.
  */
 
 import { beforeAll, describe, expect, test } from "bun:test";
@@ -27,22 +32,41 @@ import {
 import { writeDialogueRevision, type DialogueTxInput } from "../src/db/repositories/corpus.ts";
 import { dialogueIdentityKey } from "../src/domain/identity.ts";
 import { kimiCodeExtractors } from "../src/search/extractors/kimi-code.ts";
-import { isForensic, searchForensic, searchText, type SearchFilters } from "../src/search/fulltext.ts";
+import {
+  isForensic,
+  searchForensic,
+  searchText,
+  type SearchFilters,
+  type SearchHit,
+} from "../src/search/fulltext.ts";
+import {
+  dedupByMessage,
+  diversifyByDialogue,
+  searchVector,
+  VectorSearchUnavailable,
+} from "../src/search/hybrid.ts";
 import { rebuildSearchProjection } from "../src/search/rebuild.ts";
 import { SEGMENTATION_VERSION } from "../src/search/segmenter.ts";
+import type { EmbeddingProvider } from "../src/embeddings/provider.ts";
+import { createSpace } from "../src/embeddings/spaces.ts";
 import { selectAll, selectOne } from "../src/db/repositories/helpers.ts";
-import { createTestDb, dropTestDb, isDbAvailable, type TestDb } from "./db-test-utils.ts";
+import { createTestDb, dbTest, dropTestDb, isDbAvailable, type TestDb } from "./db-test-utils.ts";
 
-let dbReady = false;
+// Прогрев кеша доступности; сами тесты регистрируются через testDb.
 beforeAll(async () => {
-  dbReady = await isDbAvailable();
+  await isDbAvailable();
 });
+
+/** `test` при живой БД, иначе явный `test.skip` (проверка один раз на файл). */
+const testDb = await dbTest();
 
 const USER_PHRASE = "запечённые яблоки с корицей";
 const MIDDLE_MARKER = "срединный маркер абракадабра";
 const OLD_PHRASE = "старая уникальная фраза первой версии";
 const REASONING_MARKER = "тайное рассуждение ксиволь";
 const TOOL_MARKER = "результат инструмента йолопуки";
+const SYSTEM_MARKER = "системная инструкция фыркол";
+const DEVELOPER_MARKER = "developer послание жумбра";
 
 /** Длинный текст > TARGET токенов с маркером в середине (проверка §13.4). */
 function longAssistantText(marker: string): string {
@@ -119,6 +143,28 @@ function dialogueV2(externalId: string): ParsedDialogue {
     { sequence: 0, kind: "text", content: "Совершенно новый лаконичный ответ второй версии.", metadata: {} },
   ];
   return v1;
+}
+
+/** Диалог с system/developer сообщениями (forensic --include-system, §12.1). */
+function dialogueWithSystem(externalId: string): ParsedDialogue {
+  const d = dialogueV1(externalId);
+  d.messages.push(
+    makeMessage(2, {
+      role: "system",
+      humanAuthored: false,
+      chunks: [
+        { sequence: 0, kind: "system", content: `Первая ${SYSTEM_MARKER} для ассистента`, metadata: {} },
+      ],
+    }),
+    makeMessage(3, {
+      role: "developer",
+      humanAuthored: false,
+      chunks: [
+        { sequence: 0, kind: "developer", content: `Второе ${DEVELOPER_MARKER} от команды`, metadata: {} },
+      ],
+    }),
+  );
+  return d;
 }
 
 interface Ctx {
@@ -224,8 +270,7 @@ async function seedV1(t: TestDb, externalId: string) {
 }
 
 describe("full-text search (integration)", () => {
-  test("обычный поиск находит известную фразу, контекст и фильтры работают", async () => {
-    if (!dbReady) return;
+  testDb("обычный поиск находит известную фразу, контекст и фильтры работают", async () => {
     const t = await createTestDb();
     try {
       await seedV1(t, "session_search");
@@ -272,8 +317,7 @@ describe("full-text search (integration)", () => {
     }
   });
 
-  test("сегментированный длинный документ: находится по фразе из середины, метаданные сегментов корректны", async () => {
-    if (!dbReady) return;
+  testDb("сегментированный длинный документ: находится по фразе из середины, метаданные сегментов корректны", async () => {
     const t = await createTestDb();
     try {
       const { result } = await seedV1(t, "session_segmented");
@@ -309,8 +353,7 @@ describe("full-text search (integration)", () => {
     }
   });
 
-  test("старые revisions не в обычной выдаче; forensic --all-revisions их видит", async () => {
-    if (!dbReady) return;
+  testDb("старые revisions не в обычной выдаче; forensic --all-revisions их видит", async () => {
     const t = await createTestDb();
     try {
       const { ctx, key } = await seedV1(t, "session_revisions");
@@ -341,8 +384,7 @@ describe("full-text search (integration)", () => {
     }
   });
 
-  test("reasoning/tool контент доступен только через forensic mode", async () => {
-    if (!dbReady) return;
+  testDb("reasoning/tool контент доступен только через forensic mode", async () => {
     const t = await createTestDb();
     try {
       await seedV1(t, "session_forensic");
@@ -368,8 +410,7 @@ describe("full-text search (integration)", () => {
     }
   });
 
-  test("search:rebuild пересоздаёт projection current revisions идемпотентно", async () => {
-    if (!dbReady) return;
+  testDb("search:rebuild пересоздаёт projection current revisions идемпотентно", async () => {
     const t = await createTestDb();
     try {
       const { ctx, result } = await seedV1(t, "session_rebuild");
@@ -417,6 +458,211 @@ describe("full-text search (integration)", () => {
         "SELECT count() AS n FROM search_document GROUP ALL",
       );
       expect(count?.n).toBe(result.searchDocumentCount);
+    } finally {
+      await dropTestDb(t);
+    }
+  });
+});
+
+describe("forensic --include-system (integration)", () => {
+  testDb("system/developer контент доступен только через forensic --include-system (§12.1)", async () => {
+    const t = await createTestDb();
+    try {
+      const ctx = await makeCtx(t);
+      const key = dialogueIdentityKey(ctx.installation.toString(), "session_system", "fb");
+      await writeDialogueRevision(t.db, txInput(ctx, dialogueWithSystem("session_system"), key));
+
+      expect(isForensic(filters())).toBe(false);
+      expect(isForensic(filters({ includeSystem: true }))).toBe(true);
+
+      // обычный поиск system/developer НЕ видит
+      expect(await searchText(t.db, "фыркол", filters())).toHaveLength(0);
+      expect(await searchText(t.db, "жумбра", filters())).toHaveLength(0);
+      // forensic без флага: только kind=text → тоже не видит
+      expect(await searchForensic(t.db, "фыркол", filters())).toHaveLength(0);
+      expect(await searchForensic(t.db, "жумбра", filters())).toHaveLength(0);
+      // --include-system: оба kinds находятся
+      const system = await searchForensic(t.db, "фыркол", filters({ includeSystem: true }));
+      expect(system).toHaveLength(1);
+      expect(system[0]!.kind).toBe("system");
+      const developer = await searchForensic(t.db, "жумбра", filters({ includeSystem: true }));
+      expect(developer).toHaveLength(1);
+      expect(developer[0]!.kind).toBe("developer");
+      // --include-system НЕ включает thought/tool (флаги независимы)
+      expect(await searchForensic(t.db, "ксиволь", filters({ includeSystem: true }))).toHaveLength(0);
+      expect(await searchForensic(t.db, "йолопуки", filters({ includeSystem: true }))).toHaveLength(0);
+    } finally {
+      await dropTestDb(t);
+    }
+  });
+});
+
+describe("hybrid pipeline: dedup + diversification (unit, §14 шаги 4–5)", () => {
+  function hit(id: string, dialogueId: string, messageId?: string): SearchHit {
+    return { id, score: 1, snippet: "", dialogueId, revisionId: "dialogue_revision:x", messageId };
+  }
+
+  test("5 hits одного диалога в топе → не более 3 в выдаче", () => {
+    const hits = [
+      ...Array.from({ length: 5 }, (_, i) => hit(`doc${i}`, "dlg_1", `m${i}`)),
+      hit("other1", "dlg_2", "m9"),
+      hit("other2", "dlg_3", "m8"),
+    ];
+    const out = diversifyByDialogue(dedupByMessage(hits));
+    expect(out.filter((h) => h.dialogueId === "dlg_1")).toHaveLength(3);
+    // лучшие по порядку сохраняются, остальные диалоги не пострадали
+    expect(out.map((h) => h.id)).toEqual(["doc0", "doc1", "doc2", "other1", "other2"]);
+  });
+
+  test("dedup по message идёт до diversification: сегменты одного message не тратят лимит диалога", () => {
+    const hits = [
+      hit("seg0", "dlg_1", "m1"),
+      hit("seg1", "dlg_1", "m1"), // тот же message — выпадает на dedup
+      hit("seg2", "dlg_1", "m2"),
+      hit("seg3", "dlg_1", "m3"),
+      hit("seg4", "dlg_1", "m4"),
+    ];
+    const out = diversifyByDialogue(dedupByMessage(hits));
+    expect(out.map((h) => h.id)).toEqual(["seg0", "seg2", "seg3"]);
+  });
+});
+
+describe("vector search: over-fetch, limit, provider (integration)", () => {
+  const VECTOR_DIMS = 16;
+  const DECOYS = 60;
+  // Query = [1,0,…]; decoy'и — близкие, но РАЗЛИЧНЫЕ векторы (dist ≈ 1e-6·i):
+  // на 120 одинаковых векторах HNSW-граф в SurrealDB вырождается и ANN
+  // недетерминированно теряет точки (проверено на живой базе).
+  // Codex-документы — противоположный вектор (dist ≈ 2): детерминированно
+  // ВНЕ глобального top-50.
+  const QUERY_VECTOR = [1, ...Array.from({ length: VECTOR_DIMS - 1 }, () => 0)];
+  const decoyVector = (i: number): number[] => [
+    1,
+    (i + 1) * 1e-3,
+    ...Array.from({ length: VECTOR_DIMS - 2 }, () => 0),
+  ];
+  const FAR_VECTOR = [-1, 1e-3, ...Array.from({ length: VECTOR_DIMS - 2 }, () => 0)];
+
+  function fixedProvider(): EmbeddingProvider {
+    return {
+      provider: "mock",
+      model: "mock-embedding",
+      dimensions: VECTOR_DIMS,
+      embed: (texts: string[]) =>
+        Promise.resolve({
+          vectors: texts.map(() => [...QUERY_VECTOR]),
+          usage: { promptTokens: 1, totalTokens: 1 },
+        }),
+    };
+  }
+
+  function shortDialogue(externalId: string, prompt: string): ParsedDialogue {
+    return {
+      externalId,
+      title: `Диалог ${externalId}`,
+      workspace: { path: "/tmp/project", name: "project" },
+      startedAt: new Date("2026-07-20T10:00:00Z"),
+      updatedAt: new Date("2026-07-20T10:05:00Z"),
+      messages: [
+        makeMessage(0, {
+          metadata: { origin: { kind: "user" } },
+          chunks: [{ sequence: 0, kind: "text", content: prompt, metadata: {} }],
+        }),
+        makeMessage(1, {
+          role: "assistant",
+          humanAuthored: false,
+          timestamp: new Date("2026-07-20T10:01:00Z"),
+          model: { rawModelName: "kimi-code/k3", vendor: "moonshot", canonicalName: "k3" },
+          chunks: [{ sequence: 0, kind: "text", content: `Ответ на ${prompt}`, metadata: {} }],
+        }),
+      ],
+      metadata: {},
+    };
+  }
+
+  testDb("документ редкого harness'а вне глобального top-50 находится с --harness; limit уважается; provider сверяется", async () => {
+    const t = await createTestDb();
+    try {
+      const ctx = await makeCtx(t);
+      // 60 decoy-диалогов kimi-code (вектор = query, dist 0).
+      for (let i = 0; i < DECOYS; i++) {
+        const key = dialogueIdentityKey(ctx.installation.toString(), `decoy_${i}`, "fb");
+        await writeDialogueRevision(
+          t.db,
+          txInput(ctx, shortDialogue(`decoy_${i}`, `обычный вопрос номер ${i}`), key),
+        );
+      }
+      // 1 диалог редкого harness'а codex (вектор противоположный, dist 2).
+      const codexHarness = await ensureHarness(t.db, {
+        slug: "codex",
+        displayName: "Codex",
+        kind: "file_tree",
+      });
+      const codexInstallation = await ensureHarnessInstallation(t.db, {
+        host: ctx.host,
+        harness: codexHarness,
+        installed: true,
+      });
+      const rareKey = dialogueIdentityKey(codexInstallation.toString(), "rare_codex", "fb");
+      await writeDialogueRevision(t.db, {
+        ...txInput(ctx, shortDialogue("rare_codex", "редкий вопрос codex"), rareKey),
+        harnessInstallation: codexInstallation,
+      });
+
+      const { space } = await createSpace(t.db, {
+        slug: "search_overfetch_16",
+        provider: "mock",
+        model: "mock-embedding",
+        dimensions: VECTOR_DIMS,
+        activate: true,
+      });
+      // Векторы пишем напрямую (без worker'а): детерминированные расстояния.
+      const docs = await selectAll<{ id: RecordId; harness?: string }>(
+        t.db,
+        "SELECT id, dialogue.harness_installation.harness.slug AS harness FROM search_document",
+      );
+      expect(docs.length).toBe((DECOYS + 1) * 2);
+      for (const [i, doc] of docs.entries()) {
+        await t.db.query(
+          `CREATE ${space.physical_table} SET search_document = $doc, embedding_space = $space, ` +
+            `input_sha256 = "manual", vector = $vec, prompt_tokens = 1, created_at = time::now()`,
+          { doc: doc.id, space: space.id, vec: doc.harness === "codex" ? FAR_VECTOR : decoyVector(i) },
+        );
+      }
+
+      // HNSW-индекс догоняет вставки асинхронно: ждём, пока ANN увидит все
+      // векторы, иначе выдача недетерминированна.
+      for (let attempt = 0; ; attempt++) {
+        const ann = await selectAll<{ search_document: RecordId }>(
+          t.db,
+          `SELECT search_document FROM ${space.physical_table} WHERE vector <|200, 200|> $q`,
+          { q: QUERY_VECTOR },
+        );
+        if (ann.length === docs.length) break;
+        if (attempt >= 25) throw new Error(`HNSW не догнал индексацию: ${ann.length}/${docs.length}`);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+
+      const provider = fixedProvider();
+      // Без фильтров глобальный top-50 — только decoy'и (dist 0).
+      const unfiltered = await searchVector(t.db, provider, "запрос", filters({ limit: 50 }));
+      expect(unfiltered).toHaveLength(50);
+      expect(unfiltered.every((h) => h.harness === "kimi-code")).toBe(true);
+
+      // С фильтром --harness codex over-fetch доходит и до худшего вектора.
+      const rare = await searchVector(t.db, provider, "запрос", filters({ harness: "codex" }));
+      expect(rare.length).toBeGreaterThan(0);
+      expect(rare.every((h) => h.harness === "codex")).toBe(true);
+
+      // Vector mode уважает пользовательский limit.
+      const limited = await searchVector(t.db, provider, "запрос", filters({ limit: 5 }));
+      expect(limited).toHaveLength(5);
+
+      // Тот же model/dimensions, но другой provider — space не подходит.
+      const alien: EmbeddingProvider = { ...fixedProvider(), provider: "other" };
+      await expect(searchVector(t.db, alien, "запрос", filters())).rejects.toBeInstanceOf(
+        VectorSearchUnavailable,
+      );
     } finally {
       await dropTestDb(t);
     }

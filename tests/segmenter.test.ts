@@ -117,6 +117,33 @@ describe("segmentDocument", () => {
     }
   });
 
+  test("hard limit: 9000 мелких абзацев — разделители учтены, ни один сегмент не >= MAX", () => {
+    // Регрессия ревью: packBlocks суммировал токены блоков без "\n\n" —
+    // сегмент выходил за 8000 токенов (11428 по точному counter'у).
+    const content = Array.from({ length: 9000 }, () => "abc").join("\n\n");
+    const segments = segmentDocument(content);
+    expect(segments.length).toBeGreaterThan(1);
+    for (const segment of segments) {
+      expect(segment.tokenCount).toBe(counter(segment.content));
+      expect(segment.tokenCount).toBeLessThan(MAX_TOKENS);
+    }
+  });
+
+  test("splitOversized режет по переданному counter'у, а не по эвристике chars", () => {
+    // Регрессия ревью: посимвольный split игнорировал counter (резал по
+    // MAX_TOKENS × CHARS_PER_TOKEN символов). Counter «1 символ = 1 токен»:
+    // строка из 9000 символов — 9000 токенов > MAX, должна быть разрезана.
+    const charCounter = (text: string): number => text.length;
+    const content = "x".repeat(MAX_TOKENS + 1000);
+    const segments = segmentDocument(content, charCounter);
+    expect(segments.length).toBeGreaterThan(1);
+    for (const segment of segments) {
+      expect(segment.tokenCount).toBe(charCounter(segment.content));
+      expect(segment.tokenCount).toBeLessThanOrEqual(MAX_TOKENS);
+    }
+    expect(segments.map((s) => s.content).join("")).toBe(content);
+  });
+
   test("детерминизм: одинаковый вход → одинаковый выход", () => {
     const content = Array.from({ length: 20 }, (_, i) => `## S${i}\n${paragraph(1000)}`).join("\n\n");
     expect(segmentDocument(content)).toEqual(segmentDocument(content));

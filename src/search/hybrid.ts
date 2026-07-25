@@ -11,7 +11,9 @@
  * Hybrid mode: BM25 top 50 + vector top 50 → Reciprocal Rank Fusion
  * (клиентский RRF k=60 — search::rrf() в 3.2.3 требует переписывания
  * запросов на subquery-форму, клиентский вариант проще и детерминирован)
- * → dedup по message → top N. Вывод совпадает с text mode (SearchHit).
+ * → dedup по message → diversification по dialogue (не более
+ * MAX_HITS_PER_DIALOGUE hits) → top N. Вывод совпадает с text mode
+ * (SearchHit).
  *
  * Деградация (§14): нет active space или API key — vector mode бросает
  * VectorSearchUnavailable с причиной; hybrid на уровне CLI деградирует
@@ -34,6 +36,12 @@ import {
 export const VECTOR_TOP_K = 50;
 /** EF HNSW-поиска (>= K): чем больше, тем точнее ANN и медленнее. */
 export const HNSW_EF = 200;
+/** Множитель over-fetch ANN при активных фильтрах §14 (см. searchVector). */
+export const VECTOR_OVERFETCH_FACTOR = 4;
+/** Потолок кандидатов ANN при over-fetch. */
+export const VECTOR_MAX_CANDIDATES = 1000;
+/** Diversification (§14 шаг 5): не более стольких hits на один dialogue. */
+export const MAX_HITS_PER_DIALOGUE = 3;
 /** RRF constant (план §14: k = 60). */
 export const RRF_K = 60;
 
@@ -71,10 +79,30 @@ interface HydratedRow {
   ts?: Date;
 }
 
+/** Есть ли активные фильтры §14 (для over-fetch в searchVector). */
+function hasFilters(filters: SearchFilters): boolean {
+  return Boolean(
+    filters.harness ||
+      filters.host ||
+      filters.workspace ||
+      filters.model ||
+      filters.documentType ||
+      filters.from ||
+      filters.to ||
+      filters.deletedOnly,
+  );
+}
+
 /**
- * Vector ANN search по active space. Фильтры §14 применяются при гидратации
- * search_document (top-K ANN без учёта фильтров — отфильтрованные строки
- * просто выпадают, over-fetch не реализован).
+ * Vector ANN search по active space. Возвращает не более filters.limit hits.
+ *
+ * HNSW в SurrealDB не поддерживает partial WHERE, поэтому фильтры §14
+ * нельзя применить внутри ANN-запроса. Без фильтров — top 50 ANN, как
+ * раньше. При активных фильтрах — over-fetch: запрашиваем
+ * max(50 × VECTOR_OVERFETCH_FACTOR, 200) (потолок VECTOR_MAX_CANDIDATES)
+ * кандидатов, фильтруем при гидратации search_document и режем до limit;
+ * иначе подходящие документы вне глобального top-50 никогда не
+ * рассматривались (ложные пустые результаты редких фильтров).
  */
 export async function searchVector(
   db: Surreal,
@@ -83,19 +111,27 @@ export async function searchVector(
   filters: SearchFilters,
 ): Promise<SearchHit[]> {
   const space = await resolveActiveSpace(db);
-  if (provider.model !== space.model || provider.dimensions !== space.dimensions) {
+  if (
+    provider.provider !== space.provider ||
+    provider.model !== space.model ||
+    provider.dimensions !== space.dimensions
+  ) {
     throw new VectorSearchUnavailable(
-      `provider ${provider.model}@${provider.dimensions} не совпадает с active space ${space.model}@${space.dimensions}`,
+      `provider ${provider.provider}/${provider.model}@${provider.dimensions} не совпадает с active space ${space.provider}/${space.model}@${space.dimensions}`,
     );
   }
   const { vectors } = await provider.embed([query]);
   const queryVector = vectors[0];
   if (!queryVector) throw new VectorSearchUnavailable("provider вернул пустой результат на query");
 
+  const k = hasFilters(filters)
+    ? Math.min(Math.max(VECTOR_TOP_K * VECTOR_OVERFETCH_FACTOR, 200), VECTOR_MAX_CANDIDATES)
+    : VECTOR_TOP_K;
+  const ef = Math.max(HNSW_EF, k);
   const ann = await selectAll<AnnRow>(
     db,
     `SELECT search_document, vector::distance::knn() AS dist FROM ${space.physical_table}
-     WHERE vector <|${VECTOR_TOP_K}, ${HNSW_EF}|> $q`,
+     WHERE vector <|${k}, ${ef}|> $q`,
     { q: queryVector },
   );
   if (ann.length === 0) return [];
@@ -140,7 +176,8 @@ export async function searchVector(
       model: doc.model,
       timestamp: doc.ts?.toISOString(),
     }))
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => b.score - a.score)
+    .slice(0, filters.limit);
 }
 
 /**
@@ -176,7 +213,29 @@ export function dedupByMessage(hits: SearchHit[]): SearchHit[] {
   return out;
 }
 
-/** Hybrid pipeline §14: BM25 top 50 + vector top 50 → RRF → dedup → top N. */
+/**
+ * Diversification по dialogue (§14 шаг 5): не более maxPerDialogue hits
+ * на один диалог, порядок и score остальных не меняются. Чистая функция.
+ */
+export function diversifyByDialogue(
+  hits: SearchHit[],
+  maxPerDialogue = MAX_HITS_PER_DIALOGUE,
+): SearchHit[] {
+  const counts = new Map<string, number>();
+  const out: SearchHit[] = [];
+  for (const hit of hits) {
+    const count = counts.get(hit.dialogueId) ?? 0;
+    if (count >= maxPerDialogue) continue;
+    counts.set(hit.dialogueId, count + 1);
+    out.push(hit);
+  }
+  return out;
+}
+
+/**
+ * Hybrid pipeline §14: BM25 top 50 + vector top 50 → RRF → dedup по
+ * message → diversification по dialogue → top N.
+ */
 export async function searchHybrid(
   db: Surreal,
   provider: EmbeddingProvider,
@@ -185,7 +244,10 @@ export async function searchHybrid(
 ): Promise<SearchHit[]> {
   const [textHits, vectorHits] = await Promise.all([
     searchText(db, query, { ...filters, limit: VECTOR_TOP_K }),
-    searchVector(db, provider, query, filters),
+    searchVector(db, provider, query, { ...filters, limit: VECTOR_TOP_K }),
   ]);
-  return dedupByMessage(rrfFuse([textHits, vectorHits])).slice(0, filters.limit);
+  return diversifyByDialogue(dedupByMessage(rrfFuse([textHits, vectorHits]))).slice(
+    0,
+    filters.limit,
+  );
 }

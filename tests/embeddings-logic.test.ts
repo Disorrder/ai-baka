@@ -5,9 +5,18 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { backoffMs, isJobStale, BACKOFF_BASE_MS, BACKOFF_MAX_MS } from "../src/embeddings/jobs.ts";
+import { RecordId } from "surrealdb";
+import {
+  backoffMs,
+  isJobStale,
+  distributePromptTokens,
+  defaultProviderFactory,
+  BACKOFF_BASE_MS,
+  BACKOFF_MAX_MS,
+  type JobStaleFactors,
+} from "../src/embeddings/jobs.ts";
 import { privacyExclusion, EMPTY_PRIVACY_POLICY } from "../src/embeddings/privacy.ts";
-import { defaultSlug, physicalTableName, SLUG_RE } from "../src/embeddings/spaces.ts";
+import { defaultSlug, physicalTableName, SLUG_RE, type EmbeddingSpace } from "../src/embeddings/spaces.ts";
 import { dedupByMessage, rrfFuse, RRF_K } from "../src/search/hybrid.ts";
 import { MockEmbeddingProvider, mockVector } from "../src/embeddings/mock-provider.ts";
 import { OpenAIEmbeddingProvider } from "../src/embeddings/openai-provider.ts";
@@ -24,10 +33,99 @@ describe("backoff (§13.6)", () => {
 });
 
 describe("stale detection (§13.5)", () => {
-  test("hash изменился — stale; совпадает — нет; документ удалён — stale", () => {
-    expect(isJobStale("aaa", "bbb")).toBe(true);
-    expect(isJobStale("aaa", "aaa")).toBe(false);
-    expect(isJobStale("aaa", undefined)).toBe(true);
+  const recorded: JobStaleFactors = {
+    contentSha256: "hash",
+    extractionVersion: "1",
+    segmentationVersion: "1",
+    provider: "openai",
+    model: "text-embedding-3-large",
+    dimensions: 1024,
+  };
+  const current: JobStaleFactors = { ...recorded };
+
+  test("все факторы совпадают — не stale", () => {
+    expect(isJobStale(recorded, current)).toBe(false);
+  });
+
+  test("документ удалён (recorded undefined) — stale", () => {
+    expect(isJobStale(undefined, current)).toBe(true);
+  });
+
+  test("изменение любого фактора §13.5 — stale", () => {
+    expect(isJobStale(recorded, { ...current, contentSha256: "other" })).toBe(true);
+    expect(isJobStale(recorded, { ...current, extractionVersion: "2" })).toBe(true);
+    expect(isJobStale(recorded, { ...current, segmentationVersion: "2" })).toBe(true);
+    expect(isJobStale(recorded, { ...current, provider: "voyage" })).toBe(true);
+    expect(isJobStale(recorded, { ...current, model: "text-embedding-3-small" })).toBe(true);
+    expect(isJobStale(recorded, { ...current, dimensions: 512 })).toBe(true);
+  });
+});
+
+describe("распределение prompt_tokens (§13.6)", () => {
+  test("сумма распределённого строго равна фактическому usage API, значения ≥ 0", () => {
+    const cases: Array<[number, number[]]> = [
+      [42, [10, 10, 10]],
+      [1, [1, 1, 1]],
+      // round-half-up суммарно превышает total — доля обрезается, остаток последнему.
+      [2, [1, 1, 1, 1]],
+      [100, [1]],
+      [7, [3, 1, 1]],
+      [0, [5, 5]],
+      // Нулевые веса (пустые документы): весь usage уходит последнему.
+      [10, [0, 0, 0]],
+    ];
+    for (const [total, weights] of cases) {
+      const shares = distributePromptTokens(total, weights);
+      expect(shares).toHaveLength(weights.length);
+      expect(shares.reduce((sum, share) => sum + share, 0)).toBe(total);
+      expect(shares.every((share) => share >= 0)).toBe(true);
+    }
+  });
+
+  test("остаток округления уходит последнему элементу", () => {
+    expect(distributePromptTokens(42, [10, 10, 10])).toEqual([14, 14, 14]);
+    expect(distributePromptTokens(10, [1, 1, 1])).toEqual([3, 3, 4]);
+    expect(distributePromptTokens(2, [1, 1, 1, 1])).toEqual([1, 1, 0, 0]);
+  });
+
+  test("пустой батч — пустое распределение", () => {
+    expect(distributePromptTokens(5, [])).toEqual([]);
+  });
+});
+
+describe("defaultProviderFactory (§13.1)", () => {
+  function space(provider: string): EmbeddingSpace {
+    return {
+      id: new RecordId("embedding_space", "test"),
+      slug: "test",
+      provider,
+      model: "m",
+      dimensions: 8,
+      distance: "COSINE",
+      vector_type: "F32",
+      segmentation_version: "1",
+      active: true,
+      physical_table: "search_embedding_test",
+      created_at: new Date(),
+    };
+  }
+
+  test("openai без API key — понятная ошибка", () => {
+    const factory = defaultProviderFactory({});
+    expect(() => factory(space("openai"))).toThrow("OPENAI_API_KEY не задан");
+  });
+
+  test("неизвестный provider — понятная ошибка", () => {
+    const factory = defaultProviderFactory({ openaiApiKey: "sk-test" });
+    expect(() => factory(space("voyage"))).toThrow('неизвестный embedding provider "voyage"');
+  });
+
+  test("openai с key — provider с model/dimensions из space", () => {
+    const factory = defaultProviderFactory({ openaiApiKey: "sk-test" });
+    const provider = factory(space("openai"));
+    expect(provider.provider).toBe("openai");
+    expect(provider.model).toBe("m");
+    expect(provider.dimensions).toBe(8);
   });
 });
 
@@ -231,6 +329,58 @@ describe("OpenAI provider (fake fetch)", () => {
     } catch (error) {
       expect(error).toBeInstanceOf(EmbeddingProviderError);
       expect((error as EmbeddingProviderError).message).toContain("dimension mismatch");
+      expect((error as EmbeddingProviderError).retryable).toBe(false);
+    }
+  });
+
+  test("дубликаты data[].index при правильной длине — понятная permanent ошибка", async () => {
+    const body = {
+      data: [
+        { index: 0, embedding: [0.1, 0.2] },
+        { index: 0, embedding: [0.3, 0.4] },
+      ],
+      usage: { prompt_tokens: 2, total_tokens: 2 },
+    };
+    const { fetchFn } = fakeFetch([{ status: 200, body }]);
+    const provider = new OpenAIEmbeddingProvider({
+      apiKey: "sk-test",
+      model: "m",
+      dimensions: 2,
+      fetchFn,
+      sleep: noSleep,
+    });
+    try {
+      await provider.embed(["a", "b"]);
+      expect.unreachable("должна быть ошибка");
+    } catch (error) {
+      expect(error).toBeInstanceOf(EmbeddingProviderError);
+      expect((error as EmbeddingProviderError).message).toContain("data[].index 0");
+      expect((error as EmbeddingProviderError).retryable).toBe(false);
+    }
+  });
+
+  test("data[].index вне диапазона [0, batchSize) — permanent ошибка", async () => {
+    const body = {
+      data: [
+        { index: 0, embedding: [0.1, 0.2] },
+        { index: 5, embedding: [0.3, 0.4] },
+      ],
+      usage: { prompt_tokens: 2, total_tokens: 2 },
+    };
+    const { fetchFn } = fakeFetch([{ status: 200, body }]);
+    const provider = new OpenAIEmbeddingProvider({
+      apiKey: "sk-test",
+      model: "m",
+      dimensions: 2,
+      fetchFn,
+      sleep: noSleep,
+    });
+    try {
+      await provider.embed(["a", "b"]);
+      expect.unreachable("должна быть ошибка");
+    } catch (error) {
+      expect(error).toBeInstanceOf(EmbeddingProviderError);
+      expect((error as EmbeddingProviderError).message).toContain("data[].index 5");
       expect((error as EmbeddingProviderError).retryable).toBe(false);
     }
   });

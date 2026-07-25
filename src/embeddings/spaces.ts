@@ -138,8 +138,16 @@ export async function createSpace(
   );
   if (!space) throw new Error(`не удалось создать embedding_space "${slug}"`);
 
-  if (options.activate) await activateSpace(db, slug);
-  const { created, existing: existingJobs } = await enqueueBackfillJobs(db, space);
+  // activateSpace сам догоняет backfill — повторный enqueue не нужен.
+  let created: number;
+  let existingJobs: number;
+  if (options.activate) {
+    const activated = await activateSpace(db, slug);
+    created = activated.enqueuedJobs;
+    existingJobs = activated.existingJobs;
+  } else {
+    ({ created, existing: existingJobs } = await enqueueBackfillJobs(db, space));
+  }
   return {
     space: { ...space, active: options.activate ?? false },
     backfilledJobs: created,
@@ -194,8 +202,22 @@ export async function enqueueBackfillJobs(
   return { created: pending.length, existing: docs.length - pending.length };
 }
 
-/** Один active space на момент; старый space не уничтожается (§13.1). */
-export async function activateSpace(db: Surreal, slug: string): Promise<EmbeddingSpace> {
+/** Результат активации: активный space + счётчики догоняющего backfill. */
+export type ActivateSpaceResult = EmbeddingSpace & {
+  /** Jobs, созданные для search_documents без job в этом space. */
+  enqueuedJobs: number;
+  /** Документы, у которых job в этом space уже был. */
+  existingJobs: number;
+};
+
+/**
+ * Один active space на момент; старый space не уничтожается (§13.1).
+ * (Ре)активация догоняет backfill: документы, появившиеся пока space был
+ * inactive, jobs не получали (sync ставит jobs только active spaces, §13.5).
+ * Идемпотентно: детерминированные id + UNIQUE (search_document,
+ * embedding_space) — повторная активация не дублирует jobs.
+ */
+export async function activateSpace(db: Surreal, slug: string): Promise<ActivateSpaceResult> {
   const space = await selectOne<EmbeddingSpace>(
     db,
     "SELECT * FROM embedding_space WHERE slug = $slug",
@@ -209,7 +231,8 @@ export async function activateSpace(db: Surreal, slug: string): Promise<Embeddin
       "COMMIT;",
     { rid: space.id },
   );
-  return { ...space, active: true };
+  const { created, existing } = await enqueueBackfillJobs(db, space);
+  return { ...space, active: true, enqueuedJobs: created, existingJobs: existing };
 }
 
 export async function getActiveSpace(db: Surreal): Promise<EmbeddingSpace | undefined> {

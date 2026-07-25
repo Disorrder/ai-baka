@@ -44,12 +44,12 @@ import {
 } from "./embeddings/spaces.ts";
 import {
   cancelPendingJobs,
+  defaultProviderFactory,
   embeddingsPlan,
   embeddingsStatus,
   rebuildStaleJobs,
   retryFailedJobs,
   runEmbeddingWorker,
-  type ProviderFactory,
 } from "./embeddings/jobs.ts";
 import { localIdentity } from "./sync/host-identity.ts";
 import { ensureLegacySnapshot, migrationInputDir } from "./migration/legacy-snapshot.ts";
@@ -346,6 +346,7 @@ program
   .option("--deleted-only", "только диалоги, удалённые из источника")
   .option("--include-reasoning", "forensic: включить thought-чанки (поиск по chunk)")
   .option("--include-tools", "forensic: включить tool_call/tool_result (поиск по chunk)")
+  .option("--include-system", "forensic: включить system/developer-чанки (поиск по chunk)")
   .option("--all-revisions", "forensic: искать по всем revisions, не только current")
   .option("--limit <n>", "максимум результатов", Number)
   .option("--json", "вывести результат в JSON")
@@ -365,6 +366,7 @@ program
           deletedOnly?: boolean;
           includeReasoning?: boolean;
           includeTools?: boolean;
+          includeSystem?: boolean;
           allRevisions?: boolean;
           limit?: number;
           json?: boolean;
@@ -392,6 +394,7 @@ program
           deletedOnly: options.deletedOnly ?? false,
           includeReasoning: options.includeReasoning ?? false,
           includeTools: options.includeTools ?? false,
+          includeSystem: options.includeSystem ?? false,
           allRevisions: options.allRevisions ?? false,
           limit: options.limit && options.limit > 0 ? options.limit : 20,
         };
@@ -622,18 +625,9 @@ async function vectorProvider(db: Surreal, cfg: AppConfig): Promise<EmbeddingPro
   });
 }
 
-/** ProviderFactory worker'а: model/dimensions берутся из space record. */
-function workerProviderFactory(cfg: AppConfig): ProviderFactory {
-  return (space: EmbeddingSpace) => {
-    if (!cfg.openaiApiKey) {
-      throw new Error("OPENAI_API_KEY не задан — worker не может вызвать provider");
-    }
-    return new OpenAIEmbeddingProvider({
-      apiKey: cfg.openaiApiKey,
-      model: space.model,
-      dimensions: space.dimensions,
-    });
-  };
+/** ProviderFactory worker'а: provider выбирается по space.provider (§13.5). */
+function workerProviderFactory(cfg: AppConfig) {
+  return defaultProviderFactory({ openaiApiKey: cfg.openaiApiKey });
 }
 
 const embeddings = program
