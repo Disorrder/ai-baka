@@ -19,6 +19,9 @@
     "db:status": "bun run src/cli.ts db status",
     "db:migrate": "bun run src/cli.ts db migrate",
     "db:logs": "bun run src/cli.ts db logs",
+    "db:backup": "bun run src/cli.ts backup",
+    "db:restore:test": "bun run src/cli.ts restore:test",
+    "raw:verify": "bun run src/cli.ts raw:verify",
     "disk:eject": "bun run src/cli.ts disk eject",
     "test": "bun test --timeout 30000",
     "typecheck": "tsc --noEmit"
