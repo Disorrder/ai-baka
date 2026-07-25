@@ -1,0 +1,15 @@
+{
+  "sessionId": "local_33333333-3333-4333-8333-333333333333",
+  "processName": "quiet-example-fox",
+  "cliSessionId": "eeeeeeee-0000-4000-8000-eeeeeeeeeeee",
+  "cwd": "/sessions/quiet-example-fox",
+  "userSelectedFolders": [
+    "/Users/example/projects/edge-cases"
+  ],
+  "createdAt": 1783920000000,
+  "lastActivityAt": 1783920100000,
+  "model": "claude-opus-4-6",
+  "isArchived": false,
+  "title": "Граничные случаи",
+  "titleSource": "auto"
+}

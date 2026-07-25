@@ -1,0 +1,15 @@
+{
+  "sessionId": "local_44444444-4444-4444-8444-444444444444",
+  "processName": "lonely-example-owl",
+  "cliSessionId": "12121212-0000-4000-8000-121212121212",
+  "cwd": "/sessions/lonely-example-owl",
+  "userSelectedFolders": [
+    "/Users/example/projects/no-transcript"
+  ],
+  "createdAt": 1783930000000,
+  "lastActivityAt": 1783930005000,
+  "model": "claude-opus-4-6",
+  "isArchived": false,
+  "title": "Сессия без транскрипта",
+  "titleSource": "auto"
+}

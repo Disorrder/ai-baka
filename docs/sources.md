@@ -7,7 +7,7 @@
 | --- | --- | --- | --- | --- |
 | Codex | `codex` | `~/.codex/archived_sessions`, `~/.codex/sessions`, `~/.codex/sqlite` | JSONL file tree | `copy` |
 | Claude Code | `claude-code` | `~/.claude/projects`, `~/.claude/history.jsonl` | JSONL file tree | `copy` |
-| Claude Desktop | `claude-desktop` | `~/Library/Application Support/Claude/IndexedDB`, `Session Storage` | file-backed | `copy` |
+| Claude Desktop | `claude-desktop` | `~/Library/Application Support/Claude/local-agent-mode-sessions`, `IndexedDB`, `Session Storage` | JSON/JSONL file tree (+ LevelDB fallback) | `copy` |
 | OpenCode | `opencode` | `~/.local/share/opencode/opencode.db`, `storage/session_diff` | SQLite | `sqlite_backup` / `vacuum_into` |
 | Cursor | `cursor` | `~/Library/Application Support/Cursor/User/workspaceStorage`, `globalStorage/state.vscdb` | SQLite + files | `sqlite_backup` / `vacuum_into` |
 | Qwen Code | `qwen-code` | `~/.qwen/projects` | JSONL file tree | `copy` |

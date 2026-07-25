@@ -79,6 +79,8 @@ export const HARNESSES: Record<HarnessSlug, HarnessDefinition> = {
     snapshotStrategy: "copy",
     envOverride: "BAKA_SOURCES__CLAUDE_DESKTOP",
     defaultRoots: ({ home }) => [
+      // Локальные транскрипты local agent mode (local_*.json + audit.jsonl)
+      joinHome(home, "Library/Application Support/Claude/local-agent-mode-sessions"),
       joinHome(home, "Library/Application Support/Claude/IndexedDB"),
       joinHome(home, "Library/Application Support/Claude/Session Storage"),
     ],

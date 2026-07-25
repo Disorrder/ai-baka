@@ -1,0 +1,16 @@
+{
+  "sessionId": "local_22222222-2222-4222-8222-222222222222",
+  "processName": "brave-example-beaver",
+  "cliSessionId": "cccccccc-0000-4000-8000-cccccccccccc",
+  "cwd": "/sessions/brave-example-beaver",
+  "userSelectedFolders": [
+    "/Users/example/projects/spec-review"
+  ],
+  "createdAt": 1783910000000,
+  "lastActivityAt": 1783910200000,
+  "model": "claude-opus-4-6",
+  "effort": "high",
+  "isArchived": false,
+  "title": "Риски по spec.md",
+  "titleSource": "auto"
+}
