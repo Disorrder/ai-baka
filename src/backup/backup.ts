@@ -81,7 +81,9 @@ export function exportBaseName(
   schemaVersion: number,
   surrealVersion: string,
 ): string {
-  return `${timestamp}__schema-${schemaVersion}__surreal-${surrealVersion}`;
+  // /version возвращает "surrealdb-3.2.3+20260721.40522d1"; в имя — semver (§16.1).
+  const version = /\d+\.\d+\.\d+/.exec(surrealVersion)?.[0] ?? surrealVersion;
+  return `${timestamp}__schema-${schemaVersion}__surreal-${version}`;
 }
 
 export function exportFileName(base: string, compression: Compression): string {

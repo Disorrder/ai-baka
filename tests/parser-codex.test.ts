@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { normalizeUsageEvents } from "../src/parsers/shared/usage-normalization.ts";
 import { collectDialogues } from "../src/parsers/shared/parser.ts";
 import {
@@ -180,5 +183,25 @@ describe("codex parser: truncated", () => {
     expect(diagnostics.some((d) => d.code === "jsonl_parse_error")).toBe(true);
     expect(dialogue.externalId).toBe("55555555-6666-4777-8888-999999999999");
     expect(dialogue.messages.some((m) => m.role === "user")).toBe(true);
+  });
+});
+
+describe("codex parser: sqlite source (~/.codex/sqlite)", () => {
+  test("sqlite-файл → одна unsupported_file-диагностика, без jsonl_parse_error", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "baka-codex-sqlite-"));
+    try {
+      const file = path.join(dir, "state_5.sqlite");
+      await writeFile(
+        file,
+        Buffer.concat([Buffer.from("SQLite format 3\0", "latin1"), Buffer.alloc(128, 7)]),
+      );
+      const snapshot = await codexParser.parse(file);
+      expect(await collectDialogues(snapshot)).toHaveLength(0);
+      expect(snapshot.diagnostics).toHaveLength(1);
+      expect(snapshot.diagnostics[0]!.code).toBe("unsupported_file");
+      expect(snapshot.diagnostics[0]!.severity).toBe("error");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

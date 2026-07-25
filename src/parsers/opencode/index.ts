@@ -66,6 +66,7 @@ import type { NormalizedRole } from "../../domain/enums.ts";
 import type { HarnessParser, ParseContext } from "../shared/parser.ts";
 import { asNumber, asObject, asString, parseTimestamp } from "../shared/jsonl.ts";
 import { normalizeModelName } from "../shared/model-normalization.ts";
+import { isSqliteFile } from "../shared/sqlite.ts";
 
 export const OPENCODE_PARSER_NAME = "opencode";
 export const OPENCODE_PARSER_VERSION = 1;
@@ -118,6 +119,19 @@ export class OpenCodeParser implements HarnessParser {
 
   async parse(snapshotPath: string, context?: ParseContext): Promise<ParsedSourceSnapshot> {
     const diagnostics: ParsedDiagnostic[] = [];
+
+    // storage/session_diff — JSON-дампы, не sqlite: raw архивируется,
+    // parser их не читает (unsupported, а не SQLiteError "file is not
+    // a database" на первом query — bun:sqlite открывает файл лениво).
+    if ((await isSqliteFile(snapshotPath)) === false) {
+      diagnostics.push({
+        code: "unsupported_file",
+        message: `${snapshotPath}: not a sqlite database (archived as raw only)`,
+        severity: "error",
+        sourceLocator: snapshotPath,
+      });
+      return { sourceKind: "sqlite", dialogues: emptyDialogues(), diagnostics };
+    }
 
     let db: Database;
     try {

@@ -182,7 +182,10 @@ export async function snapshotSqlite(
   const stagingPath = path.join(dir, `${crypto.randomUUID()}.db`);
 
   const srcStat = await stat(sourcePath);
-  const db = new Database(sourcePath, { readonly: true });
+  // create:false — readonly+create (дефолт bun:sqlite) не может открыть
+  // WAL-базу без существующего -shm ("unable to open database file"),
+  // например Cursor state.vscdb в неактивных workspace (live acceptance, этап 8).
+  const db = new Database(sourcePath, { readonly: true, create: false });
   try {
     const escaped = stagingPath.replaceAll("'", "''");
     db.run(`VACUUM INTO '${escaped}'`);

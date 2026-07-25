@@ -50,6 +50,7 @@ import {
   readJsonlFile,
 } from "../shared/jsonl.ts";
 import { normalizeModelName } from "../shared/model-normalization.ts";
+import { isSqliteFile } from "../shared/sqlite.ts";
 
 export const CODEX_PARSER_NAME = "codex";
 export const CODEX_PARSER_VERSION = 1;
@@ -94,6 +95,26 @@ export class CodexParser implements HarnessParser {
   readonly sourceFormatVersions = ["rollout-jsonl-1"] as const;
 
   async parse(snapshotPath: string, context?: ParseContext): Promise<ParsedSourceSnapshot> {
+    // ~/.codex/sqlite (state/logs/memories/goals и сторонние *.db): parser
+    // поддерживает только rollout-jsonl-1. SQLite архивируется как raw и
+    // помечается unsupported — одна диагностика вместо jsonl_parse_error
+    // на каждую строку бинарного файла (live acceptance, этап 8).
+    if ((await isSqliteFile(snapshotPath)) === true) {
+      return {
+        sourceKind: "file_tree",
+        dialogues: (async function* () {})(),
+        diagnostics: [
+          {
+            code: "unsupported_file",
+            message:
+              `${snapshotPath}: sqlite database (codex state/logs/memories), ` +
+              `archived as raw only (parser: rollout-jsonl-1)`,
+            severity: "error",
+            sourceLocator: snapshotPath,
+          },
+        ],
+      };
+    }
     const { records, errors } = await readJsonlFile(snapshotPath);
     const diagnostics: ParsedDiagnostic[] = errors.map((error) => ({
       code: "jsonl_parse_error",

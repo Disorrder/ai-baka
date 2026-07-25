@@ -230,3 +230,23 @@ describe("cursor parser: corrupted", () => {
     expect(dialogue.messages.some((m) => m.role === "assistant")).toBe(true);
   });
 });
+
+describe("cursor parser: не-sqlite вход (workspace.json)", () => {
+  test("JSON-файл → unsupported_file, без SQLiteError", async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "baka-cursor-json-"));
+    try {
+      const jsonPath = join(dir, "workspace.json");
+      writeFileSync(jsonPath, '{"folder": "file:///Users/example/proj"}');
+      const snapshot = await cursorParser.parse(jsonPath);
+      const dialogues = await collectDialogues(snapshot);
+      expect(dialogues).toHaveLength(0);
+      expect(snapshot.diagnostics).toHaveLength(1);
+      expect(snapshot.diagnostics[0]!.code).toBe("unsupported_file");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -36,6 +36,8 @@ describe("backup naming", () => {
     expect(base).toBe("2026-07-24T120000Z__schema-4__surreal-3.2.3");
     expect(exportFileName(base, "zstd")).toBe(`${base}.surql.zst`);
     expect(exportFileName(base, "gzip")).toBe(`${base}.surql.gz`);
+    // строка /version с build metadata нормализуется до semver
+    expect(exportBaseName("2026-07-24T120000Z", 4, "surrealdb-3.2.3+20260721.40522d1")).toBe(base);
   });
 
   test("manifestPathForExport для zst и gz", () => {

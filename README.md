@@ -6,7 +6,13 @@
 с нуля: SurrealDB становится канонической моделью и индексом поверх неизменяемого
 raw-архива, а не местом, куда напрямую перекладываются прежние таблицы SQLite.
 
-**Статус:** этап 7 плана (embedding pipeline) завершён: embedding spaces
+**Статус:** этап 8 плана (live acceptance) завершён: backup tooling
+(§16.1/§16.2/§16.4) — logical backup через HTTP /export с manifest'ом,
+restore drill в отдельный namespace `baka_restore_test` без второго
+контейнера, `baka raw:verify` — и полный acceptance-прогон по всем 7
+harness'ам на боевой базе (sync ×2 идемпотентен, backup → restore:test →
+raw:verify пройдены; детали validate хранятся в приватном отчёте).
+Ранее — этап 7: embedding pipeline: embedding spaces
 с физическими vector-таблицами и HNSW (динамический DDL, §13.1–13.3),
 jobs worker с lease/retry/backoff и приватность-фильтрами (§13.5–13.7),
 OpenAI provider (batch, dimensions, retry на 429/5xx) + mock provider для
@@ -62,6 +68,17 @@ current pointers, quarantine через ingest_error, `baka sync` /
   current revision, unknown schema version;
 - `baka discover [--json]` — обнаруженные harness installations и source roots
   (переопределение путей — `BAKA_SOURCES__<SLUG>`, см. `.env.example`);
+- `baka backup [--json]` — logical backup (§16.1): HTTP /export боевой базы
+  в `backups/surreal/<timestamp>__schema-<v>__surreal-<ver>.surql.zst`
+  (gzip fallback, если нет zstd) + manifest JSON в `backups/manifests/`
+  (версии, bakaCommit, recordCounts, exportSha256);
+- `baka restore:test [export] [--json]` — restore drill (§16.4) без второго
+  контейнера: импорт в отдельный namespace `baka_restore_test`, сверка
+  record counts с manifest'ом, referential-инварианты, search-probes,
+  затем REMOVE NAMESPACE; боевой namespace не изменяется;
+- `baka raw:verify [--manifest] [--json]` — raw manifest по БД (все
+  source_revision: путь, SHA-256, size, harness) и сверка с файловой
+  системой (§16.2); orphan-файлы — предупреждение;
 - `baka archive:init`, `baka db up/down/status/migrate/preflight/logs`,
   `baka disk eject` — инфраструктура (см. `package.json` scripts).
 

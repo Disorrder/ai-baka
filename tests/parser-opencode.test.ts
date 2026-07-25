@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -256,5 +256,15 @@ describe("opencode parser: не-sqlite вход", () => {
     const dialogues = await collectDialogues(snapshot);
     expect(dialogues).toHaveLength(0);
     expect(snapshot.diagnostics.some((d) => d.code === "missing_table")).toBe(true);
+  });
+
+  test("JSON-файл (session_diff) → unsupported_file, без SQLiteError", async () => {
+    const jsonPath = join(TMP, "ses_test.json");
+    writeFileSync(jsonPath, '{"diff": []}');
+    const snapshot = await openCodeParser.parse(jsonPath);
+    const dialogues = await collectDialogues(snapshot);
+    expect(dialogues).toHaveLength(0);
+    expect(snapshot.diagnostics).toHaveLength(1);
+    expect(snapshot.diagnostics[0]!.code).toBe("unsupported_file");
   });
 });

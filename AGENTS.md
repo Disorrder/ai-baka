@@ -2,7 +2,7 @@
 
 ## Статус проекта
 
-Реализованы этапы 0–7 из [`docs/plan.md`](docs/plan.md) (раздел «Порядок
+Реализованы этапы 0–8 из [`docs/plan.md`](docs/plan.md) (раздел «Порядок
 реализации»): инфраструктура, schema migrations, source snapshot layer
 (discovery `baka discover`, complete/partial scan, immutable raw snapshots,
 SQLite через `VACUUM INTO`, deletion/rename/reconcile-логика), parser
@@ -28,6 +28,15 @@ vector search и hybrid RRF (`src/search/hybrid.ts`, CLI
 `baka embeddings plan|run|status|retry|cancel|space:create|space:activate|
 space:list|rebuild`. Решение о боевом space и полный backfill — этап 11
 (после relevance evaluation).
+Этап 8: backup tooling (`src/backup/`) и live acceptance — logical backup
+через HTTP /export (заголовки `surreal-ns`/`surreal-db`; legacy `NS`/`DB`
+в 3.x не работают) в `backups/surreal/` + manifest JSON (recordCounts,
+exportSha256) в `backups/manifests/`, zstd с fallback на gzip; restore
+drill `baka restore:test` — импорт в отдельный namespace
+`baka_restore_test` (import сам создаёт ns/db), сверка counts/инвариантов/
+search-probes, REMOVE NAMESPACE в finally, боевой ns не трогается;
+`baka raw:verify` — raw manifest по source_revision + сверка файлов
+(§16.1/§16.2/§16.4). Полный backup-модуль с rawManifestSha256 — этап 12.
 Авторитетный источник требований — `docs/plan.md`; при расхождении кода
 с планом сначала сверяйся с ним.
 
@@ -81,6 +90,37 @@ space:list|rebuild`. Решение о боевом space и полный backfi
   search_document (post-filter top-50 ANN, без over-fetch);
 - цена для `embeddings plan` — только из env
   OPENAI_EMBEDDING_PRICE_PER_1M_TOKENS, в коде не захардкожена.
+
+Ключевые решения этапа 8:
+
+- HTTP /export и /import SurrealDB 3.2.3 требуют заголовки `surreal-ns`/
+  `surreal-db` + basic auth; /import сам создаёт namespace и database,
+  явный DEFINE не нужен (синтаксиса `DEFINE DATABASE ... ON NAMESPACE`
+  нет); операции уровня сервера (REMOVE NAMESPACE) — через /sql без
+  ns-заголовков (`sqlRoot` в src/backup/http.ts);
+- restore drill не поднимает второй контейнер: импорт в
+  `baka_restore_test` той же базы, REMOVE NAMESPACE в finally (идемпотентно
+  — перед импортом тоже чистится, на случай прошлого упавшего drill'а);
+  проверки сравнивают restored с manifest'ом и с боевой базой
+  (инварианты, BM25 probes), а не с константами;
+- `baka backup` берёт preflight + lock (консистентный snapshot относительно
+  sync), `restore:test` и `raw:verify` — read-only по архиву, без lock'а;
+- orphan raw-файлы в raw:verify — предупреждение, не failure (их разбор —
+  validate/doctor).
+
+Найденные live acceptance баги (исправлены с тестами):
+
+- токен сессии SurrealDB живёт ~1 час: длинный sync падал с "Anonymous
+  access not allowed"; connectDb пере-signin'ивается каждые 30 минут
+  (src/db/client.ts);
+- codex/cursor/opencode parser'ы пытались разбирать sqlite/json файлы
+  не своего формата (state_5.sqlite как JSONL —
+  jsonl_parse_error; workspace.json/session_diff как SQLite —
+  parser_exception): ранняя классификация по magic header
+  (src/parsers/shared/sqlite.ts) → одна диагностика unsupported_file;
+- snapshotSqlite: bun:sqlite `{readonly: true}` (с неявным create) не
+  открывает закрытую WAL-базу без -shm ("unable to open database file",
+  Cursor state.vscdb неактивных workspace) — нужен `create: false`.
 
 ## Стек
 

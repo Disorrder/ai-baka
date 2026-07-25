@@ -63,6 +63,7 @@ import {
   parseTimestamp,
 } from "../shared/jsonl.ts";
 import { normalizeModelName } from "../shared/model-normalization.ts";
+import { isSqliteFile } from "../shared/sqlite.ts";
 
 export const CURSOR_PARSER_NAME = "cursor";
 export const CURSOR_PARSER_VERSION = 1;
@@ -100,6 +101,19 @@ export class CursorParser implements HarnessParser {
   async parse(snapshotPath: string, context?: ParseContext): Promise<ParsedSourceSnapshot> {
     const diagnostics: ParsedDiagnostic[] = [];
     const dialogues: ParsedDialogue[] = [];
+
+    // workspace.json и прочие не-sqlite файлы корня: raw архивируется,
+    // parser их не читает (unsupported, а не SQLiteError "file is not
+    // a database" на первом query — bun:sqlite открывает файл лениво).
+    if ((await isSqliteFile(snapshotPath)) === false) {
+      diagnostics.push({
+        code: "unsupported_file",
+        message: `${snapshotPath}: not a sqlite database (archived as raw only)`,
+        severity: "error",
+        sourceLocator: snapshotPath,
+      });
+      return { sourceKind: "sqlite", dialogues: empty(), diagnostics };
+    }
 
     let db: Database;
     try {

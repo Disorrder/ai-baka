@@ -248,6 +248,24 @@ describe("SQLite snapshot (§9.2, сценарий §19.2 №13)", () => {
     });
   });
 
+  test("закрытая WAL-база без -shm/-wal (readonly+create не открывает — Cursor state.vscdb)", async () => {
+    await withTempDir(async (dir) => {
+      const dbPath = path.join(dir, "state.vscdb");
+      const live = new Database(dbPath);
+      live.run("PRAGMA journal_mode = WAL");
+      live.run("CREATE TABLE t (x TEXT)");
+      live.run("INSERT INTO t VALUES ('1')");
+      live.close(); // чистое закрытие: -wal/-shm удаляются, база остаётся в WAL-режиме
+
+      const archive = path.join(dir, "archive");
+      const result = await snapshotSqlite(dbPath, optsFor(archive));
+      const snap = new Database(result.rawArchivePath, { readonly: true });
+      const rows = snap.query("SELECT x FROM t").all();
+      snap.close();
+      expect(rows).toEqual([{ x: "1" }]);
+    });
+  });
+
   test("snapshotSource выбирает vacuum_into по расширению .db", async () => {
     await withTempDir(async (dir) => {
       const dbPath = path.join(dir, "state.db");
