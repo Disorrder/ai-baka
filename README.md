@@ -114,6 +114,26 @@ current pointers, quarantine через ingest_error, `baka sync` /
 | Legacy-архив SQLite (read-only, не трогаем) | `/Volumes/Archive/Legacy Conversations/` |
 | SurrealDB | отдельный Docker-контейнер, `127.0.0.1:8901`, image `surrealdb/surrealdb:v3.2.3` (tag + digest) |
 
+## Известные ограничения (live acceptance, этап 8)
+
+- `~/.codex/sqlite` (`state_5.sqlite`, `logs_2.sqlite`, `goals_1.sqlite`,
+  `memories_1.sqlite`, `codex-dev.db`, `codex-history-snapshots-dev.db`) —
+  осознанный unsupported: файлы архивируются как raw, но parser читает
+  только rollout-jsonl. Это метаданные-индексы, а не контент диалогов:
+  `state_5.threads.rollout_path` ссылается на rollout JSONL в корнях
+  `~/.codex/sessions` и `~/.codex/archived_sessions`, `logs_2` — telemetry-логи, goals/memories —
+  вспомогательные таблицы app-server'а.
+- OpenCode `storage/session_diff/*.json` и Cursor `<hash>/workspace.json` —
+  unsupported (diff'ы и метаданные workspace, не диалоги); raw
+  архивируется, parser пропускает с диагностикой `unsupported_file`.
+- Claude Desktop IndexedDB blob, удалённый браузером из источника, —
+  presence `missing` до подтверждений удаления; архив сохраняет его копию.
+- Orphan raw-файлы (raw без source_revision) могут остаться после
+  пересоздания БД; `raw:verify` помечает их
+  предупреждением, не failure.
+- Restore drill большого export может быть долгим: тело /import отправляется потоком (`Bun.file`), а не буфером
+  в памяти.
+
 ## Документация
 
 - [`docs/plan.md`](docs/plan.md) — целевая редакция плана: архитектура,

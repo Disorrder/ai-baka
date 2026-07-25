@@ -120,7 +120,20 @@ search-probes, REMOVE NAMESPACE в finally, боевой ns не трогает�
   (src/parsers/shared/sqlite.ts) → одна диагностика unsupported_file;
 - snapshotSqlite: bun:sqlite `{readonly: true}` (с неявным create) не
   открывает закрытую WAL-базу без -shm ("unable to open database file",
-  Cursor state.vscdb неактивных workspace) — нужен `create: false`.
+  Cursor state.vscdb неактивных workspace) — нужен `create: false`;
+- CLI-hang после фатальной ошибки: открытый WS SurrealDB держал event
+  loop, зомби-процесс удерживал sync lock. `handle()` в cli.ts теперь
+  делает жёсткий `process.exit(1)` на путях ошибок, а connectDb закрывает
+  сокет, если signin/use упали после connect;
+- restore drill большого export: тело /import буфером
+  (`readFile`) обрывало upload, сервер применял усечённый поток —
+  передаём `Bun.file(path)` (поток с диска). Побочные находки 3.2.3:
+  SELECT по неопределённой таблице — ошибка "The table ... does not
+  exist", а не 0 строк; /import применяет поток по мере поступления
+  (ns/db могут быть частично созданы даже при оборванном upload);
+- повторный parse revision (после фикса parser'а) закрывает её прежние
+  unresolved ingest_errors (`resolveStaleIngestErrors`, resolution
+  `reparse:<status>`): иначе исправленные ошибки копились бы вечно.
 
 ## Стек
 
