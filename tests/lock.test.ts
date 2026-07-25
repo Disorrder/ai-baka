@@ -45,4 +45,30 @@ describe("sync lock", () => {
       await release();
     });
   });
+
+  test("сценарий §19.2 №29: гонка двух acquire → ровно один успешен", async () => {
+    await withTempDir(async (dir) => {
+      const results = await Promise.allSettled([
+        acquireLock(dir, "one"),
+        acquireLock(dir, "two"),
+      ]);
+      const fulfilled = results.filter((r) => r.status === "fulfilled");
+      const rejected = results.filter((r) => r.status === "rejected");
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(LockError);
+      // Lock-файл принадлежит победителю и снимается его release.
+      expect(await isLocked(dir)).toBe(true);
+      await (fulfilled[0] as PromiseFulfilledResult<() => Promise<void>>).value();
+      expect(await isLocked(dir)).toBe(false);
+    });
+  });
+
+  test("повторный acquire тем же процессом отклоняется (lock уже наш)", async () => {
+    await withTempDir(async (dir) => {
+      const release = await acquireLock(dir, "first");
+      await expect(acquireLock(dir, "second")).rejects.toThrow(LockError);
+      await release();
+    });
+  });
 });

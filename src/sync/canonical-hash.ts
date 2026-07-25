@@ -2,9 +2,12 @@
  * canonical_hash диалога (docs/plan.md §7.3 `dialogue_revision`).
  *
  * Hash стабильной проекции ParsedDialogue: содержимое сообщений/чанков,
- * модели, usage (без raw payload), временные метки. metadata диалога и
- * raw usage payloads в hash НЕ входят (они производны и не меняют
- * каноническое содержимое).
+ * модели, usage (включая raw payload), metadata сообщений/чанков,
+ * временные метки. Всё, что writer сохраняет в БД, покрыто hash'ем:
+ * иначе два snapshot'а, различающиеся только metadata/raw usage,
+ * получали бы одинаковый revision id — запись пропускалась, а в БД
+ * оставались устаревшие данные. metadata ДИАЛОГА в hash не входит —
+ * writer её не сохраняет.
  *
  * canonical_hash вместе с identity_key и parser name@version образует
  * детерминированный id dialogue_revision — одинаковое содержимое даёт
@@ -14,6 +17,23 @@
 
 import type { ParsedDialogue } from "../domain/canonical-types.ts";
 import { deterministicId, sha256hex } from "../db/transactions.ts";
+
+/**
+ * Детерминированная нормализация произвольных payload'ов для hash:
+ * ключи объектов сортируются рекурсивно (порядок ключей в metadata/raw
+ * не должен влиять на hash), Date → ISO, undefined → null.
+ */
+function stable(value: unknown): unknown {
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) return value.map(stable);
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, v]) => [key, stable(v)]);
+    return Object.fromEntries(entries);
+  }
+  return value ?? null;
+}
 
 export function canonicalDialogueHash(dialogue: ParsedDialogue): string {
   const projection = {
@@ -53,6 +73,7 @@ export function canonicalDialogueHash(dialogue: ParsedDialogue): string {
         totalTokensReported: e.totalTokensReported ?? null,
         isEstimated: e.isEstimated ?? null,
         source: e.source,
+        raw: e.raw === undefined ? null : stable(e.raw),
       })),
       chunks: m.chunks.map((c) => ({
         sequence: c.sequence,
@@ -63,7 +84,9 @@ export function canonicalDialogueHash(dialogue: ParsedDialogue): string {
         toolCallId: c.toolCallId ?? null,
         toolName: c.toolName ?? null,
         rawEventType: c.rawEventType ?? null,
+        metadata: stable(c.metadata),
       })),
+      metadata: stable(m.metadata),
     })),
   };
   return sha256hex(JSON.stringify(projection));

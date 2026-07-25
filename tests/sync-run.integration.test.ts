@@ -8,8 +8,8 @@
  * №12 (orphan raw находит validate).
  */
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { describe, expect } from "bun:test";
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { RecordId } from "surrealdb";
@@ -18,13 +18,17 @@ import { runSync, type SyncSummary } from "../src/sync/sync-run.ts";
 import { runValidation } from "../src/validate.ts";
 import { selectAll, selectOne } from "../src/db/repositories/helpers.ts";
 import {
+  setLocationRevisions,
+  updateSourceRevisionParse,
+} from "../src/db/repositories/provenance.ts";
+import {
   SURREAL_PASS,
   SURREAL_URL,
   SURREAL_USER,
   TEST_NAMESPACE,
   createTestDb,
+  dbTest,
   dropTestDb,
-  isDbAvailable,
   type TestDb,
 } from "./db-test-utils.ts";
 
@@ -32,10 +36,8 @@ const FIXTURES = path.resolve(import.meta.dir, "fixtures/kimi-code");
 const BASIC_ID = "session_11111111-aaaa-4bbb-8ccc-111111111111";
 const TOOLS_ID = "session_22222222-bbbb-4ccc-8ddd-222222222222";
 
-let dbReady = false;
-beforeAll(async () => {
-  dbReady = await isDbAvailable();
-});
+// Явный skip в отчёте, если SurrealDB недоступен (вместо молчаливого pass).
+const testDb = await dbTest();
 
 interface SyncEnv {
   t: TestDb;
@@ -105,8 +107,7 @@ const basicWire = (env: SyncEnv) =>
 const basicState = (env: SyncEnv) => path.join(env.srcRoot, "wd_test", BASIC_ID, "state.json");
 
 describe("structured sync (integration)", () => {
-  test("полный цикл: первый sync, идемпотентность (№1), truncate (№9), parse error (№10), deletion (№4–6), orphan raw (№12)", async () => {
-    if (!dbReady) return;
+  testDb("полный цикл: первый sync, идемпотентность (№1), truncate (№9), parse error (№10), deletion (№4–6), orphan raw (№12)", async () => {
     const env = await makeSyncEnv();
     try {
       // --- первый sync ---
@@ -269,8 +270,7 @@ describe("structured sync (integration)", () => {
     }
   });
 
-  test("dry-run не пишет ни в БД, ни в raw", async () => {
-    if (!dbReady) return;
+  testDb("dry-run не пишет ни в БД, ни в raw", async () => {
     const env = await makeSyncEnv();
     try {
       const summary = await runSync(env.cfg, { ...syncOptions(env), dryRun: true });
@@ -278,6 +278,114 @@ describe("structured sync (integration)", () => {
       expect(await tableCount(env.t, "sync_run")).toBe(0);
       expect(await tableCount(env.t, "source_revision")).toBe(0);
       expect(await tableCount(env.t, "dialogue")).toBe(0);
+      // read-only режим: identity/provenance-записи тоже не создаются
+      expect(await tableCount(env.t, "host")).toBe(0);
+      expect(await tableCount(env.t, "os_account")).toBe(0);
+      expect(await tableCount(env.t, "harness")).toBe(0);
+      expect(await tableCount(env.t, "harness_installation")).toBe(0);
+      expect(await tableCount(env.t, "source_root")).toBe(0);
+      expect(await tableCount(env.t, "source_location")).toBe(0);
+      expect(await tableCount(env.t, "source_scan")).toBe(0);
+    } finally {
+      await env.cleanup();
+    }
+  });
+
+  testDb("head_hash: тот же size/mtime, другое содержимое → новая revision (§10.3)", async () => {
+    const env = await makeSyncEnv();
+    try {
+      await runSync(env.cfg, syncOptions(env));
+      const revisionsBefore = await tableCount(env.t, "source_revision");
+      const wire = basicWire(env);
+      const before = await stat(wire);
+      // Меняем один ASCII-байт (длина сохраняется) и возвращаем mtime назад:
+      // size/mtime fingerprint совпадает, отличие ловит только head_hash.
+      const buf = await readFile(wire);
+      const idx = buf.indexOf(0x65); // 'e'
+      expect(idx).toBeGreaterThan(0);
+      buf[idx] = 0x45; // 'E'
+      await writeFile(wire, buf);
+      await utimes(wire, before.atime, before.mtime);
+
+      const second = await runSync(env.cfg, syncOptions(env));
+      expect(second.counters.filesChanged).toBeGreaterThan(0);
+      expect(await tableCount(env.t, "source_revision")).toBe(revisionsBefore + 1);
+    } finally {
+      await env.cleanup();
+    }
+  });
+
+  testDb("snapshot failure файла сессии → сессия не пересобирается (§9.3, §23.4)", async () => {
+    const env = await makeSyncEnv();
+    try {
+      const statePath = basicState(env);
+      await chmod(statePath, 0o000);
+      try {
+        const summary = await runSync(env.cfg, syncOptions(env));
+        expect(summary.counters.ingestErrors).toBeGreaterThan(0);
+        // Смешанный parse-view не собирался: basic-сессия НЕ распарсена
+        // (диалог только от tools-сессии), current_revision её wire-файла
+        // не двинулся — честный retry на следующем sync.
+        expect(await tableCount(env.t, "dialogue")).toBe(1);
+        const loc = await selectOne<{ current_revision?: RecordId }>(
+          env.t.db,
+          "SELECT current_revision FROM source_location WHERE relative_path = $rel",
+          { rel: `wd_test/${BASIC_ID}/agents/main/wire.jsonl` },
+        );
+        expect(loc).toBeDefined();
+        expect(loc!.current_revision ?? null).toBeNull();
+      } finally {
+        await chmod(statePath, 0o644);
+      }
+      // После восстановления доступа сессия собирается и парсится.
+      const retry = await runSync(env.cfg, syncOptions(env));
+      expect(retry.status).toBe("completed");
+      expect(await tableCount(env.t, "dialogue")).toBe(2);
+    } finally {
+      await env.cleanup();
+    }
+  });
+
+  testDb("last_successful_revision очищается при parse_error re-parse + validate (§23.3)", async () => {
+    const env = await makeSyncEnv();
+    try {
+      await runSync(env.cfg, syncOptions(env));
+      const rel = `wd_test/${BASIC_ID}/agents/main/wire.jsonl`;
+      const loc = await selectOne<{
+        id: RecordId;
+        current_revision: RecordId;
+        last_successful_revision: RecordId;
+      }>(
+        env.t.db,
+        "SELECT id, current_revision, last_successful_revision FROM source_location WHERE relative_path = $rel",
+        { rel },
+      );
+      expect(loc).toBeDefined();
+      expect(String(loc!.last_successful_revision)).toBe(String(loc!.current_revision));
+
+      // Re-parse той же revision завершился ошибкой (--full-rescan, фикс
+      // parser'а): parse_status → parse_error, location перепривязан без
+      // last_successful → указатель на failed revision очищается.
+      await updateSourceRevisionParse(env.t.db, loc!.current_revision, {
+        parseStatus: "parse_error",
+      });
+      await setLocationRevisions(env.t.db, loc!.id, { currentRevision: loc!.current_revision });
+      const cleared = await selectOne<{ last_successful_revision?: RecordId }>(
+        env.t.db,
+        "SELECT last_successful_revision FROM ONLY $id",
+        { id: loc!.id },
+      );
+      expect(cleared!.last_successful_revision ?? null).toBeNull();
+
+      // validate находит указатели на revision без успешного parse.
+      await env.t.db.query("UPDATE $id SET last_successful_revision = $rev", {
+        id: loc!.id,
+        rev: loc!.current_revision,
+      });
+      const report = await runValidation(env.cfg);
+      const bad = report.issues.filter((i) => i.check === "last_successful_not_parsed");
+      expect(bad).toHaveLength(1);
+      expect(bad[0]!.detail).toContain(rel);
     } finally {
       await env.cleanup();
     }

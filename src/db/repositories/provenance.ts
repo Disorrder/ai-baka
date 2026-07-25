@@ -258,7 +258,10 @@ export async function setLocationRenamedFrom(
   await db.query("UPDATE $id SET renamed_from = $from", { id, from: renamedFrom });
 }
 
-/** current_revision — последняя увиденная; last_successful — последняя распарсенная. */
+/**
+ * current_revision — последняя увиденная; last_successful — последняя
+ * УСПЕШНО распарсенная (parse_status = "parsed"; partial ≠ успех, §23.3).
+ */
 export async function setLocationRevisions(
   db: Surreal,
   id: RecordId,
@@ -271,11 +274,15 @@ export async function setLocationRevisions(
     );
     return;
   }
-  await db.query("UPDATE $id SET current_revision = $cur, last_seen_at = $now", {
-    id,
-    cur: input.currentRevision,
-    now: new Date(),
-  });
+  // Без успешного parse указатель не двигаем; более того, если он ссылается
+  // на ЭТУ ЖЕ revision (re-parse перевёл её в parse_error/partial —
+  // --full-rescan, mtime-only изменение), очищаем: last_successful не может
+  // указывать на revision без успешного parse (§23.3).
+  await db.query(
+    `UPDATE $id SET current_revision = $cur, last_seen_at = $now,
+       last_successful_revision = IF last_successful_revision = $cur THEN NONE ELSE last_successful_revision END`,
+    { id, cur: input.currentRevision, now: new Date() },
+  );
 }
 
 export interface SourceRevisionInput {

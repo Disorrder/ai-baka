@@ -240,6 +240,13 @@ function normalizeWorkspacePath(p: string): string {
  * логического проекта; без него проект определяется через
  * workspace_location (host, normalized_path). По голому name проекты
  * НЕ мержатся (разные проекты могут совпадать по имени).
+ *
+ * Конфликт ключей (path указывает на один workspace, repository_identity —
+ * на другой) разрешается детерминированно: побеждает repository_identity
+ * (главный ключ проекта), location перелинковывается на него.
+ *
+ * Создание workspace + workspace_location — ОДНА транзакция (один query
+ * BEGIN…COMMIT): orphan workspace при сбое между двумя query невозможен.
  */
 export async function ensureWorkspace(
   db: Surreal,
@@ -255,53 +262,94 @@ export async function ensureWorkspace(
       "SELECT id FROM workspace WHERE repository_identity = $repo LIMIT 1",
       { repo: input.repositoryIdentity },
     );
-    if (existing) {
-      await db.query("UPDATE $id SET last_seen_at = $now", { id: existing.id, now });
-      workspaceId = existing.id;
-    }
+    if (existing) workspaceId = existing.id;
   }
 
   const normalizedPath = input.path ? normalizeWorkspacePath(input.path) : undefined;
-  if (normalizedPath) {
-    const location = await selectOne<{ id: RecordId; workspace: RecordId }>(
-      db,
-      "SELECT id, workspace FROM workspace_location WHERE host = $host AND normalized_path = $path LIMIT 1",
-      { host: input.host, path: normalizedPath },
-    );
-    if (location) {
-      await db.query("UPDATE $id SET last_seen_at = $now", { id: location.id, now });
-      return location.workspace;
+  const location = normalizedPath
+    ? await selectOne<{ id: RecordId; workspace: RecordId }>(
+        db,
+        "SELECT id, workspace FROM workspace_location WHERE host = $host AND normalized_path = $path LIMIT 1",
+        { host: input.host, path: normalizedPath },
+      )
+    : undefined;
+
+  if (location) {
+    // repository_identity побеждает path: при конфликте location
+    // перелинковывается на workspace, найденный по repository_identity.
+    const target = workspaceId ?? location.workspace;
+    await db.query("UPDATE $id SET workspace = $ws, last_seen_at = $now", {
+      id: location.id,
+      ws: target,
+      now,
+    });
+    if (workspaceId) {
+      await db.query("UPDATE $id SET last_seen_at = $now", { id: workspaceId, now });
     }
+    return target;
   }
 
-  if (!workspaceId) {
-    const fallbackName =
-      input.name ??
-      (normalizedPath ? (normalizedPath.split("/").pop() || normalizedPath) : undefined) ??
-      input.repositoryIdentity ??
-      "unknown";
-    const created = await selectOne<{ id: RecordId }>(
-      db,
-      `CREATE ONLY workspace SET name = $name, repository_identity = $repo,
-         first_seen_at = $now, last_seen_at = $now`,
-      { name: fallbackName, repo: input.repositoryIdentity ?? undefined, now },
-    );
-    workspaceId = created!.id;
+  if (workspaceId) {
+    await db.query("UPDATE $id SET last_seen_at = $now", { id: workspaceId, now });
+    if (normalizedPath && input.path) {
+      await db.query(
+        `CREATE ONLY workspace_location SET workspace = $workspace, host = $host, path = $path,
+           normalized_path = $normalized, git_remote = $remote, first_seen_at = $now, last_seen_at = $now`,
+        {
+          workspace: workspaceId,
+          host: input.host,
+          path: input.path,
+          normalized: normalizedPath,
+          remote: input.repositoryIdentity ?? undefined,
+          now,
+        },
+      );
+    }
+    return workspaceId;
   }
 
+  const fallbackName =
+    input.name ??
+    (normalizedPath ? (normalizedPath.split("/").pop() || normalizedPath) : undefined) ??
+    input.repositoryIdentity ??
+    "unknown";
+
+  // Ни workspace, ни location: создаём обе записи одной транзакцией.
   if (normalizedPath && input.path) {
-    await db.query(
-      `CREATE ONLY workspace_location SET workspace = $workspace, host = $host, path = $path,
-         normalized_path = $normalized, git_remote = $remote, first_seen_at = $now, last_seen_at = $now`,
+    const result = await db.query<unknown[]>(
+      `BEGIN;
+       LET $ws = (CREATE ONLY workspace SET name = $name, repository_identity = $repo,
+         first_seen_at = $now, last_seen_at = $now).id;
+       CREATE ONLY workspace_location SET workspace = $ws, host = $host, path = $path,
+         normalized_path = $normalized, git_remote = $repo,
+         first_seen_at = $now, last_seen_at = $now;
+       COMMIT;
+       RETURN $ws;`,
       {
-        workspace: workspaceId,
+        name: fallbackName,
+        repo: input.repositoryIdentity ?? undefined,
         host: input.host,
         path: input.path,
         normalized: normalizedPath,
-        remote: input.repositoryIdentity ?? undefined,
         now,
       },
     );
+    const returned = result.at(-1) as RecordId | undefined;
+    if (!returned) {
+      // Защита от молчаливого обрыва транзакции (как в corpus.ts).
+      throw new Error(
+        `workspace transaction оборвалась: RETURN не выполнен (получено ${result.length} результатов)`,
+      );
+    }
+    return returned;
   }
-  return workspaceId;
+
+  // Только repository_identity, без path — одиночный CREATE.
+  const created = await selectOne<{ id: RecordId }>(
+    db,
+    `CREATE ONLY workspace SET name = $name, repository_identity = $repo,
+       first_seen_at = $now, last_seen_at = $now`,
+    { name: fallbackName, repo: input.repositoryIdentity ?? undefined, now },
+  );
+  return created!.id;
 }

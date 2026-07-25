@@ -5,7 +5,7 @@
  * external id на разных installation не мержится (№16), embedding jobs.
  */
 
-import { beforeAll, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { RecordId } from "surrealdb";
 import type { ParsedDialogue } from "../src/domain/canonical-types.ts";
 import {
@@ -31,12 +31,10 @@ import {
 import { dialogueIdentityKey } from "../src/domain/identity.ts";
 import { kimiCodeExtractors } from "../src/search/extractors/kimi-code.ts";
 import { selectAll, selectOne } from "../src/db/repositories/helpers.ts";
-import { createTestDb, dropTestDb, isDbAvailable, type TestDb } from "./db-test-utils.ts";
+import { createTestDb, dbTest, dropTestDb, type TestDb } from "./db-test-utils.ts";
 
-let dbReady = false;
-beforeAll(async () => {
-  dbReady = await isDbAvailable();
-});
+// Явный skip в отчёте, если SurrealDB недоступен (вместо молчаливого pass).
+const testDb = await dbTest();
 
 function makeDialogue(externalId: string, assistantText = "Ответ ассистента."): ParsedDialogue {
   return {
@@ -188,8 +186,7 @@ async function tableCount(t: TestDb, table: string): Promise<number> {
 }
 
 describe("dialogue transaction (integration)", () => {
-  test("сценарий 15: два host с username example → два os_account", async () => {
-    if (!dbReady) return;
+  testDb("сценарий 15: два host с username example → два os_account", async () => {
     const t = await createTestDb();
     try {
       const ctx1 = await makeCtx(t, "host-uuid-1");
@@ -201,8 +198,7 @@ describe("dialogue transaction (integration)", () => {
     }
   });
 
-  test("сценарий 16: один external id на разных installation не мержится", async () => {
-    if (!dbReady) return;
+  testDb("сценарий 16: один external id на разных installation не мержится", async () => {
     const t = await createTestDb();
     try {
       const ctx1 = await makeCtx(t, "host-uuid-1");
@@ -219,8 +215,7 @@ describe("dialogue transaction (integration)", () => {
     }
   });
 
-  test("полная запись: dialogue/revision/messages/chunks/search docs, идемпотентность (№1)", async () => {
-    if (!dbReady) return;
+  testDb("полная запись: dialogue/revision/messages/chunks/search docs, идемпотентность (№1)", async () => {
     const t = await createTestDb();
     try {
       const ctx = await makeCtx(t, "host-uuid-1");
@@ -299,8 +294,7 @@ describe("dialogue transaction (integration)", () => {
     }
   });
 
-  test("rollback: ошибка в середине транзакции не оставляет частичных записей", async () => {
-    if (!dbReady) return;
+  testDb("rollback: ошибка в середине транзакции не оставляет частичных записей", async () => {
     const t = await createTestDb();
     try {
       const ctx = await makeCtx(t, "host-uuid-1");
@@ -320,8 +314,7 @@ describe("dialogue transaction (integration)", () => {
     }
   });
 
-  test("сценарий 9: укоротившийся диалог — новая revision без stale tail, projection переключена", async () => {
-    if (!dbReady) return;
+  testDb("сценарий 9: укоротившийся диалог — новая revision без stale tail, projection переключена", async () => {
     const t = await createTestDb();
     try {
       const ctx = await makeCtx(t, "host-uuid-1");
@@ -386,8 +379,7 @@ describe("dialogue transaction (integration)", () => {
     }
   });
 
-  test("embedding jobs создаются только при active embedding_space", async () => {
-    if (!dbReady) return;
+  testDb("embedding jobs создаются только при active embedding_space", async () => {
     const t = await createTestDb();
     try {
       const ctx = await makeCtx(t, "host-uuid-1");
@@ -422,5 +414,109 @@ describe("dialogue transaction (integration)", () => {
     const empty = makeDialogue("y");
     empty.messages = empty.messages.filter((m) => m.role !== "assistant");
     expect(primaryModelKey(empty)).toBeUndefined();
+  });
+
+  testDb("primary_model очищается (NONE) при revision без модели", async () => {
+    const t = await createTestDb();
+    try {
+      const ctx = await makeCtx(t, "host-uuid-1");
+      const key = dialogueIdentityKey(ctx.installation.toString(), "session_nomodel", "fb");
+      const primaryModelOf = async () =>
+        (
+          await selectOne<{ primary_model?: RecordId }>(
+            t.db,
+            "SELECT primary_model FROM dialogue WHERE identity_key = $k",
+            { k: key },
+          )
+        )?.primary_model;
+
+      const withModel = makeDialogue("session_nomodel");
+      await writeDialogueRevision(t.db, txInput(ctx, withModel, key));
+      expect(await primaryModelOf()).toBeDefined();
+
+      // Та же сессия, но assistant message без модели → новая revision;
+      // primary_model обязан очиститься, а не сохранить прежнюю модель.
+      const noModel = makeDialogue("session_nomodel", "Другой ответ");
+      delete noModel.messages[1]!.model;
+      const second = await writeDialogueRevision(t.db, txInput(ctx, noModel, key));
+      expect(second.created).toBe(true);
+      expect((await primaryModelOf()) ?? null).toBeNull();
+
+      // Switch-путь: возврат к revision с моделью и обратно.
+      const backToModel = await writeDialogueRevision(t.db, txInput(ctx, withModel, key));
+      expect(backToModel.switched).toBe(true);
+      expect(await primaryModelOf()).toBeDefined();
+      const backToNoModel = await writeDialogueRevision(t.db, txInput(ctx, noModel, key));
+      expect(backToNoModel.switched).toBe(true);
+      expect((await primaryModelOf()) ?? null).toBeNull();
+    } finally {
+      await dropTestDb(t);
+    }
+  });
+
+  testDb("ensureWorkspace: workspace+location одной транзакцией, повтор идемпотентен", async () => {
+    const t = await createTestDb();
+    try {
+      const ctx = await makeCtx(t, "host-uuid-1");
+      const ws1 = await ensureWorkspace(t.db, {
+        host: ctx.host,
+        path: "/tmp/proj-a",
+        name: "proj-a",
+        repositoryIdentity: "git@x:proj-a",
+      });
+      expect(ws1).toBeDefined();
+      // Обе записи созданы вместе (orphan workspace невозможен).
+      expect(await tableCount(t, "workspace")).toBe(1);
+      expect(await tableCount(t, "workspace_location")).toBe(1);
+      const ws2 = await ensureWorkspace(t.db, {
+        host: ctx.host,
+        path: "/tmp/proj-a",
+        repositoryIdentity: "git@x:proj-a",
+      });
+      expect(String(ws2)).toBe(String(ws1));
+      expect(await tableCount(t, "workspace")).toBe(1);
+      expect(await tableCount(t, "workspace_location")).toBe(1);
+    } finally {
+      await dropTestDb(t);
+    }
+  });
+
+  testDb("ensureWorkspace: конфликт ключей — repository_identity побеждает path", async () => {
+    const t = await createTestDb();
+    try {
+      const ctx = await makeCtx(t, "host-uuid-1");
+      const byRepo = await ensureWorkspace(t.db, {
+        host: ctx.host,
+        repositoryIdentity: "git@x:proj",
+        name: "proj",
+      });
+      const byPath = await ensureWorkspace(t.db, { host: ctx.host, path: "/tmp/proj", name: "proj" });
+      // Два независимых workspace: один по repo, другой по path.
+      expect(String(byRepo)).not.toBe(String(byPath));
+      // Оба ключа в одном вызове: побеждает repository_identity (главный
+      // ключ проекта), location перелинковывается на него.
+      const resolved = await ensureWorkspace(t.db, {
+        host: ctx.host,
+        path: "/tmp/proj",
+        repositoryIdentity: "git@x:proj",
+      });
+      expect(String(resolved)).toBe(String(byRepo));
+      const locRow = await selectOne<{ workspace: RecordId }>(
+        t.db,
+        "SELECT workspace FROM workspace_location",
+      );
+      expect(String(locRow!.workspace)).toBe(String(byRepo));
+      // Детерминированно: повтор даёт тот же результат, новых записей нет.
+      const again = await ensureWorkspace(t.db, {
+        host: ctx.host,
+        path: "/tmp/proj",
+        repositoryIdentity: "git@x:proj",
+      });
+      expect(String(again)).toBe(String(byRepo));
+      expect(await tableCount(t, "workspace")).toBe(2);
+      expect(await tableCount(t, "workspace_location")).toBe(1);
+    } finally {
+      await dropTestDb(t);
+    }
   });
 });

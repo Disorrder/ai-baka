@@ -108,6 +108,23 @@ describe("location reconciler (§10.3)", () => {
     expect(fingerprintMatches(prev[0]!, file("a.jsonl", { sha256: "same" }))).toBe(true);
   });
 
+  test("head_hash: равные size/mtime, но другое содержимое → changed (§10.3)", () => {
+    const prev = [loc("a.jsonl", { headHash: "h1" })];
+    const changed = reconcileLocations(
+      prev,
+      { status: "complete", files: [file("a.jsonl", { headHash: "h2" })] },
+      { deletionConfirmations: N },
+    );
+    expect(changed.actions).toEqual([{ kind: "changed", relativePath: "a.jsonl" }]);
+    const same = reconcileLocations(
+      prev,
+      { status: "complete", files: [file("a.jsonl", { headHash: "h1" })] },
+      { deletionConfirmations: N },
+    );
+    expect(same.actions).toEqual([{ kind: "unchanged", relativePath: "a.jsonl" }]);
+    expect(fingerprintMatches(prev[0]!, file("a.jsonl", { headHash: "h2" }))).toBe(false);
+  });
+
   test("новый файл → new; состояние дополняется", () => {
     const result = reconcileLocations(
       [],
@@ -165,6 +182,16 @@ describe("rename detection (§10.7, сценарий §19.2 №7)", () => {
       [],
     );
     expect(matches).toEqual([]);
+  });
+
+  test("несколько missing с тем же sha → неоднозначный источник, rename не подтверждён", () => {
+    const missing = [
+      loc("old1.jsonl", { currentSha256: SHA, presence: { status: "missing", missingCompleteScans: 1 } }),
+      loc("old2.jsonl", { currentSha256: SHA, presence: { status: "missing", missingCompleteScans: 1 } }),
+    ];
+    // Один новый файл, но ДВА возможных источника — выбор был бы произвольным:
+    // новый файл становится независимым location (§10.7).
+    expect(detectRenames(missing, [file("new.jsonl", { sha256: SHA })], [])).toEqual([]);
   });
 
   test("активный location с тем же содержимым → rename не подтверждён", () => {

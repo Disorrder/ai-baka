@@ -391,15 +391,26 @@ export async function writeDialogueRevision(
       `UPDATE ONLY $dlgId SET ` +
         tx.assignments([
           ["current_revision", revisionRid],
-          ["primary_model", primaryModel],
           ["updated_at", parsed.updatedAt],
           ["last_seen_at", new Date()],
         ]) +
-        ";",
+        // assignments() отбрасывает undefined, а primary_model обязан
+        // очищаться: revision без модели → NONE, иначе сохраняется модель
+        // прежней current revision.
+        `, primary_model = ${primaryModel ? tx.param(primaryModel) : "NONE"};`,
     );
     tx.add("COMMIT;");
     tx.add(`RETURN { dialogue: $dlgId, revision: $revId };`);
-    await db.query(tx.statements.join("\n"), tx.vars);
+    const result = await db.query<unknown[]>(tx.statements.join("\n"), tx.vars);
+    const returned = result.at(-1) as { dialogue?: RecordId; revision?: RecordId } | undefined;
+    if (!returned || !returned.dialogue || !returned.revision) {
+      // Та же защита от молчаливого обрыва транзакции, что в пути создания
+      // ниже: SDK 2.0.8 может вернуть усечённый массив результатов без
+      // исключения — switched:true здесь означал бы ложный «успех» sync.
+      throw new Error(
+        `dialogue switch transaction оборвалась: RETURN не выполнен (получено ${result.length} результатов из ${tx.statements.length} statements)`,
+      );
+    }
     return {
       dialogueId,
       revisionId: revisionRid,
@@ -483,11 +494,12 @@ export async function writeDialogueRevision(
     `UPDATE ONLY $dlgId SET ` +
       tx.assignments([
         ["current_revision", revisionRid],
-        ["primary_model", primaryModel],
         ["updated_at", parsed.updatedAt],
         ["last_seen_at", new Date()],
       ]) +
-      ";",
+      // primary_model — явно (см. switch-путь выше): NONE при revision
+      // без модели, undefined в assignments() поле бы не очистил.
+      `, primary_model = ${primaryModel ? tx.param(primaryModel) : "NONE"};`,
   );
   tx.add("COMMIT;");
   tx.add("RETURN { dialogue: $dlgId, revision: $revId };");

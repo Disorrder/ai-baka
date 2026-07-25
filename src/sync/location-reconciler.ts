@@ -74,9 +74,18 @@ export function detectRenames(
 ): RenameMatch[] {
   const matches: RenameMatch[] = [];
   const claimed = new Set<string>();
+  // Неоднозначность ИСТОЧНИКА: несколько отсутствующих locations с тем же
+  // SHA — любой выбор «источника rename» был бы произвольным, поэтому
+  // новый файл становится независимым location (§10.7).
+  const missingBySha = new Map<string, number>();
+  for (const loc of missing) {
+    if (!loc.currentSha256) continue;
+    missingBySha.set(loc.currentSha256, (missingBySha.get(loc.currentSha256) ?? 0) + 1);
+  }
   for (const loc of missing) {
     if (!loc.currentSha256) continue;
     const sha = loc.currentSha256;
+    if ((missingBySha.get(sha) ?? 0) > 1) continue;
     const hasActiveTwin = activeLocations.some((a) => a.currentSha256 === sha);
     if (hasActiveTwin) continue;
     const candidates = newFiles.filter(

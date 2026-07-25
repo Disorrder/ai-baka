@@ -4,6 +4,7 @@
  * database на прогон, REMOVE DATABASE в teardown, скип без живой БД.
  */
 
+import { test } from "bun:test";
 import { Surreal } from "surrealdb";
 import { applyMigrations } from "../src/db/migrations.ts";
 
@@ -32,6 +33,19 @@ export async function isDbAvailable(): Promise<boolean> {
   }
   if (!dbAvailable) console.warn("SKIP: SurrealDB недоступен (docker не поднят)");
   return dbAvailable;
+}
+
+/**
+ * `test` при живой БД, иначе `test.skip` — ЯВНЫЙ skip в отчёте вместо
+ * молчаливого pass (раньше тесты делали `return` и выглядели зелёными,
+ * ничего не проверив). Использование в integration-файле (проверка
+ * доступности выполняется один раз на файл, до регистрации тестов):
+ *
+ *   const testDb = await dbTest();
+ *   testDb("сценарий", async () => { ... });
+ */
+export async function dbTest(): Promise<typeof test> {
+  return (await isDbAvailable()) ? test : test.skip;
 }
 
 export interface TestDb {

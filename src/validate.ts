@@ -170,6 +170,20 @@ export async function runValidation(cfg: AppConfig): Promise<ValidationReport> {
         detail: `${String(row.id)} (dialogue ${String(row.dialogue)})`,
       });
     }
+
+    // last_successful_revision — только revision со статусом успешного parse
+    // (§23.3): partial ≠ успех, parse_error — тем более.
+    for (const row of await selectAll<{ relative_path: string; status: string }>(
+      db,
+      `SELECT relative_path, last_successful_revision.parse_status AS status FROM source_location
+       WHERE last_successful_revision IS NOT NONE
+         AND last_successful_revision.parse_status != "parsed"`,
+    )) {
+      issues.push({
+        check: "last_successful_not_parsed",
+        detail: `${row.relative_path} (parse_status: ${row.status})`,
+      });
+    }
   } finally {
     await db.close();
   }
