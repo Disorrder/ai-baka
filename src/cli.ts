@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
 import { Command } from "commander";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 import type { Surreal } from "surrealdb";
 import { loadConfig, type AppConfig } from "./config.ts";
 import { initArchive } from "./infra/sentinel.ts";
@@ -28,6 +30,9 @@ import {
   VectorSearchUnavailable,
 } from "./search/hybrid.ts";
 import { rebuildSearchProjection } from "./search/rebuild.ts";
+import { backupTimestamp, runLogicalBackup } from "./backup/backup.ts";
+import { runRestoreTest } from "./backup/restore-test.ts";
+import { runRawVerify } from "./backup/raw-verify.ts";
 import { OpenAIEmbeddingProvider } from "./embeddings/openai-provider.ts";
 import type { EmbeddingProvider } from "./embeddings/provider.ts";
 import {
@@ -47,6 +52,12 @@ import {
   type ProviderFactory,
 } from "./embeddings/jobs.ts";
 import { localIdentity } from "./sync/host-identity.ts";
+import { ensureLegacySnapshot } from "./migration/legacy-snapshot.ts";
+import {
+  buildPreflightReport,
+  formatPreflightSummary,
+  probeLiveCorpus,
+} from "./migration/preflight.ts";
 import { ensureHost } from "./db/repositories/identity.ts";
 import { TARGET_TOKENS } from "./search/segmenter.ts";
 
@@ -501,6 +512,90 @@ program
     }),
   );
 
+program
+  .command("backup")
+  .description("Logical backup: HTTP /export → backups/surreal + manifest (docs/plan.md §16.1)")
+  .option("--json", "вывести результат в JSON")
+  .action(
+    handle(async (options: { json?: boolean }) => {
+      const cfg = loadConfig();
+      await assertPreflight(cfg);
+      const release = await acquireLock(cfg.archiveRoot, "backup");
+      try {
+        const result = await runLogicalBackup(cfg);
+        if (options.json) {
+          console.log(JSON.stringify(result, null, 2));
+          return;
+        }
+        console.log(`export: ${result.exportPath}`);
+        console.log(`manifest: ${result.manifestPath}`);
+        console.log(
+          `schema ${result.manifest.schemaVersion}, surreal ${result.manifest.surrealdbVersion}, ` +
+            `${result.manifest.exportBytes} bytes (${result.manifest.compression}), ` +
+            `sha256 ${result.manifest.exportSha256.slice(0, 12)}…`,
+        );
+        const totals = Object.entries(result.manifest.recordCounts)
+          .filter(([, n]) => n > 0)
+          .map(([t, n]) => `${t} ${n}`)
+          .join(", ");
+        console.log(`recordCounts: ${totals}`);
+      } finally {
+        await release();
+      }
+    }),
+  );
+
+program
+  .command("restore:test [export]")
+  .description(
+    "Restore drill в отдельный namespace baka_restore_test (docs/plan.md §16.4); боевой ns не изменяется",
+  )
+  .option("--json", "вывести результат в JSON")
+  .action(
+    handle(async (exportPath: string | undefined, options: { json?: boolean }) => {
+      const cfg = loadConfig();
+      const report = await runRestoreTest(cfg, { exportPath });
+      if (options.json) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(`restore:test: ${report.exportFile} → ns ${report.namespace}`);
+        for (const check of report.checks) {
+          console.log(`  ${check.ok ? "ok" : "FAIL"} [${check.name}] ${check.detail}`);
+        }
+        console.log(report.ok ? "restore:test: ok" : "restore:test: FAIL");
+      }
+      if (!report.ok) process.exitCode = 1;
+    }),
+  );
+
+program
+  .command("raw:verify")
+  .description("Raw manifest по БД и сверка файлов: существование, size, SHA-256 (docs/plan.md §16.2)")
+  .option("--manifest", "сохранить manifest в backups/manifests/raw-manifest-<timestamp>.json")
+  .option("--json", "вывести результат в JSON")
+  .action(
+    handle(async (options: { manifest?: boolean; json?: boolean }) => {
+      const cfg = loadConfig();
+      const report = await runRawVerify(cfg, { writeManifest: options.manifest ?? false });
+      if (options.json) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(`raw:verify: проверено ${report.checked} файлов`);
+        for (const item of report.missing) console.log(`  MISSING ${item}`);
+        for (const item of report.sizeMismatch) console.log(`  SIZE ${item}`);
+        for (const item of report.hashMismatch) console.log(`  HASH ${item}`);
+        if (report.orphans.length > 0) {
+          console.log(`  внимание: ${report.orphans.length} orphan-файлов (raw без source_revision):`);
+          for (const item of report.orphans.slice(0, 20)) console.log(`    ${item}`);
+          if (report.orphans.length > 20) console.log(`    … и ещё ${report.orphans.length - 20}`);
+        }
+        if (report.manifestPath) console.log(`manifest: ${report.manifestPath}`);
+        console.log(report.ok ? "raw:verify: ok" : "raw:verify: FAIL");
+      }
+      if (!report.ok) process.exitCode = 1;
+    }),
+  );
+
 /** Provider для vector/hybrid search по ACTIVE space; деградация §14. */
 async function vectorProvider(db: Surreal, cfg: AppConfig): Promise<EmbeddingProvider> {
   const space = await getActiveSpace(db);
@@ -777,6 +872,69 @@ embeddings
         await db.close();
       }
     }),
+  );
+
+const DEFAULT_LEGACY_DB =
+  process.env.BAKA_LEGACY_DB?.trim() ||
+  "/Volumes/Archive/Legacy Conversations/index.sqlite";
+
+const migration = program
+  .command("migration")
+  .description("Миграция legacy SQLite-архива (docs/plan.md §15)");
+
+migration
+  .command("plan")
+  .description(
+    "Preflight migration report по snapshot-копии legacy index.sqlite (§15.2/§15.3); ничего не изменяет",
+  )
+  .option("--legacy-db <path>", "путь к legacy index.sqlite (источник snapshot'а)", DEFAULT_LEGACY_DB)
+  .option("--report <path>", "куда писать JSON-отчёт (default: <archive>/backups/manifests/)")
+  .option("--skip-live", "не сверять дубликаты с живым корпусом SurrealDB")
+  .option("--json", "вывести отчёт в JSON")
+  .action(
+    handle(
+      async (options: {
+        legacyDb: string;
+        report?: string;
+        skipLive?: boolean;
+        json?: boolean;
+      }) => {
+        const cfg = loadConfig();
+        console.log(`snapshot legacy SQLite: ${options.legacyDb}`);
+        const snapshot = await ensureLegacySnapshot(options.legacyDb, cfg.archiveRoot);
+        console.log(
+          `snapshot: ${snapshot.snapshotPath} (${snapshot.sizeBytes} bytes, sha256 ${snapshot.sha256.slice(0, 12)}…${snapshot.reused ? ", переиспользован" : ""})`,
+        );
+        const identity = await localIdentity();
+        const live = options.skipLive ? undefined : await probeLiveCorpus(cfg);
+        if (live && !live.available) {
+          console.log(`внимание: live corpus probe: ${live.note}`);
+        }
+        const report = await buildPreflightReport({
+          snapshotPath: snapshot.snapshotPath,
+          snapshotSha256: snapshot.sha256,
+          identity,
+          live,
+        });
+        const reportPath =
+          options.report ??
+          path.join(
+            cfg.archiveRoot,
+            "backups",
+            "manifests",
+            `migration-preflight-${backupTimestamp()}.json`,
+          );
+        await mkdir(path.dirname(reportPath), { recursive: true });
+        await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+        if (options.json) {
+          console.log(JSON.stringify(report, null, 2));
+        } else {
+          console.log(formatPreflightSummary(report));
+        }
+        console.log(`отчёт: ${reportPath}`);
+        if (!report.reconciliation.ok) process.exitCode = 1;
+      },
+    ),
   );
 
 await program.parseAsync(process.argv);

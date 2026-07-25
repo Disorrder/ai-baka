@@ -1,0 +1,239 @@
+/**
+ * Этап 9 (docs/plan.md §15.2/§15.3): snapshot legacy SQLite и preflight report.
+ * Синтетическая legacy-подобная SQLite создаётся в tmpdir через bun:sqlite —
+ * реальный архив не трогается.
+ */
+
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { ensureLegacySnapshot } from "../src/migration/legacy-snapshot.ts";
+import {
+  buildPreflightReport,
+  type LiveCorpusProbe,
+  type PreflightReport,
+} from "../src/migration/preflight.ts";
+import { hashFile } from "../src/sources/snapshot/hashing.ts";
+import type { LocalIdentity } from "../src/sync/host-identity.ts";
+
+const IDENTITY: LocalIdentity = {
+  hostUuid: "test-host-uuid",
+  hostname: "test-host",
+  platform: "darwin",
+  arch: "arm64",
+  osUsername: "example",
+  homePath: "/Users/example",
+};
+
+let dir: string;
+let archiveRoot: string;
+let legacyDbPath: string;
+let rawBackupFile: string;
+
+/** Минимальная схема = фактические колонки legacy index.sqlite (план §15.5). */
+function createLegacyDb(dbPath: string): Database {
+  const db = new Database(dbPath, { create: true });
+  db.run(`CREATE TABLE agent_systems (id integer primary key, slug text not null unique)`);
+  db.run(`CREATE TABLE projects (id integer primary key, agent_id integer not null, external_id text not null)`);
+  db.run(`CREATE TABLE threads (
+    id integer primary key, agent_id integer not null, external_id text not null)`);
+  db.run(`CREATE TABLE source_files (
+    id integer primary key, original_path text not null, status text not null,
+    sha256 text not null, deleted_at text)`);
+  db.run(`CREATE TABLE raw_backups (
+    id integer primary key, source_file_id integer not null,
+    archive_path text not null, status text not null)`);
+  db.run(`CREATE TABLE thread_records (
+    id integer primary key, thread_id integer not null,
+    source_file_id integer, sequence integer not null, payload text not null)`);
+  db.run(`CREATE TABLE messages (
+    id integer primary key, thread_id integer not null, sequence integer not null)`);
+  db.run(`CREATE TABLE message_chunks (
+    id integer primary key, message_id integer not null, sequence integer not null)`);
+  return db;
+}
+
+beforeAll(async () => {
+  dir = await mkdtemp(path.join(tmpdir(), "baka-migration-test-"));
+  archiveRoot = path.join(dir, "archive");
+  legacyDbPath = path.join(dir, "index.sqlite");
+  rawBackupFile = path.join(dir, "raw-backup-1.jsonl");
+  await writeFile(rawBackupFile, '{"type":"user"}\n');
+
+  const db = createLegacyDb(legacyDbPath);
+  db.run(`INSERT INTO agent_systems (id, slug) VALUES (1, 'claude-code')`);
+  // sf1: текущий host, raw backup на диске есть
+  db.run(
+    `INSERT INTO source_files VALUES (1, '/Users/example/.claude/a.jsonl', 'active', 'sha-a', NULL)`,
+  );
+  // sf2: чужой home, raw backup есть, но файл отсутствует на диске
+  db.run(
+    `INSERT INTO source_files VALUES (2, '/Users/other/.claude/b.jsonl', 'active', 'sha-b', NULL)`,
+  );
+  // sf3: deleted_in_source, дубликат sha с sf2, raw backup отсутствует
+  db.run(
+    `INSERT INTO source_files VALUES (3, '/Volumes/ext/c.jsonl', 'deleted_in_source', 'sha-b', '2026-01-01')`,
+  );
+  // sf4: текущий host, без raw backup
+  db.run(
+    `INSERT INTO source_files VALUES (4, '/Users/example/.claude/d.jsonl', 'active', 'sha-d', NULL)`,
+  );
+  db.run(
+    `INSERT INTO raw_backups VALUES (1, 1, '${rawBackupFile}', 'active')`,
+  );
+  db.run(
+    `INSERT INTO raw_backups VALUES (2, 2, '/nonexistent/raw/b.jsonl', 'active')`,
+  );
+  // t1: все записи из sf1 → reconstructable from raw (+ дубль против live)
+  db.run(`INSERT INTO threads VALUES (1, 1, 'd1')`);
+  db.run(`INSERT INTO thread_records VALUES (1, 1, 1, 0, '{"a":1}')`);
+  db.run(`INSERT INTO thread_records VALUES (2, 1, 1, 1, '{"b":2}')`);
+  // t2: raw backup есть, но файл потерян; payload валиден → from payload
+  db.run(`INSERT INTO threads VALUES (2, 1, 'd2')`);
+  db.run(`INSERT INTO thread_records VALUES (3, 2, 2, 0, '{"c":3}')`);
+  // t3: payload невалиден, есть messages → only normalized
+  db.run(`INSERT INTO threads VALUES (3, 1, 'd3')`);
+  db.run(`INSERT INTO thread_records VALUES (4, 3, NULL, 0, '{broken')`);
+  db.run(`INSERT INTO messages VALUES (1, 3, 0)`);
+  db.run(`INSERT INTO messages VALUES (2, 3, 1)`);
+  db.run(`INSERT INTO message_chunks VALUES (1, 1, 0)`);
+  // t4: пустой payload, messages нет → quarantined
+  db.run(`INSERT INTO threads VALUES (4, 1, 'd4')`);
+  db.run(`INSERT INTO thread_records VALUES (5, 4, 4, 0, '')`);
+  // t5: вообще без записей → quarantined
+  db.run(`INSERT INTO threads VALUES (5, 1, 'd5')`);
+  db.close();
+});
+
+afterAll(async () => {
+  await rm(dir, { recursive: true, force: true });
+});
+
+describe("legacy snapshot (§15.3)", () => {
+  test("создаёт snapshot, оригинал не изменяется, повторный вызов переиспользует", async () => {
+    const before = await hashFile(legacyDbPath);
+    const first = await ensureLegacySnapshot(legacyDbPath, archiveRoot);
+    expect(first.reused).toBe(false);
+    expect(first.snapshotPath).toBe(
+      path.join(archiveRoot, "migration-input", `index__${first.sha256}.sqlite`),
+    );
+    const after = await hashFile(legacyDbPath);
+    expect(after).toEqual(before);
+
+    // snapshot — валидная SQLite с теми же данными
+    const snap = new Database(first.snapshotPath, { readonly: true });
+    expect(snap.query<{ c: number }, []>(`SELECT COUNT(*) AS c FROM threads`).get()?.c).toBe(5);
+    snap.close();
+
+    const second = await ensureLegacySnapshot(legacyDbPath, archiveRoot);
+    expect(second.reused).toBe(true);
+    expect(second.snapshotPath).toBe(first.snapshotPath);
+    expect(second.sha256).toBe(first.sha256);
+  });
+});
+
+describe("migration preflight report (§15.2)", () => {
+  let report: PreflightReport;
+
+  beforeAll(async () => {
+    const snapshot = await ensureLegacySnapshot(legacyDbPath, archiveRoot);
+    const live: LiveCorpusProbe = {
+      available: true,
+      revisionSha256: new Set(["sha-a"]),
+      dialogueKeys: new Set(["claude-code:d1"]),
+    };
+    report = await buildPreflightReport({
+      snapshotPath: snapshot.snapshotPath,
+      snapshotSha256: snapshot.sha256,
+      identity: IDENTITY,
+      live,
+    });
+  });
+
+  test("counts и соответствие схемы плану §15.5", () => {
+    expect(report.counts).toEqual({
+      sourceFiles: 4,
+      rawBackups: 2,
+      dialogues: 5,
+      messages: 2,
+      chunks: 1,
+      threadRecords: 5,
+    });
+    for (const present of Object.values(report.schema.expected)) {
+      expect(present).toBe(true);
+    }
+  });
+
+  test("payload coverage: present/missing/valid/invalid", () => {
+    expect(report.payload.present).toBe(4);
+    expect(report.payload.missing).toBe(1);
+    expect(report.payload.validJson).toBe(3);
+    expect(report.payload.invalidJson).toBe(1);
+    expect(report.payload.threadsFullyCovered).toBe(2); // t1, t2
+    expect(report.payload.threadsUncovered).toBe(2); // t3 (невалиден), t4 (пустой)
+    expect(report.payload.coversAllDialogues).toBe(false);
+  });
+
+  test("классификация по приоритету §15.4 и reconciliation", () => {
+    expect(report.reconstructable.fromRaw).toBe(1); // t1
+    expect(report.reconstructable.fromPayload).toBe(1); // t2
+    expect(report.reconstructable.onlyNormalized).toBe(1); // t3
+    expect(report.reconstructable.quarantined).toBe(2); // t4, t5
+    expect(report.reconciliation).toEqual({
+      legacyTotal: 5,
+      reconstructable: 3,
+      quarantined: 2,
+      ok: true,
+    });
+  });
+
+  test("deleted_in_source и missing raw backup", () => {
+    expect(report.deletedInSource).toBe(1); // sf3
+    expect(report.missingRawBackup.withoutBackupRow).toBe(2); // sf3, sf4
+    expect(report.missingRawBackup.fileMissingOnDisk).toBe(1); // rb2
+  });
+
+  test("каждая проблема с конкретным record ID", () => {
+    const key = (p: { table: string; recordId: string }) => `${p.table}:${p.recordId}`;
+    const keys = new Set(report.problems.map(key));
+    expect(keys.has("threads:4")).toBe(true); // quarantine
+    expect(keys.has("threads:5")).toBe(true);
+    expect(keys.has("raw_backups:2")).toBe(true); // файл отсутствует на диске
+    expect(keys.has("source_files:3")).toBe(true); // нет raw_backups
+    expect(keys.has("source_files:4")).toBe(true);
+    for (const p of report.problems) expect(p.reason.length).toBeGreaterThan(0);
+  });
+
+  test("duplicates внутри legacy и против live corpus", () => {
+    expect(report.duplicates.withinLegacy.duplicateSha256Groups).toBe(1);
+    expect(report.duplicates.withinLegacy.affectedSourceFiles).toBe(2);
+    expect(report.duplicates.withinLegacy.examples[0]?.sha256).toBe("sha-b");
+    expect(report.duplicates.vsLiveCorpus.revisionsMatched).toBe(1); // sf1 sha-a
+    expect(report.duplicates.vsLiveCorpus.dialoguesMatched).toBe(1); // t1
+  });
+
+  test("host mapping preview (§15.6)", () => {
+    expect(report.hostMapping.currentHost).toBe(2); // sf1, sf4
+    const legacy = Object.keys(report.hostMapping.legacyHosts);
+    expect(legacy.length).toBe(1);
+    expect(legacy[0]).toMatch(/^legacy-[0-9a-f]{12}$/); // /Users/other
+    expect(report.hostMapping.legacyHosts[legacy[0]!]).toBe(1);
+    expect(report.hostMapping.uncertain).toEqual({ "/Volumes/ext": 1 }); // sf3
+  });
+
+  test("без live probe секция vsLiveCorpus помечается unavailable", async () => {
+    const snapshot = await ensureLegacySnapshot(legacyDbPath, archiveRoot);
+    const noLive = await buildPreflightReport({
+      snapshotPath: snapshot.snapshotPath,
+      identity: IDENTITY,
+      checkRawFiles: false,
+    });
+    expect(noLive.duplicates.vsLiveCorpus.available).toBe(false);
+    expect(noLive.missingRawBackup.fileMissingOnDisk).toBe(0);
+    // без проверки файлов t2 классифицируется как from_raw (backup row есть)
+    expect(noLive.reconstructable.fromRaw).toBe(2);
+    expect(noLive.reconciliation.ok).toBe(true);
+  });
+});
