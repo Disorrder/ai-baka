@@ -52,11 +52,15 @@ import {
   type ProviderFactory,
 } from "./embeddings/jobs.ts";
 import { localIdentity } from "./sync/host-identity.ts";
-import { ensureLegacySnapshot } from "./migration/legacy-snapshot.ts";
+import { ensureLegacySnapshot, migrationInputDir } from "./migration/legacy-snapshot.ts";
 import {
+  analysisCheckpointPath,
+  analyzeLegacySnapshot,
   buildPreflightReport,
   formatPreflightSummary,
+  loadAnalysisCheckpoint,
   probeLiveCorpus,
+  saveAnalysisCheckpoint,
 } from "./migration/preflight.ts";
 import { ensureHost } from "./db/repositories/identity.ts";
 import { TARGET_TOKENS } from "./search/segmenter.ts";
@@ -906,6 +910,23 @@ migration
           `snapshot: ${snapshot.snapshotPath} (${snapshot.sizeBytes} bytes, sha256 ${snapshot.sha256.slice(0, 12)}…${snapshot.reused ? ", переиспользован" : ""})`,
         );
         const identity = await localIdentity();
+        // Тяжёлый анализ snapshot'а кэшируется checkpoint'ом (ключ — sha256
+        // snapshot'а); live probe дешёвый и всегда выполняется заново.
+        const checkpointPath = analysisCheckpointPath(
+          migrationInputDir(cfg.archiveRoot),
+          snapshot.sha256,
+        );
+        let analysis = await loadAnalysisCheckpoint(checkpointPath, snapshot.sha256, true);
+        if (analysis) {
+          console.log(`анализ: checkpoint переиспользован (${checkpointPath})`);
+        } else {
+          console.log("анализ snapshot'а (первый прогон по этому snapshot'у — может занять десятки минут)…");
+          analysis = await analyzeLegacySnapshot(snapshot.snapshotPath, identity, {
+            snapshotSha256: snapshot.sha256,
+          });
+          await saveAnalysisCheckpoint(checkpointPath, analysis);
+          console.log(`анализ: checkpoint сохранён (${checkpointPath})`);
+        }
         const live = options.skipLive ? undefined : await probeLiveCorpus(cfg);
         if (live && !live.available) {
           console.log(`внимание: live corpus probe: ${live.note}`);
@@ -915,6 +936,7 @@ migration
           snapshotSha256: snapshot.sha256,
           identity,
           live,
+          analysis,
         });
         const reportPath =
           options.report ??

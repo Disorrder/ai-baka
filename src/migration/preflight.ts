@@ -13,10 +13,17 @@
  *   quarantined   — ничего из перечисленного (§15.9: с record ID и причиной).
  *
  * Reconciliation (критерий этапа 9): legacy total = reconstructable + quarantined.
+ *
+ * Анализ большого snapshot'а (json_valid по всем payload) может быть долгим,
+ * поэтому результат кэшируется в checkpoint-файл,
+ * ключованный SHA-256 snapshot'а (saveAnalysisCheckpoint). Повторный запуск
+ * с тем же snapshot'ом читает checkpoint и повторяет только дешёвый live
+ * probe против SurrealDB — он зависит от текущего состояния корпуса и
+ * никогда не кэшируется.
  */
 
 import { Database } from "bun:sqlite";
-import { stat } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import type { Surreal } from "surrealdb";
@@ -50,6 +57,31 @@ export interface LiveCorpusProbe {
   revisionSha256: Set<string>;
   /** "<harness-slug>:<external_id>" всех dialogue живого корпуса. */
   dialogueKeys: Set<string>;
+}
+
+/**
+ * Результат анализа snapshot'а — всё, что детерминированно выводится из
+ * legacy-копии (кэшируется в checkpoint). Сверка с live корпусом сюда не
+ * входит: она зависит от текущего состояния SurrealDB.
+ */
+export interface LegacyAnalysis {
+  formatVersion: 1;
+  snapshotSha256?: string;
+  checkRawFiles: boolean;
+  schema: PreflightReport["schema"];
+  counts: PreflightReport["counts"];
+  payload: PreflightReport["payload"];
+  reconstructable: PreflightReport["reconstructable"];
+  deletedInSource: number;
+  missingRawBackup: PreflightReport["missingRawBackup"];
+  withinLegacy: PreflightReport["duplicates"]["withinLegacy"];
+  hostMapping: PreflightReport["hostMapping"];
+  reconciliation: PreflightReport["reconciliation"];
+  problems: PreflightProblem[];
+  /** Вход для сверки с live (в итоговый отчёт не попадает): id → sha256. */
+  sourceFileSha256: Record<string, string>;
+  /** Вход для сверки с live: "<slug>:<external_id>" каждого диалога. */
+  threadKeys: string[];
 }
 
 export interface PreflightReport {
@@ -140,6 +172,11 @@ export interface PreflightOptions {
   live?: LiveCorpusProbe;
   /** Проверять существование raw backup файлов на диске (default true). */
   checkRawFiles?: boolean;
+  /**
+   * Готовый анализ (из checkpoint) — скан snapshot'а пропускается.
+   * Должен соответствовать snapshotSha256 и checkRawFiles.
+   */
+  analysis?: LegacyAnalysis;
 }
 
 /** Read-only probe живого корпуса: sha256 ревизий и (harness, external_id) диалогов. */
@@ -201,10 +238,19 @@ function count(db: Database, table: string): number {
   return row?.c ?? 0;
 }
 
-export async function buildPreflightReport(opts: PreflightOptions): Promise<PreflightReport> {
-  const checkRawFiles = opts.checkRawFiles ?? true;
+/**
+ * Полный анализ snapshot'а (единственная тяжёлая часть preflight):
+ * сканы legacy SQLite + stat raw backup файлов. Результат детерминирован
+ * относительно содержимого snapshot'а — кэшируется checkpoint'ом.
+ */
+export async function analyzeLegacySnapshot(
+  snapshotPath: string,
+  identity: LocalIdentity,
+  options: { snapshotSha256?: string; checkRawFiles?: boolean } = {},
+): Promise<LegacyAnalysis> {
+  const checkRawFiles = options.checkRawFiles ?? true;
   const problems: PreflightProblem[] = [];
-  const db = new Database(opts.snapshotPath, { readonly: true });
+  const db = new Database(snapshotPath, { readonly: true });
   try {
     db.run("pragma query_only = on");
 
@@ -424,39 +470,20 @@ export async function buildPreflightReport(opts: PreflightOptions): Promise<Pref
           .get()?.c ?? 0;
     }
 
-    // --- Дубликаты против живого корпуса (read-only probe) ---
-    const live = opts.live;
-    let revisionsMatched = 0;
-    let dialoguesMatched = 0;
-    const liveExamples: string[] = [];
-    if (live?.available) {
-      for (const row of db
-        .query<{ id: number; sha256: string }, []>(`SELECT id, sha256 FROM source_files`)
-        .all()) {
-        if (live.revisionSha256.has(row.sha256)) {
-          revisionsMatched += 1;
-          if (liveExamples.length < 20) {
-            liveExamples.push(`source_files:${row.id} sha256=${row.sha256.slice(0, 12)}…`);
-          }
-        }
-      }
-      for (const thread of threads) {
-        if (live.dialogueKeys.has(`${thread.slug}:${thread.external_id}`)) {
-          dialoguesMatched += 1;
-        }
-      }
-    }
-
     // --- Host mapping preview (§15.6) ---
     let currentHost = 0;
     const legacyHosts = new Map<string, number>();
     const uncertain = new Map<string, number>();
-    const homePrefix = opts.identity.homePath.endsWith(path.sep)
-      ? opts.identity.homePath
-      : opts.identity.homePath + path.sep;
+    const homePrefix = identity.homePath.endsWith(path.sep)
+      ? identity.homePath
+      : identity.homePath + path.sep;
+    const sourceFileSha256: Record<string, string> = {};
     for (const row of db
-      .query<{ original_path: string }, []>(`SELECT original_path FROM source_files`)
+      .query<{ id: number; original_path: string; sha256: string }, []>(
+        `SELECT id, original_path, sha256 FROM source_files`,
+      )
       .all()) {
+      sourceFileSha256[String(row.id)] = row.sha256;
       const p = row.original_path;
       if (p.startsWith(homePrefix)) {
         currentHost += 1;
@@ -473,10 +500,10 @@ export async function buildPreflightReport(opts: PreflightOptions): Promise<Pref
     }
 
     const reconstructableTotal = fromRaw + fromPayload + onlyNormalized;
-    const report: PreflightReport = {
-      createdAt: new Date().toISOString(),
-      snapshotPath: opts.snapshotPath,
-      snapshotSha256: opts.snapshotSha256,
+    return {
+      formatVersion: 1,
+      snapshotSha256: options.snapshotSha256,
+      checkRawFiles,
       schema: { tables, expected, extra },
       counts: {
         sourceFiles: count(db, "source_files"),
@@ -510,23 +537,14 @@ export async function buildPreflightReport(opts: PreflightOptions): Promise<Pref
           ? [...fileExists.values()].filter((ok) => !ok).length
           : 0,
       },
-      duplicates: {
-        withinLegacy: {
-          duplicateSha256Groups: dupGroups.length,
-          affectedSourceFiles: dupFileIds.length,
-          affectedThreads,
-          examples: dupGroups.slice(0, 20).map((g) => ({
-            sha256: g.sha256,
-            sourceFileIds: g.ids.split(",").map(Number),
-          })),
-        },
-        vsLiveCorpus: {
-          available: live?.available ?? false,
-          note: live?.note ?? "probe не запрашивался",
-          revisionsMatched,
-          dialoguesMatched,
-          examples: liveExamples,
-        },
+      withinLegacy: {
+        duplicateSha256Groups: dupGroups.length,
+        affectedSourceFiles: dupFileIds.length,
+        affectedThreads,
+        examples: dupGroups.slice(0, 20).map((g) => ({
+          sha256: g.sha256,
+          sourceFileIds: g.ids.split(",").map(Number),
+        })),
       },
       hostMapping: {
         currentHost,
@@ -541,10 +559,109 @@ export async function buildPreflightReport(opts: PreflightOptions): Promise<Pref
         ok: threads.length === reconstructableTotal + quarantined,
       },
       problems,
+      sourceFileSha256,
+      threadKeys: threads.map((t) => `${t.slug}:${t.external_id}`),
     };
-    return report;
   } finally {
     db.close();
+  }
+}
+
+/** Сборка итогового отчёта: анализ snapshot'а + свежий live probe. */
+export async function buildPreflightReport(opts: PreflightOptions): Promise<PreflightReport> {
+  const analysis =
+    opts.analysis ??
+    (await analyzeLegacySnapshot(opts.snapshotPath, opts.identity, {
+      snapshotSha256: opts.snapshotSha256,
+      checkRawFiles: opts.checkRawFiles,
+    }));
+
+  // --- Дубликаты против живого корпуса (read-only probe, не кэшируется) ---
+  const live = opts.live;
+  let revisionsMatched = 0;
+  let dialoguesMatched = 0;
+  const liveExamples: string[] = [];
+  if (live?.available) {
+    for (const [id, sha256] of Object.entries(analysis.sourceFileSha256)) {
+      if (live.revisionSha256.has(sha256)) {
+        revisionsMatched += 1;
+        if (liveExamples.length < 20) {
+          liveExamples.push(`source_files:${id} sha256=${sha256.slice(0, 12)}…`);
+        }
+      }
+    }
+    for (const key of analysis.threadKeys) {
+      if (live.dialogueKeys.has(key)) dialoguesMatched += 1;
+    }
+  }
+
+  return {
+    createdAt: new Date().toISOString(),
+    snapshotPath: opts.snapshotPath,
+    snapshotSha256: opts.snapshotSha256 ?? analysis.snapshotSha256,
+    schema: analysis.schema,
+    counts: analysis.counts,
+    payload: analysis.payload,
+    reconstructable: analysis.reconstructable,
+    deletedInSource: analysis.deletedInSource,
+    missingRawBackup: analysis.missingRawBackup,
+    duplicates: {
+      withinLegacy: analysis.withinLegacy,
+      vsLiveCorpus: {
+        available: live?.available ?? false,
+        note: live?.note ?? "probe не запрашивался",
+        revisionsMatched,
+        dialoguesMatched,
+        examples: liveExamples,
+      },
+    },
+    hostMapping: analysis.hostMapping,
+    reconciliation: analysis.reconciliation,
+    problems: analysis.problems,
+  };
+}
+
+// --- Checkpoint анализа: повторный запуск не повторяет сканы snapshot'а ---
+
+/** Путь checkpoint-файла для snapshot'а с данным SHA-256. */
+export function analysisCheckpointPath(dir: string, snapshotSha256: string): string {
+  return path.join(dir, `preflight-analysis__${snapshotSha256}.json`);
+}
+
+/** Сохраняет анализ в checkpoint (атомарно: tmp + rename). */
+export async function saveAnalysisCheckpoint(
+  filePath: string,
+  analysis: LegacyAnalysis,
+): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.tmp-${crypto.randomUUID()}`;
+  await writeFile(tmp, `${JSON.stringify(analysis)}\n`);
+  await rename(tmp, filePath);
+}
+
+/**
+ * Читает checkpoint, если он соответствует snapshot'у (sha256 + checkRawFiles
+ * + formatVersion). Несоответствие/повреждение → null (пересчёт с нуля).
+ */
+export async function loadAnalysisCheckpoint(
+  filePath: string,
+  snapshotSha256: string,
+  checkRawFiles: boolean,
+): Promise<LegacyAnalysis | null> {
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as LegacyAnalysis;
+    if (parsed.formatVersion !== 1) return null;
+    if (parsed.snapshotSha256 !== snapshotSha256) return null;
+    if (parsed.checkRawFiles !== checkRawFiles) return null;
+    return parsed;
+  } catch {
+    return null;
   }
 }
 

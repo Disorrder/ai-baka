@@ -11,7 +11,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { ensureLegacySnapshot } from "../src/migration/legacy-snapshot.ts";
 import {
+  analysisCheckpointPath,
+  analyzeLegacySnapshot,
   buildPreflightReport,
+  loadAnalysisCheckpoint,
+  saveAnalysisCheckpoint,
   type LiveCorpusProbe,
   type PreflightReport,
 } from "../src/migration/preflight.ts";
@@ -132,6 +136,27 @@ describe("legacy snapshot (§15.3)", () => {
     expect(second.snapshotPath).toBe(first.snapshotPath);
     expect(second.sha256).toBe(first.sha256);
   });
+
+  test("изменение источника (size/mtime) → новый snapshot, sidecar не срабатывает", async () => {
+    const otherDb = path.join(dir, "other.sqlite");
+    const db = new Database(otherDb, { create: true });
+    db.run("CREATE TABLE t (id integer)");
+    db.run("INSERT INTO t VALUES (1)");
+    db.close();
+
+    const first = await ensureLegacySnapshot(otherDb, archiveRoot);
+    expect(first.reused).toBe(false);
+    const second = await ensureLegacySnapshot(otherDb, archiveRoot);
+    expect(second.reused).toBe(true); // sidecar: vacuum не повторялся
+
+    // mtime не меняется в ту же миллисекунду гарантированно — меняем и размер
+    const db2 = new Database(otherDb);
+    db2.run("INSERT INTO t VALUES (2)");
+    db2.close();
+    const third = await ensureLegacySnapshot(otherDb, archiveRoot);
+    expect(third.reused).toBe(false);
+    expect(third.sha256).not.toBe(first.sha256);
+  });
 });
 
 describe("migration preflight report (§15.2)", () => {
@@ -235,5 +260,61 @@ describe("migration preflight report (§15.2)", () => {
     // без проверки файлов t2 классифицируется как from_raw (backup row есть)
     expect(noLive.reconstructable.fromRaw).toBe(2);
     expect(noLive.reconciliation.ok).toBe(true);
+  });
+});
+
+describe("analysis checkpoint (повторные запуски без пересканирования)", () => {
+  test("round-trip: save → load, отчёт из checkpoint совпадает с прямым", async () => {
+    const snapshot = await ensureLegacySnapshot(legacyDbPath, archiveRoot);
+    const analysis = await analyzeLegacySnapshot(snapshot.snapshotPath, IDENTITY, {
+      snapshotSha256: snapshot.sha256,
+    });
+    const checkpoint = analysisCheckpointPath(dir, snapshot.sha256);
+    await saveAnalysisCheckpoint(checkpoint, analysis);
+
+    const loaded = await loadAnalysisCheckpoint(checkpoint, snapshot.sha256, true);
+    expect(loaded).toEqual(analysis);
+
+    // отчёт из checkpoint'а: БД не открывается — подменяем snapshot мусором
+    const garbage = path.join(dir, "garbage.sqlite");
+    await writeFile(garbage, "not a sqlite file");
+    const live: LiveCorpusProbe = {
+      available: true,
+      revisionSha256: new Set(["sha-a"]),
+      dialogueKeys: new Set(["claude-code:d1"]),
+    };
+    const fromCache = await buildPreflightReport({
+      snapshotPath: garbage,
+      snapshotSha256: snapshot.sha256,
+      identity: IDENTITY,
+      live,
+      analysis: loaded!,
+    });
+    const direct = await buildPreflightReport({
+      snapshotPath: snapshot.snapshotPath,
+      snapshotSha256: snapshot.sha256,
+      identity: IDENTITY,
+      live,
+    });
+    const { createdAt: _a, snapshotPath: _b, ...cachedRest } = fromCache;
+    const { createdAt: _c, snapshotPath: _d, ...directRest } = direct;
+    expect(cachedRest).toEqual(directRest);
+  });
+
+  test("checkpoint отклоняется при несовпадении sha/checkRawFiles или повреждении", async () => {
+    const snapshot = await ensureLegacySnapshot(legacyDbPath, archiveRoot);
+    const analysis = await analyzeLegacySnapshot(snapshot.snapshotPath, IDENTITY, {
+      snapshotSha256: snapshot.sha256,
+    });
+    const checkpoint = analysisCheckpointPath(dir, snapshot.sha256);
+    await saveAnalysisCheckpoint(checkpoint, analysis);
+
+    expect(await loadAnalysisCheckpoint(checkpoint, "0".repeat(64), true)).toBeNull();
+    expect(await loadAnalysisCheckpoint(checkpoint, snapshot.sha256, false)).toBeNull();
+    await writeFile(checkpoint, "{broken json");
+    expect(await loadAnalysisCheckpoint(checkpoint, snapshot.sha256, true)).toBeNull();
+    expect(
+      await loadAnalysisCheckpoint(path.join(dir, "missing.json"), snapshot.sha256, true),
+    ).toBeNull();
   });
 });
