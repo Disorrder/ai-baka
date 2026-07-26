@@ -2082,7 +2082,6 @@ baka doctor
 
 ```text
 --harness
---source-root
 --full-rescan
 --deletion-confirmations
 --no-enqueue-embeddings

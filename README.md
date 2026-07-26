@@ -31,7 +31,7 @@ current pointers, quarantine через ingest_error, `baka sync` /
 
 ## CLI
 
-- `baka sync [--harness <slug>] [--source-root <path>] [--full-rescan]
+- `baka sync [--harness <slug>] [--full-rescan]
   [--deletion-confirmations <n>] [--no-enqueue-embeddings] [--dry-run] [--json]` —
   structured sync: discovery → scan → immutable raw snapshot → parse →
   транзакции диалогов → search_documents → embedding jobs (только при

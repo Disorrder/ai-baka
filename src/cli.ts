@@ -265,7 +265,6 @@ program
   .command("sync")
   .description("Structured sync: discovery → snapshot → parse → SurrealDB (docs/plan.md §10)")
   .option("--harness <slug>", `только один harness (${Object.keys(HARNESSES).join(", ")})`)
-  .option("--source-root <path>", "только один source root (точный путь)")
   .option("--full-rescan", "игнорировать fingerprint'ы и переснять все файлы")
   .option("--deletion-confirmations <n>", "complete-scan'ов до deleted_in_source", Number)
   .option("--no-enqueue-embeddings", "не создавать embedding jobs")
@@ -275,7 +274,6 @@ program
     handle(
       async (options: {
         harness?: string;
-        sourceRoot?: string;
         fullRescan?: boolean;
         deletionConfirmations?: number;
         enqueueEmbeddings?: boolean;
@@ -288,7 +286,6 @@ program
         const cfg = loadConfig();
         const summary = await runSync(cfg, {
           harness: options.harness as HarnessSlug | undefined,
-          sourceRoot: options.sourceRoot,
           fullRescan: options.fullRescan,
           deletionConfirmations:
             options.deletionConfirmations && options.deletionConfirmations > 0

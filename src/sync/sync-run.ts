@@ -72,8 +72,6 @@ import type { PresenceStatus } from "./deletion-detector.ts";
 
 export interface SyncOptions {
   harness?: HarnessSlug;
-  /** Точный путь root'а — ограничить sync одним root'ом. */
-  sourceRoot?: string;
   fullRescan?: boolean;
   deletionConfirmations?: number;
   /** По умолчанию true; --no-enqueue-embeddings выключает. */
@@ -202,7 +200,6 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
     const discovery = await discoverSourceRoots({ overrides: cfg.sourceOverrides });
     let roots = discovery.roots;
     if (options.harness) roots = roots.filter((r) => r.harness === options.harness);
-    if (options.sourceRoot) roots = roots.filter((r) => r.path === options.sourceRoot);
 
     if (!dryRun) {
       syncRunId = await createSyncRun(db, {
@@ -212,7 +209,6 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
         schemaVersion,
         configurationFingerprint: JSON.stringify({
           harness: options.harness ?? null,
-          sourceRoot: options.sourceRoot ?? null,
           fullRescan: options.fullRescan ?? false,
           deletionConfirmations,
           enqueueEmbeddings,
