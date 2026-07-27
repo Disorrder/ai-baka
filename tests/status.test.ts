@@ -775,12 +775,28 @@ describe("status CLI formatter", () => {
         lost: 0,
         ok: true,
       },
+      migrationQuarantine: {
+        state: "accepted_with_operator_exclusions",
+        unresolved: 0,
+        documentedOperatorExclusions: 3,
+        documentedOperatorExclusionLineages: 3,
+        retryResolved: 1,
+        supersededOperatorExclusions: 0,
+        invalidResolutions: 0,
+        byCode: {
+          active_original_without_exact_dialogue: 1,
+          deleted_original_unrecoverable_no_messages: 0,
+          canonical_child_of_excluded_active_thread: 1,
+          source_less_record_of_excluded_active_thread: 1,
+        },
+      },
     };
     const formatted = formatStatus(report);
     expect(formatted).toContain("last complete sync: 2026-07-25T00:01:00.000Z");
     expect(formatted).toContain("last backup: 2026-07-25T01:00:00.000Z");
     expect(formatted).toContain("last successful restore test: 2026-07-25T02:00:00.000Z");
     expect(formatted).toContain("migration reconciliation: ok");
+    expect(formatted).toContain("documented operator exclusions 3");
     expect(formatted).not.toContain("этап 12");
     expect(formatted).toContain("cutover not asserted");
     expect(formatted).toContain("embedding_jobs: pending 2, retryable_error 1");

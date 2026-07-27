@@ -2134,12 +2134,13 @@ describe("CLI command surface", () => {
     expect(command(finalAcceptance, "accept").description()).toContain("Stage11Completion");
   });
 
-  test("migration exposes plan/run/retry/status with explicit write gates", () => {
+  test("migration exposes run and signed operator-exclusion lifecycle with explicit write gates", () => {
     const migration = command(program, "migration");
     expect(migration.commands.map((item) => item.name())).toEqual([
       "plan",
       "run",
       "retry",
+      "exclusions",
       "status",
     ]);
     for (const name of ["run", "retry"]) {
@@ -2168,6 +2169,27 @@ describe("CLI command surface", () => {
     expect(flags(command(migration, "plan"))).toContain("--json");
     expect(flags(command(migration, "plan"))).not.toContain("--approval");
     expect(flags(command(migration, "status"))).toContain("--json");
+
+    const exclusions = command(migration, "exclusions");
+    expect(exclusions.commands.map((item) => item.name())).toEqual(["plan", "apply", "status"]);
+    expect(flags(command(exclusions, "plan"))).toEqual(expect.arrayContaining([
+      "--legacy-db",
+      "--source-migration",
+      "--artifact",
+      "--json",
+    ]));
+    expect(flags(command(exclusions, "apply"))).toEqual(expect.arrayContaining([
+      "--legacy-db",
+      "--artifact",
+      "--exclusion-attestation",
+      "--approval-public-key",
+      "--approval-key-sha256",
+      "--report",
+      "--apply",
+      "--json",
+    ]));
+    expect(flags(command(exclusions, "apply"))).not.toContain("--restore-report");
+    expect(flags(command(exclusions, "status"))).toContain("--json");
   });
 
   test("search exposes the four new filters and enriched human formatter", () => {

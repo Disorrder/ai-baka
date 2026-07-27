@@ -1993,6 +1993,18 @@ matched existing
 quarantined = 0
 ```
 
+Документированные исключения ограничены двумя классами: active-original
+legacy thread, для которого оператор запретил создавать canonical dialogue
+и при этом нет exact существующего dialogue, и удалённый в источнике thread
+без сообщений/chunks, который невозможно восстановить. Исходный
+`migration_meta`, reconciliation
+report и `migration_row_commit(category = "quarantined")` при этом **не
+переписываются**: исторический результат остаётся
+`completed_with_errors`, `lost = 0`, `accounted = legacyTotal`. Финальная
+приёмка показывает отдельное состояние
+`accepted_with_operator_exclusions`, а не выдаёт quarantine за canonical
+успех или matched target.
+
 Если это невозможно, каждая quarantined record имеет:
 
 * исходный primary key;
@@ -2004,6 +2016,76 @@ quarantined = 0
 `baka validate` проверяет unresolved rows именно в `migration_quarantine`
 (и legacy migration `ingest_error`), а retry закрывает прежнюю запись durable
 resolution, не удаляя audit trail.
+
+### 15.9.1. Signed operator exclusions v1
+
+Lifecycle выполняется отдельными командами:
+
+```text
+baka migration exclusions plan --legacy-db <read-only-index.sqlite> \
+  --source-migration <migration_meta:id> --artifact <new-private.json> [--json]
+
+baka migration exclusions apply --legacy-db <read-only-index.sqlite> \
+  --artifact <exact-reviewed.json> \
+  --exclusion-attestation <detached-ed25519-v1.json> \
+  --approval-public-key <independently-configured-ed25519-spki.pem> \
+  --approval-key-sha256 <lowercase-spki-der-sha256> \
+  --report <private-no-clobber-report.json> --apply [--json]
+
+baka migration exclusions status [--json]
+```
+
+`plan` аутентифицирует content-addressed legacy snapshot, exact report и
+durable `completed_with_errors` source migration, затем заново выводит exact
+row set из snapshot и живого corpus. Допустимы только machine codes:
+
+* `active_original_without_exact_dialogue` — сам active-original thread без
+  exact canonical dialogue;
+* `deleted_original_unrecoverable_no_messages` — thread без messages/chunks,
+  все связанные source rows которого аутентифицированно удалены;
+* `canonical_child_of_excluded_active_thread` — его `messages` и
+  `message_chunks`;
+* `source_less_record_of_excluded_active_thread` — только его
+  `thread_records.source_file_id IS NULL`.
+
+`thread_record` с non-null `source_file_id` исключать нельзя: для обоих классов
+его durable mapping обязан точно указывать на единственный `source_revision`
+с source-location mapping этого source row и exact snapshot SHA; missing или
+conflicting mapping оставляет thread unresolved. Несколько source rows одного
+thread проверяются независимо, без синтетического общего mapping.
+Причины quarantine и свободный текст никогда не выбирают строки. Artifact
+содержит exact quarantine/migration/lineage identities, SHA причины и raw
+payload, parser identity, attempts/last_failed_at, canonical row-set SHA и
+semantic artifact SHA; неизвестные поля/codes и любое расхождение fail closed.
+
+`apply` до writer'а проверяет detached Ed25519 по независимо закреплённому
+fingerprint (ключ exclusion может отличаться от source-import signer),
+отдельную аутентификацию source migration/report, свежий live re-derive,
+schema **ровно 5**, process lock, archive containment новых artifacts и
+no-clobber report. Source report читается по exact `migration_meta.report_path`
+и связывается с сохранёнными path/SHA/size даже вне archiveRoot; snapshot и
+новые exclusion artifacts остаются внутри archiveRoot. Записи идут детерминированными
+optimistic batches не более 500 и изменяют у `migration_quarantine` только
+`resolved_at`/`resolution`; canonical tables, identity map и исходный ledger
+не меняются. Повтор после crash принимает только exact уже записанные
+resolution/report и завершает тот же deterministic acceptance; другой retry
+создаёт новую попытку или durable mapping. Все одновременно unresolved
+попытки одного snapshot входят в exact signed set, а их source reports
+аутентифицируются независимо; поэтому прежнее acceptance
+становится `superseded`, а новая unresolved строка снова блокирует validate.
+
+`status`, `validate` и `doctor` перепроверяют persisted artifact, подпись,
+exact membership и source report bytes/binding. Удаление временного
+content-addressed migration-input snapshot после приёмки не ломает эту
+persisted проверку. Verified documented exclusions —
+информация; unresolved, malformed/unknown resolution, missing/changed
+artifact, forged signature или stale membership — ошибка. Поэтому final
+diagnostics могут честно иметь `unresolved = 0` и одновременно показывать
+ненулевое точное число документированных исключений без поддельных canonical
+records или matched targets.
+
+Backup+restore выполняется только один раз на финальной приёмке архива и не
+является входом или промежуточным шагом exclusion plan/apply.
 
 ## 15.10. Authorization, запуск и идемпотентность
 
@@ -2022,6 +2104,7 @@ baka migration run|retry [--legacy-db <read-only-index.sqlite>] \
   --report <new-exclusive-reconciliation.json> --apply [--json]
 
 baka migration status [--json]
+baka migration exclusions plan|apply|status ...
 ```
 
 Writer не создаётся до проверки exact snapshot SHA/size, table totals,

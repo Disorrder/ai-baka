@@ -153,7 +153,17 @@ raw-архива, а не местом, куда напрямую перекла
   production approval `--skip-live` недопустим. `migration run|retry` требуют
   точные signed approval/attestation/host-map/restore artifacts, независимый
   public-key fingerprint, новый `--report`, `--apply`; `migration status
-  [--json]` читает durable reconciliation;
+  [--json]` читает durable reconciliation. Для единственного fail-closed
+  набора irreducible quarantine rows есть отдельный
+  signed lifecycle: `baka migration exclusions plan --source-migration <id>
+  --artifact <path>`, затем внешняя detached Ed25519 подпись,
+  `baka migration exclusions apply --artifact <path>
+  --exclusion-attestation <path>
+  --approval-public-key <pem> --approval-key-sha256 <sha256> --report <path>
+  --apply`, `baka migration exclusions status [--json]`. Он не меняет
+  original reconciliation/ledger и не создаёт canonical mappings; verified
+  exact exclusions показываются отдельно от unresolved/forged/stale. Отдельный
+  backup+restore выполняется только при финальной приёмке архива;
 - `baka doctor [--apply] [--allow-destructive] [--import-orphan-raw]
   [--remove-stale-staging] [--requeue-stuck-embeddings]
   [--rebuild-search-projection] [--recalculate-primary-models]

@@ -315,6 +315,54 @@ describe("migration quarantine", () => {
     expect(issues.every((issue) => issue.check === "unresolved_migration_quarantine")).toBe(true);
     expect(issues[0]!.detail).toContain("threads:42");
   });
+
+  test("verified documented exclusions are informational while malformed acceptance stays an issue", async () => {
+    const db = fakeDb((sql) => sql.includes("FROM ingest_error") ? [] : []);
+    const accepted = await validateMigrationQuarantine(db, {
+      lifecycle: {
+        state: "accepted_with_operator_exclusions",
+        unresolved: 0,
+        documentedOperatorExclusions: 4,
+        documentedOperatorExclusionLineages: 4,
+        retryResolved: 0,
+        supersededOperatorExclusions: 0,
+        invalidResolutions: 0,
+        byCode: {
+          active_original_without_exact_dialogue: 1,
+          deleted_original_unrecoverable_no_messages: 0,
+          canonical_child_of_excluded_active_thread: 2,
+          source_less_record_of_excluded_active_thread: 1,
+        },
+        issues: [],
+      },
+    });
+    expect(accepted).toEqual([]);
+
+    const forged = await validateMigrationQuarantine(db, {
+      lifecycle: {
+        state: "blocked",
+        unresolved: 0,
+        documentedOperatorExclusions: 0,
+        documentedOperatorExclusionLineages: 0,
+        retryResolved: 0,
+        supersededOperatorExclusions: 0,
+        invalidResolutions: 1,
+        byCode: {
+          active_original_without_exact_dialogue: 0,
+          deleted_original_unrecoverable_no_messages: 0,
+          canonical_child_of_excluded_active_thread: 0,
+          source_less_record_of_excluded_active_thread: 0,
+        },
+        issues: [{
+          check: "invalid_migration_quarantine_resolution",
+          detail: "migration_quarantine:q: signature mismatch",
+        }],
+      },
+    });
+    expect(forged).toEqual([expect.objectContaining({
+      check: "invalid_migration_quarantine_resolution",
+    })]);
+  });
 });
 
 describe("optional raw_archive_path (migration 0005)", () => {

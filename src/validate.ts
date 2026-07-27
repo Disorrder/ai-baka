@@ -16,6 +16,10 @@ import { checkSchemaVersion, listMigrations } from "./db/migrations.ts";
 import { selectAll } from "./db/repositories/helpers.ts";
 import { listSpaces } from "./embeddings/spaces.ts";
 import { hashFile } from "./sources/snapshot/hashing.ts";
+import {
+  inspectMigrationQuarantineLifecycle,
+  type MigrationQuarantineLifecycle,
+} from "./migration/exclusions.ts";
 
 export interface ValidationIssue {
   check: string;
@@ -25,6 +29,8 @@ export interface ValidationIssue {
 export interface ValidationReport {
   ok: boolean;
   issues: ValidationIssue[];
+  /** Verified informational state; documented exclusions are not failures. */
+  migrationQuarantine?: Omit<MigrationQuarantineLifecycle, "issues">;
 }
 
 const SAFE_TABLE_NAME = /^[a-zA-Z0-9_]+$/;
@@ -529,28 +535,20 @@ export async function validateRelationalState(db: Surreal): Promise<ValidationIs
 /** Незакрытые migration ingest_error — авторитетный quarantine (§7.2/§15.9). */
 export async function validateMigrationQuarantine(
   db: Surreal,
-  options: { includeDedicatedTable?: boolean } = {},
+  options: {
+    includeDedicatedTable?: boolean;
+    archiveRoot?: string;
+    lifecycle?: MigrationQuarantineLifecycle;
+  } = {},
 ): Promise<ValidationIssue[]> {
   const issues: ValidationIssue[] = [];
   // До migration 0005 dedicated table не существует; старый quarantine
   // представлен только ingest_error(stage=migration).
   if (options.includeDedicatedTable ?? true) {
-    const quarantine = await selectAll<{
-      id: unknown;
-      legacy_table: string;
-      legacy_id: string;
-      reason: string;
-    }>(
-      db,
-      `SELECT id, legacy_table, legacy_id, reason FROM migration_quarantine
-       WHERE resolved_at IS NONE`,
-    );
-    for (const row of quarantine) {
-      issues.push({
-        check: "unresolved_migration_quarantine",
-        detail: `${String(row.id)} (${row.legacy_table}:${row.legacy_id}): ${row.reason}`,
-      });
-    }
+    const lifecycle = options.lifecycle ?? await inspectMigrationQuarantineLifecycle(db, {
+      ...(options.archiveRoot ? { archiveRoot: options.archiveRoot } : {}),
+    });
+    issues.push(...lifecycle.issues);
   }
   const legacyIngestErrors = await selectAll<{
     id: unknown;
@@ -672,12 +670,24 @@ export async function runValidationWithDb(
   }
 
   issues.push(...(await validateEmbeddingState(db)));
+  const migrationQuarantine = schemaVersion >= 5
+    ? await inspectMigrationQuarantineLifecycle(db, { archiveRoot: cfg.archiveRoot })
+    : undefined;
   issues.push(
     ...(await validateMigrationQuarantine(db, {
       includeDedicatedTable: schemaVersion >= 5,
+      archiveRoot: cfg.archiveRoot,
+      ...(migrationQuarantine ? { lifecycle: migrationQuarantine } : {}),
     })),
   );
-  return { ok: issues.length === 0, issues };
+  const migrationQuarantineSummary = migrationQuarantine
+    ? (({ issues: _issues, ...summary }) => summary)(migrationQuarantine)
+    : undefined;
+  return {
+    ok: issues.length === 0,
+    issues,
+    ...(migrationQuarantineSummary ? { migrationQuarantine: migrationQuarantineSummary } : {}),
+  };
 }
 
 export async function runValidation(cfg: AppConfig): Promise<ValidationReport> {

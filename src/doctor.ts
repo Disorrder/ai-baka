@@ -800,6 +800,20 @@ async function runDoctorCore(
   log({ event: "doctor_inspection_started", dryRun, actions: requestedActions(options).length });
   const validate = dependencies.validate ?? runValidationWithDb;
   const validation = await validate(db, cfg);
+  const migrationQuarantine = validation.migrationQuarantine;
+  if (migrationQuarantine) {
+    // Verified signed exclusions are information, not repair candidates. A
+    // retry/new durable mapping is reflected as superseded and any new
+    // unresolved attempt remains a validation failure.
+    log({
+      event: "doctor_migration_quarantine_inspected",
+      state: migrationQuarantine.state,
+      documentedOperatorExclusions: migrationQuarantine.documentedOperatorExclusions,
+      supersededOperatorExclusions: migrationQuarantine.supersededOperatorExclusions,
+      unresolved: migrationQuarantine.unresolved,
+      invalidResolutions: migrationQuarantine.invalidResolutions,
+    });
+  }
   // Validation остаётся отдельной полной секцией отчёта; findings здесь —
   // только doctor-specific diagnosis/repair plan, без дублей orphan raw.
   const findings: DoctorFinding[] = [];

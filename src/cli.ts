@@ -127,6 +127,15 @@ import {
   runLegacyMigrationWithSurreal,
   verifyMigrationSnapshot,
 } from "./migration/run.ts";
+import {
+  applyOperatorExclusions,
+  buildOperatorExclusionArtifact,
+  inspectMigrationQuarantineLifecycle,
+  parseOperatorExclusionAttestation,
+  writeOperatorExclusionArtifact,
+  type OperatorExclusionArtifact,
+  type OperatorExclusionReport,
+} from "./migration/exclusions.ts";
 import type { MigrationRunReport } from "./migration/reconciliation.ts";
 import {
   SurrealLegacyMigrationBackend,
@@ -3058,12 +3067,22 @@ program
       const report = await runValidation(cfg);
       if (options.json) {
         console.log(JSON.stringify(report, null, 2));
-      } else if (report.ok) {
-        console.log("validate: ok — инварианты соблюдены");
       } else {
-        console.log(`validate: ${report.issues.length} проблем(а)`);
-        for (const issue of report.issues) {
-          console.log(`  [${issue.check}] ${issue.detail}`);
+        if (report.migrationQuarantine) {
+          const migration = report.migrationQuarantine;
+          console.log(
+            `migration quarantine: ${migration.state}, documented ` +
+              `${migration.documentedOperatorExclusions}, unresolved ${migration.unresolved}, ` +
+              `invalid ${migration.invalidResolutions}`,
+          );
+        }
+        if (report.ok) {
+          console.log("validate: ok — инварианты соблюдены");
+        } else {
+          console.log(`validate: ${report.issues.length} проблем(а)`);
+          for (const issue of report.issues) {
+            console.log(`  [${issue.check}] ${issue.detail}`);
+          }
         }
       }
       if (!report.ok) process.exitCode = 1;
@@ -3569,6 +3588,8 @@ program
         findings: report.findings.length,
         actions: report.actions.length,
         manual: report.manual.length,
+        documentedOperatorExclusions:
+          report.validation.migrationQuarantine?.documentedOperatorExclusions ?? 0,
       });
       if (options.json) console.log(JSON.stringify(report, null, 2));
       else printDoctorReport(report);
@@ -3578,6 +3599,14 @@ program
 
 function printDoctorReport(report: DoctorReport): void {
   console.log(`doctor: ${report.ok ? "ok" : "needs attention"} (${report.dryRun ? "dry-run" : "apply"})`);
+  if (report.validation.migrationQuarantine) {
+    const migration = report.validation.migrationQuarantine;
+    console.log(
+      `  MIGRATION quarantine ${migration.state}: documented ` +
+        `${migration.documentedOperatorExclusions}, unresolved ${migration.unresolved}, ` +
+        `invalid ${migration.invalidResolutions}`,
+    );
+  }
   for (const issue of report.validation.issues) {
     console.log(`  VALIDATE [${issue.check}] ${issue.detail}`);
   }
@@ -4641,6 +4670,64 @@ interface MigrationExecutionCliOptions {
   json?: boolean;
 }
 
+interface MigrationExclusionPlanCliOptions {
+  legacyDb: string;
+  sourceMigration: string;
+  artifact: string;
+  json?: boolean;
+}
+
+interface MigrationExclusionApplyCliOptions {
+  legacyDb: string;
+  artifact: string;
+  exclusionAttestation: string;
+  approvalPublicKey: string;
+  approvalKeySha256: string;
+  report: string;
+  apply?: boolean;
+  json?: boolean;
+}
+
+function assertPathInsideArchive(archiveRoot: string, candidate: string, label: string): string {
+  const root = path.resolve(archiveRoot);
+  const resolved = path.resolve(candidate);
+  const relative = path.relative(root, resolved);
+  if (relative === "" || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`${label} должен быть файлом внутри archiveRoot`);
+  }
+  return resolved;
+}
+
+function printOperatorExclusionArtifact(
+  artifactPath: string,
+  artifactFileSha256: string,
+  artifact: OperatorExclusionArtifact,
+): void {
+  console.log(`operator exclusion plan: ${artifact.rows.length} rows`);
+  console.log(
+    `codes: active-original ${artifact.counts.active_original_without_exact_dialogue}, ` +
+      `deleted-empty ${artifact.counts.deleted_original_unrecoverable_no_messages}, ` +
+      `canonical-child ${artifact.counts.canonical_child_of_excluded_active_thread}, ` +
+      `source-less-record ${artifact.counts.source_less_record_of_excluded_active_thread}`,
+  );
+  console.log(`artifact: ${artifactPath}`);
+  console.log(`artifact file sha256: ${artifactFileSha256}`);
+  console.log(`artifact semantic sha256: ${artifact.artifactSha256}`);
+  console.log(`row set sha256: ${artifact.rowSetSha256}`);
+  console.log("apply requires a detached Ed25519 v1 attestation and independently pinned public key");
+}
+
+function printOperatorExclusionReport(report: OperatorExclusionReport): void {
+  console.log(`operator exclusions: ${report.state}`);
+  console.log(
+    `documented ${report.excludedRows} rows / ${report.excludedLineages} lineages, ` +
+      `unresolved ${report.unresolved}, invalid ${report.invalidResolutions}`,
+  );
+  console.log(`source migration: ${report.sourceMigrationId}`);
+  console.log(`acceptance: ${report.acceptanceId}`);
+  console.log(`report: ${report.reportPath}`);
+}
+
 function addMigrationExecutionOptions(command: Command): Command {
   return command
     .option(
@@ -4927,6 +5014,105 @@ async function executeMigration(
   }
 }
 
+async function planMigrationOperatorExclusions(
+  options: MigrationExclusionPlanCliOptions,
+): Promise<void> {
+  if (!options.legacyDb.trim()) throw new Error("--legacy-db не может быть пустым");
+  const cfg = loadConfig();
+  await withMigrationPlanArchiveSafety(cfg, async () => {
+    const artifactPath = assertPathInsideArchive(
+      cfg.archiveRoot,
+      options.artifact,
+      "--artifact",
+    );
+    const snapshot = await ensureLegacySnapshot(options.legacyDb, cfg.archiveRoot);
+    const db = await connectDb(cfg);
+    let artifact: OperatorExclusionArtifact;
+    try {
+      artifact = await buildOperatorExclusionArtifact({
+        db,
+        archiveRoot: cfg.archiveRoot,
+        snapshotPath: snapshot.snapshotPath,
+        sourceMigrationId: options.sourceMigration,
+      });
+    } finally {
+      await db.close();
+    }
+    await writeOperatorExclusionArtifact(cfg.archiveRoot, artifactPath, artifact);
+    const artifactFile = await hashFile(artifactPath);
+    const signaturePayload = {
+      artifactFileSha256: artifactFile.sha256,
+      artifactSha256: artifact.artifactSha256,
+      rowSetSha256: artifact.rowSetSha256,
+      sourceMigrationId: artifact.sourceMigrationId,
+      snapshotSha256: artifact.snapshotSha256,
+      issuedAt: "<exact external ISO timestamp>",
+    };
+    if (options.json) {
+      console.log(JSON.stringify({ artifactPath, artifactFile, artifact, signaturePayload }, null, 2));
+    } else {
+      printOperatorExclusionArtifact(artifactPath, artifactFile.sha256, artifact);
+    }
+  });
+}
+
+async function applyMigrationOperatorExclusions(
+  options: MigrationExclusionApplyCliOptions,
+): Promise<void> {
+  if (options.apply !== true) {
+    throw new Error("migration exclusions apply изменяет quarantine и требует явный --apply");
+  }
+  if (!options.legacyDb.trim()) throw new Error("--legacy-db не может быть пустым");
+  assertLowerSha256(options.approvalKeySha256, "--approval-key-sha256");
+  const cfg = loadConfig();
+  await assertPreflight(cfg);
+  const release = await acquireLock(cfg.archiveRoot, "migration exclusions apply --apply");
+  let db: Surreal | undefined;
+  try {
+    const artifactPath = assertPathInsideArchive(cfg.archiveRoot, options.artifact, "--artifact");
+    const attestationPath = assertPathInsideArchive(
+      cfg.archiveRoot,
+      options.exclusionAttestation,
+      "--exclusion-attestation",
+    );
+    const reportPath = assertPathInsideArchive(cfg.archiveRoot, options.report, "--report");
+    const [keyFile, attestationFile] = await Promise.all([
+      readStableMigrationCliArtifact(options.approvalPublicKey, "operator exclusion public key"),
+      readStableMigrationCliArtifact(attestationPath, "operator exclusion detached attestation"),
+    ]);
+    const ed25519PublicKeyPem = keyFile.bytes.toString("utf8");
+    if (migrationApprovalKeyFingerprint(ed25519PublicKeyPem) !== options.approvalKeySha256) {
+      throw new Error("operator exclusion public key does not match independently pinned SHA-256");
+    }
+    parseOperatorExclusionAttestation(
+      JSON.parse(attestationFile.bytes.toString("utf8")),
+    );
+    const snapshot = await ensureLegacySnapshot(options.legacyDb, cfg.archiveRoot);
+    db = await connectDb(cfg);
+    const schemaVersion = await checkSchemaVersion(db);
+    if (schemaVersion !== 5) {
+      throw new Error(`operator exclusions require exact schema 5; current ${schemaVersion}`);
+    }
+    const report = await applyOperatorExclusions({
+      db,
+      archiveRoot: cfg.archiveRoot,
+      snapshotPath: snapshot.snapshotPath,
+      artifactPath,
+      attestationPath,
+      reportPath,
+      trustAnchor: {
+        ed25519PublicKeyPem,
+        sha256Fingerprint: options.approvalKeySha256,
+      },
+    });
+    if (options.json) console.log(JSON.stringify(report, null, 2));
+    else printOperatorExclusionReport(report);
+  } finally {
+    if (db) await db.close();
+    await release();
+  }
+}
+
 migration
   .command("plan")
   .description(
@@ -5020,6 +5206,65 @@ addMigrationExecutionOptions(
   migration.command("retry").description("Новый durable run; resolved quarantine сохраняет audit trail"),
 ).action(handle(async (options: MigrationExecutionCliOptions) => executeMigration("retry", options)));
 
+const migrationExclusions = migration
+  .command("exclusions")
+  .description("Signed v1 acceptance для строго допустимых irreducible quarantine rows");
+
+migrationExclusions
+  .command("plan")
+  .description("Построить exact unsigned row-set artifact из snapshot и свежего live состояния")
+  .option("--legacy-db <path>", "legacy index.sqlite; используется content-addressed snapshot", DEFAULT_LEGACY_DB)
+  .requiredOption("--source-migration <id>", "exact completed_with_errors migration_meta id")
+  .requiredOption("--artifact <path>", "новый private signed-review artifact внутри archiveRoot")
+  .option("--json", "вывести artifact, file hash и detached-signature payload")
+  .action(handle(async (options: MigrationExclusionPlanCliOptions) => {
+    await planMigrationOperatorExclusions(options);
+  }));
+
+migrationExclusions
+  .command("apply")
+  .description("Проверить подпись и adjudicate exact freshly re-derived quarantine row set")
+  .option("--legacy-db <path>", "legacy index.sqlite; используется content-addressed snapshot", DEFAULT_LEGACY_DB)
+  .requiredOption("--artifact <path>", "exact reviewed v1 artifact внутри archiveRoot")
+  .requiredOption("--exclusion-attestation <path>", "detached Ed25519 v1 attestation внутри archiveRoot")
+  .requiredOption("--approval-public-key <path>", "independently configured Ed25519 SPKI PEM")
+  .requiredOption("--approval-key-sha256 <sha256>", "independently pinned SPKI DER SHA-256")
+  .requiredOption("--report <path>", "private deterministic report внутри archiveRoot")
+  .option("--apply", "явно разрешить bounded quarantine resolution writes")
+  .option("--json", "вывести machine-readable acceptance report")
+  .action(handle(async (options: MigrationExclusionApplyCliOptions) => {
+    await applyMigrationOperatorExclusions(options);
+  }));
+
+migrationExclusions
+  .command("status")
+  .description("Проверить persisted signatures, exact membership и retry invalidation")
+  .option("--json", "вывести machine-readable lifecycle")
+  .action(handle(async (options: { json?: boolean }) => {
+    const cfg = loadConfig();
+    const db = await connectDb(cfg);
+    try {
+      const lifecycle = await inspectMigrationQuarantineLifecycle(db, {
+        archiveRoot: cfg.archiveRoot,
+      });
+      if (options.json) console.log(JSON.stringify(lifecycle, null, 2));
+      else {
+        const { issues: _issues, ...summary } = lifecycle;
+        console.log(`migration exclusions: ${summary.state}`);
+        console.log(
+          `documented ${summary.documentedOperatorExclusions} rows / ` +
+            `${summary.documentedOperatorExclusionLineages} lineages; ` +
+            `unresolved ${summary.unresolved}, retry ${summary.retryResolved}, ` +
+            `superseded ${summary.supersededOperatorExclusions}, invalid ${summary.invalidResolutions}`,
+        );
+        for (const issue of lifecycle.issues) console.log(`  [${issue.check}] ${issue.detail}`);
+      }
+      if (lifecycle.state === "blocked") process.exitCode = 1;
+    } finally {
+      await db.close();
+    }
+  }));
+
 migration
   .command("status")
   .description("Последний persisted migration reconciliation из enhanced status")
@@ -5030,7 +5275,10 @@ migration
       const status = await collectStatus(cfg);
       const reconciliation = status.migrationReconciliation;
       if (options.json) {
-        console.log(JSON.stringify({ migrationReconciliation: reconciliation ?? null }, null, 2));
+        console.log(JSON.stringify({
+          migrationReconciliation: reconciliation ?? null,
+          migrationQuarantine: status.migrationQuarantine,
+        }, null, 2));
       } else if (!reconciliation) {
         console.log("migration status: durable reconciliation отсутствует");
       } else {
@@ -5041,6 +5289,14 @@ migration
             `lost ${reconciliation.lost}, ok ${reconciliation.ok ? "yes" : "no"}`,
         );
         console.log(`migration: ${reconciliation.id}`);
+      }
+      if (!options.json) {
+        console.log(
+          `migration quarantine: ${status.migrationQuarantine.state}, ` +
+            `documented ${status.migrationQuarantine.documentedOperatorExclusions}, ` +
+            `unresolved ${status.migrationQuarantine.unresolved}, ` +
+            `invalid ${status.migrationQuarantine.invalidResolutions}`,
+        );
       }
     }),
   );

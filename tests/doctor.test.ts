@@ -461,6 +461,48 @@ describe("doctor safety and explicit repairs", () => {
     }
   });
 
+  test("doctor reports verified operator exclusions as information, not repair work", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "baka-doctor-exclusions-"));
+    try {
+      const events: Record<string, unknown>[] = [];
+      const report = await runDoctorWithDb(
+        fakeDb(() => []),
+        { archiveRoot: root },
+        { logger: (event) => events.push(event) },
+        {
+          validate: async () => ({
+            ok: true,
+            issues: [],
+            migrationQuarantine: {
+              state: "accepted_with_operator_exclusions",
+              unresolved: 0,
+              documentedOperatorExclusions: 7,
+              documentedOperatorExclusionLineages: 3,
+              retryResolved: 0,
+              supersededOperatorExclusions: 0,
+              invalidResolutions: 0,
+              byCode: {
+                active_original_without_exact_dialogue: 1,
+                deleted_original_unrecoverable_no_messages: 0,
+                canonical_child_of_excluded_active_thread: 5,
+                source_less_record_of_excluded_active_thread: 1,
+              },
+            },
+          }),
+        },
+      );
+      expect(report.ok).toBe(true);
+      expect(report.findings).toEqual([]);
+      expect(events).toContainEqual(expect.objectContaining({
+        event: "doctor_migration_quarantine_inspected",
+        documentedOperatorExclusions: 7,
+        unresolved: 0,
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("stuck jobs, primary model, rebuild hook и raw manifest применяются", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "baka-doctor-actions-"));
     try {

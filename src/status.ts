@@ -24,6 +24,10 @@ import {
 } from "./backup/restore-test.ts";
 import { assertRegularNonSymlinkFile } from "./backup/safety.ts";
 import { hashFile } from "./sources/snapshot/hashing.ts";
+import {
+  inspectMigrationQuarantineLifecycle,
+  type MigrationQuarantineLifecycle,
+} from "./migration/exclusions.ts";
 
 async function count(db: Surreal, table: string, where?: string): Promise<number> {
   const row = await selectOne<{ n: number }>(
@@ -156,6 +160,7 @@ export interface StatusReport {
   lastSuccessfulRestore?: LastRestoreStatus;
   recoveryChain?: BackupRecoveryChainStatus;
   migrationReconciliation?: MigrationReconciliationStatus;
+  migrationQuarantine: Omit<MigrationQuarantineLifecycle, "issues">;
 }
 
 export type DatabaseStatus = Omit<
@@ -190,7 +195,8 @@ export const INCOMPLETE_LIVE_SYNC_SCANS_SQL =
 /** Running migration без итоговых counters не скрывает последний reconciliation. */
 export const LATEST_MIGRATION_RECONCILIATION_SQL =
   `SELECT id, status, started_at, finished_at, counters FROM migration_meta
-   WHERE counters IS NOT NONE ORDER BY started_at DESC LIMIT 1`;
+   WHERE counters IS NOT NONE AND status IN ["completed", "completed_with_errors", "failed"]
+   ORDER BY started_at DESC LIMIT 1`;
 
 function isoDate(value: unknown): string | undefined {
   if (value instanceof Date && Number.isFinite(value.getTime())) return value.toISOString();
@@ -210,7 +216,10 @@ function finiteNumber(value: unknown): number | undefined {
 }
 
 /** Testable database seam; caller owns and closes the connection. */
-export async function collectDatabaseStatus(db: Surreal): Promise<DatabaseStatus> {
+export async function collectDatabaseStatus(
+  db: Surreal,
+  archiveRoot?: string,
+): Promise<DatabaseStatus> {
   const jobs: Record<string, number> = {};
   for (const row of await selectAll<{ status: string; n: number }>(
     db,
@@ -271,6 +280,11 @@ export async function collectDatabaseStatus(db: Surreal): Promise<DatabaseStatus
       }
     : undefined;
 
+  const migrationQuarantine = await inspectMigrationQuarantineLifecycle(db, {
+    ...(archiveRoot ? { archiveRoot } : {}),
+    includeRows: false,
+  });
+  const { issues: _migrationQuarantineIssues, ...migrationQuarantineStatus } = migrationQuarantine;
   return {
     hosts: await count(db, "host"),
     osAccounts: await count(db, "os_account"),
@@ -298,6 +312,7 @@ export async function collectDatabaseStatus(db: Surreal): Promise<DatabaseStatus
     embeddingJobs: jobs,
     lastSync,
     migrationReconciliation,
+    migrationQuarantine: migrationQuarantineStatus,
   };
 }
 
@@ -612,7 +627,7 @@ export async function collectStatus(cfg: AppConfig): Promise<StatusReport> {
   const db = await connectDb(cfg);
   try {
     const [database, rawBytes, dbBytes, artifacts] = await Promise.all([
-      collectDatabaseStatus(db),
+      collectDatabaseStatus(db, cfg.archiveRoot),
       dirSize(path.join(cfg.archiveRoot, "raw")),
       dirSize(cfg.dbRoot),
       collectStatusArtifacts(cfg.archiveRoot),
@@ -632,6 +647,7 @@ export function formatBytes(bytes: number): string {
 
 export function formatStatus(report: StatusReport): string {
   const migration = report.migrationReconciliation;
+  const quarantine = report.migrationQuarantine;
   const lines = [
     `hosts: ${report.hosts}, os_accounts: ${report.osAccounts}, harness_installations: ${report.harnessInstallations}`,
     `source_roots: ${report.sourceRoots}`,
@@ -658,6 +674,11 @@ export function formatStatus(report: StatusReport): string {
     migration
       ? `migration reconciliation: ${migration.ok ? "ok" : "FAIL"}, status ${migration.status}, total ${migration.legacyTotal}, matched ${migration.matched}, inserted ${migration.inserted}, quarantined ${migration.quarantined}, lost ${migration.lost} (${migration.id})`
       : "migration reconciliation: —",
+    `migration quarantine: ${quarantine.state}, unresolved ${quarantine.unresolved}, ` +
+      `documented operator exclusions ${quarantine.documentedOperatorExclusions} ` +
+      `(lineages ${quarantine.documentedOperatorExclusionLineages}), ` +
+      `retry-resolved ${quarantine.retryResolved}, superseded ${quarantine.supersededOperatorExclusions}, ` +
+      `invalid ${quarantine.invalidResolutions}`,
   ];
   return lines.join("\n");
 }
