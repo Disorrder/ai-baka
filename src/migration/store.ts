@@ -93,6 +93,15 @@ export interface MigrationRunInput {
   reportPath: string;
 }
 
+/** Runtime scope derived only from authenticated preflight evidence. */
+export interface AuthenticatedPreflightScope {
+  snapshotSha256: string;
+  /** raw_backups legacy id -> exact signed missing-file reason. */
+  missingRawBackups: ReadonlyMap<string, string>;
+  /** source_files legacy id -> exact signed absence-of-raw-row reason. */
+  sourceFilesWithoutRawBackups?: ReadonlyMap<string, string>;
+}
+
 export interface MigrationRunHandle {
   syncRunId: RecordId;
   migrationId: RecordId;
@@ -313,6 +322,8 @@ export interface DialogueWriteInput {
   canonicalImportPolicy: "match_existing" | "import_deleted";
   /** Durable legacy mapping has precedence over all derived identities. */
   authoritativeDialogueId?: RecordId;
+  /** Exact per-row provenance; required by the concrete atomic writer. */
+  threadRecordTargets?: ReadonlyMap<string, RevisionTarget>;
 }
 
 function legacyMessageRole(row: LegacyMessageRow): ParsedMessage["role"] {
@@ -348,6 +359,158 @@ function finalSourceLine(chunk: ParsedChunk): number | undefined {
   if (!match) return undefined;
   const line = Number(match[1]);
   return Number.isSafeInteger(line) ? line : undefined;
+}
+
+function finalLocatorLine(locator: string | undefined): number | undefined {
+  const match = locator?.match(/#L([1-9][0-9]*)$/u);
+  if (!match) return undefined;
+  const line = Number(match[1]);
+  return Number.isSafeInteger(line) ? line : undefined;
+}
+
+interface ExistingCanonicalMessage {
+  id: RecordId;
+  sequence: number;
+  role: ParsedMessage["role"];
+}
+
+interface ExistingCanonicalChunk {
+  id: RecordId;
+  message: RecordId;
+  sequence: number;
+  kind: string;
+  raw_kind?: string;
+  source_locator?: string;
+  content_sha256: string;
+  content_bytes: number;
+}
+
+interface ExistingCanonicalOwnership {
+  messages: Map<string, RecordId>;
+  chunks: Map<string, RecordId>;
+}
+
+function hasExactExistingChunkSemantics(
+  row: LegacyChunkRow,
+  chunk: ExistingCanonicalChunk,
+): boolean {
+  const expectedSha = stringColumn(row, "content_sha256")?.toLowerCase();
+  const rawBytes = row.content_bytes;
+  const expectedBytes = rawBytes === null || rawBytes === undefined
+    ? Number.NaN
+    : numberColumn(row, "content_bytes", Number.NaN);
+  const expectedRawKind = stringColumn(row, "kind");
+  return !!expectedSha && /^[a-f0-9]{64}$/u.test(expectedSha) &&
+    Number.isSafeInteger(expectedBytes) && expectedBytes >= 0 &&
+    !!expectedRawKind && chunk.content_sha256 === expectedSha &&
+    chunk.content_bytes === expectedBytes &&
+    (chunk.raw_kind ?? chunk.kind) === expectedRawKind;
+}
+
+/**
+ * Resolves legacy projection rows onto an already-existing current revision.
+ *
+ * The dialogue's exact durable identity is the admission proof. Historical
+ * payload/content and arbitrary metadata are deliberately not re-persisted:
+ * children are owned by structural sequence/role (or Codex source line), so
+ * a legacy history snapshot can be accounted without manufacturing a second
+ * canonical revision for a live thread.
+ */
+export function resolveExistingCanonicalOwnership(
+  bundle: LegacyThreadBundle,
+  harness: HarnessSlug,
+  canonicalMessages: ExistingCanonicalMessage[],
+  canonicalChunks: ExistingCanonicalChunk[],
+): ExistingCanonicalOwnership {
+  const records = new Map(bundle.records.map((row) => [row.id, row]));
+  const chunksByCanonicalMessage = new Map<string, ExistingCanonicalChunk[]>();
+  for (const chunk of canonicalChunks) {
+    const key = String(chunk.message);
+    const rows = chunksByCanonicalMessage.get(key) ?? [];
+    rows.push(chunk);
+    chunksByCanonicalMessage.set(key, rows);
+  }
+  const messageTargets = new Map<string, RecordId>();
+  const occupiedMessages = new Set<string>();
+  for (const row of bundle.messages) {
+    const role = legacyMessageRole(row);
+    const sourceRecordId = legacySourceRecordId(row);
+    const sourceRecord = sourceRecordId === undefined ? undefined : records.get(sourceRecordId);
+    if (harness === "codex" && (!sourceRecord ||
+        !Number.isSafeInteger(sourceRecord.sequence) || sourceRecord.sequence < 0)) {
+      throw new Error(`messages:${row.id} has no owned Codex source locator line`);
+    }
+    const expectedLine = harness === "codex" && sourceRecord
+      ? sourceRecord.sequence + 1
+      : undefined;
+    let candidates = canonicalMessages.filter((message) => message.role === role);
+    if (expectedLine !== undefined) {
+      candidates = candidates.filter((message) =>
+        (chunksByCanonicalMessage.get(String(message.id)) ?? []).some(
+          (chunk) => finalLocatorLine(chunk.source_locator) === expectedLine,
+        )
+      );
+    }
+    if (expectedLine === undefined && candidates.length !== 1) {
+      const bySequence = candidates.filter((message) => message.sequence === row.sequence);
+      if (bySequence.length === 1) candidates = bySequence;
+    }
+    const target = exactlyOne(
+      candidates,
+      `messages:${row.id} has no unique existing role/sequence/line target`,
+    );
+    if (occupiedMessages.has(String(target.id))) {
+      throw new Error(`legacy binding: existing message ${String(target.id)} has multiple owners`);
+    }
+    occupiedMessages.add(String(target.id));
+    messageTargets.set(String(row.id), target.id);
+  }
+
+  const legacyMessages = new Map(bundle.messages.map((row) => [row.id, row]));
+  const chunkTargets = new Map<string, RecordId>();
+  const occupiedChunks = new Set<string>();
+  for (const row of bundle.chunks) {
+    const parentTarget = messageTargets.get(String(row.message_id));
+    const legacyMessage = legacyMessages.get(row.message_id);
+    if (!parentTarget || !legacyMessage) {
+      throw new Error(`legacy binding: message_chunks:${row.id} has no existing parent`);
+    }
+    const sourceRecordId = legacySourceRecordId(row, legacySourceRecordId(legacyMessage));
+    const sourceRecord = sourceRecordId === undefined ? undefined : records.get(sourceRecordId);
+    if (harness === "codex" && (!sourceRecord ||
+        !Number.isSafeInteger(sourceRecord.sequence) || sourceRecord.sequence < 0)) {
+      throw new Error(`message_chunks:${row.id} has no owned Codex source locator line`);
+    }
+    const expectedLine = harness === "codex" && sourceRecord
+      ? sourceRecord.sequence + 1
+      : undefined;
+    const siblings = (chunksByCanonicalMessage.get(String(parentTarget)) ?? [])
+      .filter((chunk) => hasExactExistingChunkSemantics(row, chunk));
+    let candidates = expectedLine === undefined
+      ? siblings.filter((chunk) => chunk.sequence === row.sequence)
+      : siblings.filter((chunk) => finalLocatorLine(chunk.source_locator) === expectedLine);
+    const expectedRawKind = stringColumn(row, "kind");
+    if (candidates.length !== 1 && expectedRawKind) {
+      const byKind = candidates.filter((chunk) =>
+        (chunk.raw_kind ?? chunk.kind) === expectedRawKind
+      );
+      if (byKind.length > 0) candidates = byKind;
+    }
+    if (expectedLine === undefined && candidates.length !== 1) {
+      const bySequence = siblings.filter((chunk) => chunk.sequence === row.sequence);
+      if (bySequence.length === 1) candidates = bySequence;
+    }
+    const target = exactlyOne(
+      candidates,
+      `message_chunks:${row.id} has no unique existing sequence/line target`,
+    );
+    if (occupiedChunks.has(String(target.id))) {
+      throw new Error(`legacy binding: existing chunk ${String(target.id)} has multiple owners`);
+    }
+    occupiedChunks.add(String(target.id));
+    chunkTargets.set(String(row.id), target.id);
+  }
+  return { messages: messageTargets, chunks: chunkTargets };
 }
 
 function assertLegacyChunkSemantics(
@@ -554,8 +717,24 @@ export interface AtomicDialogueCommitResult {
 export interface DialogueDedupInput {
   thread: LegacyThreadRow;
   installationId: RecordId;
-  sourceSha256: string;
+  /** Optional when installation + external_id or a durable legacy map is the proof. */
+  sourceSha256?: string;
+  /** Exact raw/replay candidates known before recovery; queried as one key family. */
+  sourceSha256Candidates?: readonly string[];
   authoritativeDialogueId?: RecordId;
+}
+
+export interface ExistingDialogueWriteInput {
+  thread: LegacyThreadRow;
+  agent: AgentTarget;
+  installationId: RecordId;
+  dialogueId: RecordId;
+  sourceSha256?: string;
+  sourceSha256Candidates?: readonly string[];
+  authoritativeDialogueId?: RecordId;
+  legacyIdentityPrefetch: LegacyIdentityPrefetch;
+  /** Exact source_revision target for every non-null legacy record link. */
+  threadRecordTargets: ReadonlyMap<string, RecordId>;
 }
 
 export interface ApprovedLegacyHostMapping {
@@ -620,11 +799,16 @@ export interface QuarantineInput {
   parserName?: string;
   parserVersion?: number;
   retryable: boolean;
+  /** Host assignment was resolved and consumed before the row failed later. */
+  hostAssignmentConsumed?: boolean;
 }
 
 export interface LegacyMigrationBackend {
   readonly durableAttribution?: boolean;
   configureHostMappingApproval?(approval: LegacyHostMappingApproval): void | Promise<void>;
+  configureAuthenticatedPreflightScope?(
+    scope: AuthenticatedPreflightScope,
+  ): void | Promise<void>;
   startRun(input: MigrationRunInput): Promise<MigrationRunHandle>;
   finishRun(
     run: MigrationRunHandle,
@@ -732,6 +916,15 @@ export interface LegacyMigrationBackend {
     input: DialogueWriteInput,
     bundle: LegacyThreadBundle,
   ): Promise<AtomicDialogueCommitResult>;
+  /**
+   * Binds legacy ownership to an exact live dialogue without creating or
+   * updating canonical corpus records.
+   */
+  commitExistingDialogueRow?(
+    run: MigrationRunHandle,
+    input: ExistingDialogueWriteInput,
+    bundle: LegacyThreadBundle,
+  ): Promise<AtomicDialogueCommitResult>;
   rollbackDialogueAttempt(
     thread: LegacyThreadRow,
     dialogue: DialogueTarget | undefined,
@@ -750,6 +943,11 @@ interface HostContext {
 function normalizedPath(value: string): string {
   const trimmed = value.replace(/\/+$/, "");
   return trimmed.length > 0 ? trimmed : value;
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return error instanceof Error && "code" in error &&
+    (error as NodeJS.ErrnoException).code === "ENOENT";
 }
 
 function isDeleted(row: LegacySourceFileRow): boolean {
@@ -1276,6 +1474,7 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
   private readonly attributionIssues: LegacyHostAttributionIssue[] = [];
   private readonly approvedAssignmentByRow = new Map<string, LegacyHostAssignment>();
   private readonly kimiRecoveryViewRoots = new Set<string>();
+  private authenticatedPreflightScope?: AuthenticatedPreflightScope;
 
   constructor(
     private readonly db: Surreal,
@@ -1345,6 +1544,39 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
       }
       this.approvedAssignmentByRow.set(key, { ...assignment });
     }
+  }
+
+  configureAuthenticatedPreflightScope(scope: AuthenticatedPreflightScope): void {
+    if (!/^[a-f0-9]{64}$/u.test(scope.snapshotSha256)) {
+      throw new Error("authenticated preflight snapshot SHA is invalid");
+    }
+    const missingRawBackups = new Map<string, string>();
+    for (const [legacyId, reason] of scope.missingRawBackups) {
+      if (!/^\d+$/u.test(legacyId) ||
+          !reason.startsWith("raw backup файл отсутствует на диске: ")) {
+        throw new Error("authenticated missing-raw scope is malformed");
+      }
+      if (missingRawBackups.has(legacyId)) {
+        throw new Error(`authenticated missing-raw scope duplicates raw_backups:${legacyId}`);
+      }
+      missingRawBackups.set(legacyId, reason);
+    }
+    const sourceFilesWithoutRawBackups = new Map<string, string>();
+    for (const [legacyId, reason] of scope.sourceFilesWithoutRawBackups ?? []) {
+      if (!/^\d+$/u.test(legacyId) ||
+          reason !== "нет записи raw_backups (missing raw backup)") {
+        throw new Error("authenticated source-without-raw scope is malformed");
+      }
+      if (sourceFilesWithoutRawBackups.has(legacyId)) {
+        throw new Error(`authenticated source-without-raw scope duplicates source_files:${legacyId}`);
+      }
+      sourceFilesWithoutRawBackups.set(legacyId, reason);
+    }
+    this.authenticatedPreflightScope = {
+      snapshotSha256: scope.snapshotSha256,
+      missingRawBackups,
+      sourceFilesWithoutRawBackups,
+    };
   }
 
   private async cleanupUncommittedMigrationEffects(
@@ -1528,6 +1760,10 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
   }
 
   async startRun(input: MigrationRunInput): Promise<MigrationRunHandle> {
+    if (!this.authenticatedPreflightScope ||
+        this.authenticatedPreflightScope.snapshotSha256 !== input.legacyDbSha256) {
+      throw new Error("authenticated preflight scope is missing or belongs to another snapshot");
+    }
     await this.reconcileMigrationLifecycle();
     const hostId = await ensureHost(this.db, {
       hostUuid: this.identity.hostUuid,
@@ -2084,6 +2320,9 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
         `${recordKey(run.migrationId)}:${input.table}:${String(input.row.id)}`,
       ),
     );
+    const assignment = input.hostAssignmentConsumed
+      ? this.assignmentForCommit(input.table, String(input.row.id))
+      : undefined;
     const result = await this.db.query<unknown[]>(
       `BEGIN;
        CREATE ONLY $id SET migration = $migration, legacy_table = $table, legacy_id = $legacyId,
@@ -2093,6 +2332,7 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
          first_failed_at = $first, last_failed_at = $now;
        CREATE ONLY $ledger SET migration = $migration, legacy_table = $table,
          legacy_id = $legacyId, category = "quarantined", target = $id,
+         host_mapping_id = $hostMapping, host_assignment_json = $hostAssignment,
          committed_at = $now;
        COMMIT;
        RETURN true;`,
@@ -2110,6 +2350,8 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
         attempts: (previous?.attempts ?? 0) + 1,
         lineage: lineageKey,
         previous: previous?.id ?? undefined,
+        hostMapping: assignment?.mappingId,
+        hostAssignment: assignment ? JSON.stringify(assignment) : undefined,
         first: previous?.first_failed_at ?? now,
         now,
       },
@@ -2225,7 +2467,7 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
     ]>(
       `SELECT legacy_table, legacy_id, host_mapping_id, host_assignment_json
        FROM migration_row_commit
-       WHERE migration = $migration AND category IN ["matched", "inserted"]
+       WHERE migration = $migration AND category IN ["matched", "inserted", "quarantined"]
          AND host_assignment_json != NONE`,
       { migration: run.migrationId },
     );
@@ -2688,8 +2930,6 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
     assertAuthoritativeTarget("source_files", row.id, authoritativeTarget, locationId);
 
     type RevisionPlan = {
-      row?: LegacyRawBackupRow;
-      mapped?: RecordId;
       revision: RevisionTarget;
       exists: boolean;
       existingRawPath?: string;
@@ -2702,11 +2942,33 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
       parserVersion: number;
       parseStatus: string;
     };
-    const plans: RevisionPlan[] = [];
+    type RawOwnership = {
+      row: LegacyRawBackupRow;
+      mapped?: RecordId;
+      revisionId: RecordId;
+    };
+    const plansById = new Map<string, RevisionPlan>();
+    const rawOwnerships: RawOwnership[] = [];
+    let selectedRevisionId: RecordId | undefined;
+    const rememberPlan = (plan: RevisionPlan): void => {
+      const key = String(plan.revision.revisionId);
+      const prior = plansById.get(key);
+      if (prior && prior.revision.sha256 !== plan.revision.sha256) {
+        throw new Error(`legacy source revision plan conflict: ${key}`);
+      }
+      // A real immutable snapshot is stronger evidence than an ENOENT row
+      // carrying only the expected digest. Preserve one canonical CREATE per
+      // deterministic revision while every raw_backups row gets ownership.
+      if (!prior || (!prior.rawArchivePath && plan.rawArchivePath)) {
+        plansById.set(key, plan);
+      }
+      selectedRevisionId = plan.revision.revisionId;
+    };
     const rejectedBackups: AtomicSourceCommitResult["rejectedBackups"] = [];
     for (const backup of backups) {
+      const expectedRaw = stringColumn(backup, "sha256") ?? row.sha256;
+      const expected = expectedRaw?.toLowerCase();
       try {
-        const expected = stringColumn(backup, "sha256") ?? row.sha256;
         const snapshot = await snapshotRegularFile(backup.archive_path, {
           archiveRoot: this.archiveRoot,
           harness: agent.slug,
@@ -2738,9 +3000,7 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
               semanticPaths: [relativePath, row.original_path],
             })
           : undefined;
-        plans.push({
-          row: backup,
-          mapped,
+        const plan: RevisionPlan = {
           revision: {
             revisionId,
             sha256: snapshot.sha256,
@@ -2759,17 +3019,84 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
           parserName: parser.parserName,
           parserVersion: parser.parserVersion,
           parseStatus: "pending",
-        });
+        };
+        rememberPlan(plan);
+        rawOwnerships.push({ row: backup, mapped, revisionId });
       } catch (error) {
         // A durable mapping conflict is a bundle-level invariant failure, not
         // a recoverable raw-file defect. Let the outer source handler
         // quarantine the source and every child without committing a partial
         // source/raw ownership bundle.
         if (error instanceof LegacyIdentityConflictError) throw error;
+        if (isMissingFileError(error) && expectedRaw === expected &&
+            expected && /^[a-f0-9]{64}$/u.test(expected)) {
+          const exactMissingReason =
+            `raw backup файл отсутствует на диске: ${backup.archive_path}`;
+          const approvedMissingReason = this.authenticatedPreflightScope
+            ?.missingRawBackups.get(String(backup.id));
+          if (approvedMissingReason !== exactMissingReason) {
+            rejectedBackups.push({
+              row: backup,
+              reason: `raw backup ENOENT is outside authenticated preflight scope`,
+            });
+            continue;
+          }
+          const revisionId = new RecordId(
+            "source_revision",
+            deterministicId("srev", `${String(locationId)}:${expected}`),
+          );
+          const mapped = prefetchedLegacyIdentity(
+            identityPrefetch,
+            "raw_backups",
+            String(backup.id),
+          )?.target;
+          assertAuthoritativeTarget("raw_backups", backup.id, mapped, revisionId);
+          const existing = await selectOne<{
+            id: RecordId;
+            sha256: string;
+            source_location: RecordId;
+            raw_archive_path?: string;
+          }>(
+            this.db,
+            "SELECT id, sha256, source_location, raw_archive_path FROM ONLY $id",
+            { id: revisionId },
+          );
+          if (existing && (
+            existing.sha256 !== expected ||
+            String(existing.source_location) !== String(locationId)
+          )) {
+            throw new LegacyIdentityConflictError(
+              `legacy missing-raw revision collision: ${String(revisionId)}`,
+            );
+          }
+          rememberPlan({
+            revision: {
+              revisionId,
+              sha256: expected,
+              rawPath: existing?.raw_archive_path
+                ? path.join(this.archiveRoot, existing.raw_archive_path)
+                : undefined,
+              created: !existing,
+            },
+            exists: !!existing,
+            existingRawPath: existing?.raw_archive_path,
+            sizeBytes: optionalInt(backup, "size") ?? optionalInt(row, "size") ?? 0,
+            mtimeMs: optionalInt(row, "mtime_ms") ?? 0,
+            headHash: stringColumn(row, "head_hash"),
+            snapshotKind: "legacy_missing_raw",
+            parserName: "legacy",
+            parserVersion: 1,
+            parseStatus: "unsupported",
+          });
+          rawOwnerships.push({ row: backup, mapped, revisionId });
+          continue;
+        }
         rejectedBackups.push({ row: backup, reason: error instanceof Error ? error.message : String(error) });
       }
     }
-    if (plans.length === 0) {
+    if (plansById.size === 0 && backups.length === 0 &&
+        this.authenticatedPreflightScope?.sourceFilesWithoutRawBackups?.get(sourceLegacyId) ===
+          "нет записи raw_backups (missing raw backup)") {
       const revisionId = new RecordId(
         "source_revision",
         deterministicId("srev", `${String(locationId)}:${row.sha256}`),
@@ -2779,7 +3106,7 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
         "SELECT id, raw_archive_path FROM ONLY $id",
         { id: revisionId },
       );
-      plans.push({
+      rememberPlan({
         revision: { revisionId, sha256: row.sha256, created: !existing },
         exists: !!existing,
         existingRawPath: existing?.raw_archive_path,
@@ -2792,7 +3119,13 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
         parseStatus: "unsupported",
       });
     }
-    const selected = plans.at(-1)!;
+    const plans = [...plansById.values()];
+    const selected = selectedRevisionId
+      ? plansById.get(String(selectedRevisionId))
+      : undefined;
+    if (selectedRevisionId && !selected) {
+      throw new Error(`selected legacy source revision plan is missing: ${String(selectedRevisionId)}`);
+    }
     const deletedAt = new Date(stringColumn(row, "deleted_at") ?? Date.now());
     const writtenPresence = isDeleted(row) ? "deleted_in_source" : "active";
     const sourceCommit: MigrationIdentityCommit = {
@@ -2809,7 +3142,7 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
         deletedAt: existingLocation?.deleted_at,
       },
       writtenState: {
-        currentRevision: selected.revision.revisionId,
+        currentRevision: selected?.revision.revisionId ?? existingLocation?.current_revision,
         lastSuccessfulRevision: existingLocation?.last_successful_revision,
         presenceStatus: writtenPresence,
         missingCompleteScans: isDeleted(row) ? 2 : 0,
@@ -2817,14 +3150,21 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
         deletedAt: isDeleted(row) ? deletedAt : undefined,
       },
     };
-    const rawCommits = plans.flatMap((plan): MigrationIdentityCommit[] => plan.row ? [{
+    const rawCommits = rawOwnerships.map((ownership): MigrationIdentityCommit => {
+      const plan = plansById.get(String(ownership.revisionId));
+      if (!plan) throw new Error(`missing raw ownership revision plan: ${String(ownership.revisionId)}`);
+      return {
       table: "raw_backups",
-      legacyId: String(plan.row.id),
-      target: plan.revision.revisionId,
-      category: plan.mapped || plan.exists ? "matched" : "inserted",
+      legacyId: String(ownership.row.id),
+      target: ownership.revisionId,
+      category: ownership.mapped || plan.exists ? "matched" : "inserted",
       previousState: { rawArchivePath: plan.existingRawPath },
-      writtenState: { rawArchivePath: plan.existingRawPath ?? plan.rawArchivePath },
-    }] : []);
+      writtenState: {
+        rawArchivePath: plan.existingRawPath ?? plan.rawArchivePath,
+        ...(plan.rawArchivePath || plan.existingRawPath ? {} : { missingRaw: true }),
+      },
+    };
+    });
     const commits = [sourceCommit, ...rawCommits];
     const preparedCommits = await Promise.all(
       commits.map((commit) => this.prepareRowCommit(run, commit, identityPrefetch)),
@@ -2841,12 +3181,12 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
       relative: relativePath,
       original: row.original_path,
       basename: path.basename(relativePath),
-      selectedRevision: selected.revision.revisionId,
       presence: writtenPresence,
       missingScans: isDeleted(row) ? 2 : 0,
       missingSince: isDeleted(row) ? deletedAt : undefined,
       deletedAt: isDeleted(row) ? deletedAt : undefined,
     };
+    if (selected) vars.selectedRevision = selected.revision.revisionId;
     const sql = ["BEGIN;"];
     if (!existingRoot) {
       sql.push(
@@ -2893,12 +3233,14 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
         );
       }
     }
-    sql.push(
-      `UPDATE ONLY $location SET current_revision = $selectedRevision,
-       presence_status = $presence, missing_complete_scans = $missingScans,
-       missing_since_at = $missingSince, deleted_at = $deletedAt,
-       last_seen_at = $now;`,
-    );
+    sql.push(selected
+      ? `UPDATE ONLY $location SET current_revision = $selectedRevision,
+         presence_status = $presence, missing_complete_scans = $missingScans,
+         missing_since_at = $missingSince, deleted_at = $deletedAt,
+         last_seen_at = $now;`
+      : `UPDATE ONLY $location SET presence_status = $presence,
+         missing_complete_scans = $missingScans, missing_since_at = $missingSince,
+         deleted_at = $deletedAt, last_seen_at = $now;`);
     this.appendRowCommitBatchSql(sql, vars, commits, preparedCommits, identityPrefetch);
     sql.push("COMMIT;", "RETURN true;");
     await this.faultHooks.beforeAtomicRowQuery?.("source", run);
@@ -2915,7 +3257,7 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
       agentSlug: agent.slug,
       created: !existingLocation,
       previousPresence: existingLocation?.presence_status,
-      selectedRevision: selected.revision,
+      selectedRevision: selected?.revision,
       hostMappingId: mapping.mappingId,
       legacyOnlyLocation: true,
     };
@@ -3086,6 +3428,158 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
       installationId: await this.installation(agent, host.hostId),
       hostId: host.hostId,
       osAccountId: host.osAccountId,
+    };
+  }
+
+  async commitExistingDialogueRow(
+    run: MigrationRunHandle,
+    input: ExistingDialogueWriteInput,
+    bundle: LegacyThreadBundle,
+  ): Promise<AtomicDialogueCommitResult> {
+    assertExactDialogueIdentityPrefetch(bundle, input.legacyIdentityPrefetch);
+    const resolved = await this.preflightDialogueDedup({
+      thread: input.thread,
+      installationId: input.installationId,
+      sourceSha256: input.sourceSha256,
+      sourceSha256Candidates: input.sourceSha256Candidates,
+      authoritativeDialogueId: input.authoritativeDialogueId,
+    });
+    if (!resolved || String(resolved) !== String(input.dialogueId)) {
+      throw new LegacyDialogueDedupConflictError(
+        `exact live dialogue changed for threads:${input.thread.id}`,
+      );
+    }
+    const dialogue = await selectOne<{ id: RecordId; current_revision?: RecordId }>(
+      this.db,
+      "SELECT id, current_revision FROM ONLY $id",
+      { id: resolved },
+    );
+    if (!dialogue?.current_revision) {
+      throw new LegacyDialogueDedupConflictError(
+        `exact live dialogue has no current revision: ${String(resolved)}`,
+      );
+    }
+    const revision = await selectOne<{
+      id: RecordId;
+      dialogue: RecordId;
+      status: string;
+    }>(
+      this.db,
+      "SELECT id, dialogue, status FROM ONLY $id",
+      { id: dialogue.current_revision },
+    );
+    if (!revision || revision.status !== "ready" ||
+        String(revision.dialogue) !== String(dialogue.id)) {
+      throw new LegacyDialogueDedupConflictError(
+        `exact live dialogue current revision is missing or invalid: ${String(dialogue.current_revision)}`,
+      );
+    }
+    const [canonicalMessages, canonicalChunks] = await Promise.all([
+      this.db.query<[ExistingCanonicalMessage[]]>(
+        `SELECT id, sequence, role FROM message
+         WHERE dialogue_revision = $revision ORDER BY sequence, id`,
+        { revision: revision.id },
+      ).then(([rows]) => rows ?? []),
+      this.db.query<[ExistingCanonicalChunk[]]>(
+        `SELECT id, message, sequence, kind, raw_kind, source_locator,
+           content_sha256, content_bytes FROM chunk
+         WHERE dialogue_revision = $revision ORDER BY message, sequence, id`,
+        { revision: revision.id },
+      ).then(([rows]) => rows ?? []),
+    ]);
+    const ownership = resolveExistingCanonicalOwnership(
+      bundle,
+      input.agent.slug,
+      canonicalMessages,
+      canonicalChunks,
+    );
+    for (const row of bundle.records) {
+      const prior = prefetchedLegacyIdentity(
+        input.legacyIdentityPrefetch,
+        "thread_records",
+        String(row.id),
+      )?.target;
+      if (!prior) continue;
+      const expected = row.source_file_id === null
+        ? revision.id
+        : input.threadRecordTargets.get(String(row.id));
+      if (!expected || String(prior) !== String(expected)) {
+        throw new LegacyDialogueDedupConflictError(
+          `thread_records:${row.id} prior ownership does not match its exact source revision`,
+        );
+      }
+    }
+    const commits: MigrationIdentityCommit[] = [{
+      table: "threads",
+      legacyId: String(input.thread.id),
+      target: dialogue.id,
+      category: "matched",
+    }];
+    for (const row of bundle.records) {
+      const target = row.source_file_id === null
+        ? revision.id
+        : input.threadRecordTargets.get(String(row.id));
+      if (!target) {
+        throw new LegacyDialogueDedupConflictError(
+          `thread_records:${row.id} has no exact source revision target`,
+        );
+      }
+      commits.push({
+        table: "thread_records",
+        legacyId: String(row.id),
+        target,
+        category: "matched",
+      });
+    }
+    for (const row of bundle.messages) {
+      const resolvedTarget = ownership.messages.get(String(row.id));
+      const priorTarget = prefetchedLegacyIdentity(
+        input.legacyIdentityPrefetch,
+        "messages",
+        String(row.id),
+      )?.target;
+      if (!resolvedTarget || (priorTarget && String(priorTarget) !== String(resolvedTarget))) {
+        throw new LegacyDialogueDedupConflictError(
+          `messages:${row.id} prior ownership does not match exact current canonical semantics`,
+        );
+      }
+      commits.push({
+        table: "messages",
+        legacyId: String(row.id),
+        target: resolvedTarget,
+        category: "matched",
+      });
+    }
+    for (const row of bundle.chunks) {
+      const resolvedTarget = ownership.chunks.get(String(row.id));
+      const priorTarget = prefetchedLegacyIdentity(
+        input.legacyIdentityPrefetch,
+        "message_chunks",
+        String(row.id),
+      )?.target;
+      if (!resolvedTarget || (priorTarget && String(priorTarget) !== String(resolvedTarget))) {
+        throw new LegacyDialogueDedupConflictError(
+          `message_chunks:${row.id} prior ownership does not match exact current canonical semantics`,
+        );
+      }
+      commits.push({
+        table: "message_chunks",
+        legacyId: String(row.id),
+        target: resolvedTarget,
+        category: "matched",
+      });
+    }
+    await this.faultHooks.beforeAtomicRowQuery?.("dialogue", run);
+    await this.commitIdentityBatch(run, commits, undefined, input.legacyIdentityPrefetch);
+    await this.faultHooks.afterAtomicRowQuery?.("dialogue", run);
+    return {
+      dialogue: {
+        dialogueId: dialogue.id,
+        revisionId: revision.id,
+        createdDialogue: false,
+        createdRevision: false,
+      },
+      commits,
     };
   }
 
@@ -3359,11 +3853,17 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
       },
     );
     for (const row of bundle.records) {
+      const sourceTarget = input.threadRecordTargets?.get(String(row.id));
+      if (row.source_file_id !== null && !sourceTarget) {
+        throw new LegacyDialogueDedupConflictError(
+          `thread_records:${row.id} has no exact source_file revision target`,
+        );
+      }
       addCommit(
         "thread_records",
         String(row.id),
-        row.source_file_id !== null ? input.sourceRevision.revisionId : revisionId,
-        input.sourceRevision.created || createdRevision,
+        row.source_file_id !== null ? sourceTarget!.revisionId : revisionId,
+        row.source_file_id !== null ? sourceTarget!.created : createdRevision,
       );
     }
     for (const binding of verifiedBindings.messages) {
@@ -3619,19 +4119,23 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
 
   async preflightDialogueDedup(input: DialogueDedupInput): Promise<RecordId | undefined> {
     const identityKey = `${String(input.installationId)}:${input.thread.external_id}`;
-    const [bySourceRows] = await this.db.query<[
-      Array<{ dialogue: RecordId }>,
-    ]>(
-      `SELECT dialogue FROM dialogue_revision
-       WHERE source_dialogue_id = $sourceDialogueId AND source_revision.sha256 = $sha`,
-      { sourceDialogueId: input.thread.external_id, sha: input.sourceSha256 },
-    );
+    const sourceShas = [...new Set([
+      ...(input.sourceSha256Candidates ?? []),
+      ...(input.sourceSha256 ? [input.sourceSha256] : []),
+    ])];
+    const bySourceRows = sourceShas.length > 0
+      ? (await this.db.query<[Array<{ dialogue: RecordId }>]>(
+          `SELECT dialogue FROM dialogue_revision
+           WHERE source_dialogue_id = $sourceDialogueId AND source_revision.sha256 IN $shas`,
+          { sourceDialogueId: input.thread.external_id, shas: sourceShas },
+        ))[0]
+      : [];
     const bySource = [...new Map(
       (bySourceRows ?? []).map((row) => [String(row.dialogue), row.dialogue]),
     ).values()];
     if (bySource.length > 1) {
       throw new LegacyDialogueDedupConflictError(
-        `ambiguous source revision SHA + dialogue id: ${input.sourceSha256}:${input.thread.external_id}`,
+        `ambiguous source revision SHA + dialogue id: ${sourceShas.join(",")}:${input.thread.external_id}`,
       );
     }
     const [byIdentityRows] = await this.db.query<[

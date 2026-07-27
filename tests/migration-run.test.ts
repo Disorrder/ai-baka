@@ -20,6 +20,7 @@ import {
   shouldApplyLegacyDeleted,
   shouldAttachRepairedRaw,
   resolveApprovedHostMapping,
+  resolveExistingCanonicalOwnership,
   resolveLegacyCanonicalBindings,
   SurrealLegacyMigrationBackend,
 } from "../src/migration/store.ts";
@@ -308,6 +309,173 @@ describe("legacy canonical child binding", () => {
       ]);
     expect(() => resolveLegacyCanonicalBindings(bundle, parsed, "claude-code", "payload"))
       .toThrow("has no chunk identity evidence");
+  });
+
+  test("exact live ownership requires structural and stored chunk semantics", () => {
+    const bundle = bindingBundle();
+    bundle.chunks[0]!.metadata_path = "/malformed/arbitrary/metadata";
+    const user = new RecordId("message", "live_user");
+    const answer = new RecordId("message", "live_answer");
+    const userChunk = new RecordId("chunk", "live_user_chunk");
+    const answerChunk = new RecordId("chunk", "live_answer_chunk");
+    const ownership = resolveExistingCanonicalOwnership(
+      bundle,
+      "codex",
+      [
+        { id: user, sequence: 17, role: "user" },
+        { id: answer, sequence: 23, role: "assistant" },
+      ],
+      [
+        {
+          id: userChunk,
+          message: user,
+          sequence: 9,
+          kind: "text",
+          raw_kind: "input_text",
+          source_locator: "/immutable/current.jsonl#L1",
+          content_sha256: sha256hex("redacted prompt"),
+          content_bytes: Buffer.byteLength("redacted prompt"),
+        },
+        {
+          id: answerChunk,
+          message: answer,
+          sequence: 8,
+          kind: "text",
+          raw_kind: "output_text",
+          source_locator: "/immutable/current.jsonl#L4",
+          content_sha256: sha256hex("redacted answer"),
+          content_bytes: Buffer.byteLength("redacted answer"),
+        },
+      ],
+    );
+    expect(ownership.messages).toEqual(new Map([
+      ["20", user],
+      ["21", answer],
+    ]));
+    expect(ownership.chunks).toEqual(new Map([
+      ["30", userChunk],
+      ["31", answerChunk],
+    ]));
+    bundle.chunks[0]!.content_sha256 = "not-a-safe-digest";
+    expect(() => resolveExistingCanonicalOwnership(
+      bundle,
+      "codex",
+      [
+        { id: user, sequence: 17, role: "user" },
+        { id: answer, sequence: 23, role: "assistant" },
+      ],
+      [
+        {
+          id: userChunk,
+          message: user,
+          sequence: 9,
+          kind: "text",
+          raw_kind: "input_text",
+          source_locator: "/immutable/current.jsonl#L1",
+          content_sha256: sha256hex("redacted prompt"),
+          content_bytes: Buffer.byteLength("redacted prompt"),
+        },
+        {
+          id: answerChunk,
+          message: answer,
+          sequence: 8,
+          kind: "text",
+          raw_kind: "output_text",
+          source_locator: "/immutable/current.jsonl#L4",
+          content_sha256: sha256hex("redacted answer"),
+          content_bytes: Buffer.byteLength("redacted answer"),
+        },
+      ],
+    )).toThrow("no unique existing sequence/line target");
+  });
+
+  test("Codex exact live ownership never falls back when the durable locator line mismatches", () => {
+    const bundle = bindingBundle();
+    const user = new RecordId("message", "wrong_line_user");
+    const answer = new RecordId("message", "exact_line_answer");
+    expect(() => resolveExistingCanonicalOwnership(
+      bundle,
+      "codex",
+      [
+        { id: user, sequence: 0, role: "user" },
+        { id: answer, sequence: 1, role: "assistant" },
+      ],
+      [
+        {
+          id: new RecordId("chunk", "wrong_line_user_chunk"),
+          message: user,
+          sequence: 0,
+          kind: "text",
+          raw_kind: "input_text",
+          source_locator: "/immutable/current.jsonl#L999",
+          content_sha256: sha256hex("redacted prompt"),
+          content_bytes: Buffer.byteLength("redacted prompt"),
+        },
+        {
+          id: new RecordId("chunk", "exact_line_answer_chunk"),
+          message: answer,
+          sequence: 0,
+          kind: "text",
+          raw_kind: "output_text",
+          source_locator: "/immutable/current.jsonl#L4",
+          content_sha256: sha256hex("redacted answer"),
+          content_bytes: Buffer.byteLength("redacted answer"),
+        },
+      ],
+    )).toThrow("messages:20 has no unique existing role/sequence/line target");
+  });
+
+  test("Codex null source provenance cannot bind while non-Codex sequence ownership remains valid", () => {
+    const bundle = bindingBundle();
+    bundle.messages[0]!.source_record_id = null;
+    bundle.messages[1]!.source_record_id = null;
+    bundle.chunks[0]!.source_record_id = null;
+    bundle.chunks[1]!.source_record_id = null;
+    const user = new RecordId("message", "null_source_user");
+    const answer = new RecordId("message", "null_source_answer");
+    const userChunk = new RecordId("chunk", "null_source_user_chunk");
+    const answerChunk = new RecordId("chunk", "null_source_answer_chunk");
+    const canonicalMessages = [
+      { id: user, sequence: 0, role: "user" as const },
+      { id: answer, sequence: 1, role: "assistant" as const },
+    ];
+    const canonicalChunks = [
+      {
+        id: userChunk,
+        message: user,
+        sequence: 0,
+        kind: "text",
+        raw_kind: "input_text",
+        source_locator: "/immutable/current.jsonl#L999",
+        content_sha256: sha256hex("redacted prompt"),
+        content_bytes: Buffer.byteLength("redacted prompt"),
+      },
+      {
+        id: answerChunk,
+        message: answer,
+        sequence: 0,
+        kind: "text",
+        raw_kind: "output_text",
+        source_locator: "/immutable/current.jsonl#L999",
+        content_sha256: sha256hex("redacted answer"),
+        content_bytes: Buffer.byteLength("redacted answer"),
+      },
+    ];
+    expect(() => resolveExistingCanonicalOwnership(
+      bundle,
+      "codex",
+      canonicalMessages,
+      canonicalChunks,
+    )).toThrow("messages:20 has no owned Codex source locator line");
+
+    const nonCodex = resolveExistingCanonicalOwnership(
+      bundle,
+      "claude-code",
+      canonicalMessages,
+      canonicalChunks,
+    );
+    expect(nonCodex.messages).toEqual(new Map([["20", user], ["21", answer]]));
+    expect(nonCodex.chunks).toEqual(new Map([["30", userChunk], ["31", answerChunk]]));
   });
 });
 
@@ -956,6 +1124,7 @@ class MemoryBackend implements LegacyMigrationBackend {
   startCalls = 0;
   failThreadBind = 0;
   failMark = 0;
+  failSource = 0;
 
   async startRun(_input: MigrationRunInput): Promise<MigrationRunHandle> {
     this.startCalls += 1;
@@ -1052,6 +1221,10 @@ class MemoryBackend implements LegacyMigrationBackend {
   }
 
   async ensureSourceFile(row: LegacySourceFileRow, agent: AgentTarget): Promise<EnsureTarget<SourceTarget>> {
+    if (this.failSource > 0) {
+      this.failSource -= 1;
+      throw new Error("fault: source import");
+    }
     const locationId = new RecordId("source_location", `legacy_${row.id}`);
     // presence row = уже существующая live location, даже если migration
     // backend ещё не создавал target в этом тестовом процессе.
@@ -1329,7 +1502,7 @@ describe("Stage 10 migration runner", () => {
     expect(first.status).toBe("completed_with_errors");
     expect(first.reconciliation).toMatchObject({
       legacyTotal: 5,
-      quarantined: 2,
+      quarantined: 1,
       lost: 0,
       ok: true,
     });
@@ -1368,8 +1541,8 @@ describe("Stage 10 migration runner", () => {
       lost: 0,
     });
     expect(report.reconciliation.tables.thread_records).toMatchObject({
-      inserted: 1,
-      quarantined: 2,
+      inserted: 3,
+      quarantined: 0,
       accounted: 3,
       lost: 0,
     });
@@ -1377,6 +1550,9 @@ describe("Stage 10 migration runner", () => {
     expect(backend.quarantines.filter((row) =>
       row.table === "threads" && row.reason.includes("canonical import denied")
     ).map((row) => row.id)).toEqual(["2", "3"]);
+    expect(backend.quarantines.filter((row) =>
+      row.reason.includes("canonical import denied")
+    ).every((row) => row.parserName === "claude-code" && row.parserVersion === 2)).toBe(true);
   });
 
   test("null source_file_id запрещает raw recovery для всего thread", async () => {
@@ -1399,6 +1575,33 @@ describe("Stage 10 migration runner", () => {
     expect(calls).not.toContain("t1:raw");
     expect(calls).toContain("t1:payload");
     expect(report.recovery.payload).toBeGreaterThanOrEqual(1);
+  });
+
+  test("non-null thread_record without exact source target never binds to replay revision", async () => {
+    const snapshot = await migrationFixture({ emptyMessages: true });
+    const backend = new MemoryBackend();
+    backend.failSource = 1;
+    const report = await runLegacyMigration({
+      ...snapshot,
+      bakaCommit: "test",
+      schemaVersion: 5,
+      backend,
+      recoverSnapshot: async (input) =>
+        input.source === "payload" ? dialogue(input.threadExternalId, "recovered") : undefined,
+    });
+    expect(report.status).toBe("completed_with_errors");
+    expect(report.reconciliation.tables.thread_records).toMatchObject({
+      matched: 0,
+      inserted: 0,
+      quarantined: 1,
+      lost: 0,
+    });
+    expect(backend.mappings.has("thread_records:1")).toBe(false);
+    expect(backend.quarantines.some((row) =>
+      row.table === "thread_records" &&
+      row.reason.includes("no exact source_revision ownership evidence")
+    )).toBe(true);
+    expect(backend.replayThreads).toEqual([]);
   });
 
   test.each(["pointer", "sha", "bytes"] as const)(

@@ -50,9 +50,11 @@ import {
   prefetchedLegacyIdentity,
   resolveLegacyCanonicalBindings,
   type ApprovedLegacyHostMapping,
+  type AuthenticatedPreflightScope,
   type AgentTarget,
   type DialogueTarget,
   type DialogueWriteInput,
+  type ExistingDialogueWriteInput,
   type EnsureTarget,
   type LegacyMigrationBackend,
   type LegacyCanonicalBindings,
@@ -63,7 +65,10 @@ import {
   type RevisionTarget,
   type SourceTarget,
 } from "./store.ts";
-import { analyzeLegacySnapshot, probeLiveCorpusFromDb } from "./preflight.ts";
+import {
+  analyzeLegacySnapshot,
+  type LiveCorpusProbe,
+} from "./preflight.ts";
 import {
   APPROVAL_ANALYSIS_IDENTITY,
   buildLegacyHostMappingApproval,
@@ -171,6 +176,33 @@ export interface RunLegacyMigrationWithSurrealOptions
   approvedHostMappings: ApprovedLegacyHostMapping[];
 }
 
+/**
+ * Approval drift excludes only records written by a prior legacy migration.
+ * Ordinary/live records have created_by_run = NONE and therefore remain in
+ * the signed baseline, so external or sync drift still fails authentication.
+ */
+export async function probeMigrationApprovalBaselineFromDb(
+  db: Surreal,
+): Promise<LiveCorpusProbe> {
+  const [revisions, dialogues] = await Promise.all([
+    db.query<[Array<{ sha256: string }>]>(
+      "SELECT sha256 FROM source_revision WHERE created_by_run IS NONE",
+    ).then(([rows]) => rows ?? []),
+    db.query<[Array<{ external_id: string; harness: string | null }>]>(
+      `SELECT external_id, harness_installation.harness.slug AS harness
+       FROM dialogue WHERE external_id IS NOT NONE AND created_by_run IS NONE`,
+    ).then(([rows]) => rows ?? []),
+  ]);
+  return {
+    available: true,
+    note: `live corpus: ${revisions.length} source_revision, ${dialogues.length} dialogue с external_id`,
+    revisionSha256: new Set(revisions.map((row) => row.sha256)),
+    dialogueKeys: new Set(
+      dialogues.map((row) => `${row.harness ?? "?"}:${row.external_id}`),
+    ),
+  };
+}
+
 interface SourceState {
   target: SourceTarget;
   revisions: RevisionTarget[];
@@ -188,6 +220,39 @@ interface RecoveredThread {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? (error.stack ?? error.message) : String(error);
+}
+
+function authenticatedPreflightScope(
+  authorization: MigrationRunAuthorization,
+): AuthenticatedPreflightScope {
+  const missingRawBackups = new Map<string, string>();
+  const sourceFilesWithoutRawBackups = new Map<string, string>();
+  for (const problem of authorization.approval.evidence.problems) {
+    if (problem.table === "source_files" &&
+        problem.reason === "нет записи raw_backups (missing raw backup)") {
+      if (sourceFilesWithoutRawBackups.has(problem.recordId)) {
+        throw new Error(
+          `duplicate authenticated source-without-raw evidence: source_files:${problem.recordId}`,
+        );
+      }
+      sourceFilesWithoutRawBackups.set(problem.recordId, problem.reason);
+      continue;
+    }
+    if (problem.table !== "raw_backups" ||
+        !problem.reason.startsWith("raw backup файл отсутствует на диске: ")) {
+      continue;
+    }
+    const prior = missingRawBackups.get(problem.recordId);
+    if (prior && prior !== problem.reason) {
+      throw new Error(`conflicting authenticated missing-raw evidence: raw_backups:${problem.recordId}`);
+    }
+    missingRawBackups.set(problem.recordId, problem.reason);
+  }
+  return {
+    snapshotSha256: authorization.approval.evidence.snapshotSha256,
+    missingRawBackups,
+    sourceFilesWithoutRawBackups,
+  };
 }
 
 async function assertReportDoesNotExist(reportPath: string | undefined): Promise<void> {
@@ -489,6 +554,7 @@ async function quarantineRow(
   row: LegacySqlRow,
   reason: string,
   parser?: { name: string; version: number },
+  hostAssignmentConsumed = false,
 ): Promise<void> {
   await backend.quarantine(run, {
     table,
@@ -498,6 +564,7 @@ async function quarantineRow(
     parserName: parser?.name ?? LEGACY_MIGRATION_ADAPTER_NAME,
     parserVersion: parser?.version ?? LEGACY_MIGRATION_ADAPTER_VERSION,
     retryable: true,
+    hostAssignmentConsumed,
   });
   reconciler.classify(table, row.id, "quarantined");
 }
@@ -574,6 +641,94 @@ async function quarantineBundleChildren(
   }
 }
 
+async function quarantineCanonicalBundleChildren(
+  backend: LegacyMigrationBackend,
+  run: MigrationRunHandle,
+  reconciler: RowReconciler,
+  bundle: LegacyThreadBundle,
+  reason: string,
+  parser?: { name: string; version: number },
+): Promise<void> {
+  for (const row of bundle.messages) {
+    await quarantineRow(backend, run, reconciler, "messages", row, reason, parser);
+  }
+  for (const row of bundle.chunks) {
+    await quarantineRow(backend, run, reconciler, "message_chunks", row, reason, parser);
+  }
+}
+
+async function accountSourceOwnedThreadRecords(
+  backend: LegacyMigrationBackend,
+  run: MigrationRunHandle,
+  reconciler: RowReconciler,
+  bundle: LegacyThreadBundle,
+  targets: ReadonlyMap<string, RevisionTarget>,
+  prefetch: LegacyIdentityPrefetch,
+  failureReason: string,
+  parser?: { name: string; version: number },
+): Promise<void> {
+  const commits: MigrationIdentityCommit[] = [];
+  const unprovable: LegacyThreadRecordRow[] = [];
+  for (const row of bundle.records) {
+    const target = targets.get(String(row.id));
+    if (row.source_file_id === null || !target) {
+      unprovable.push(row);
+      continue;
+    }
+    const mapped = prefetchedLegacyIdentity(prefetch, "thread_records", String(row.id));
+    commits.push({
+      table: "thread_records",
+      legacyId: String(row.id),
+      target: target.revisionId,
+      category: mapped || !target.created ? "matched" : "inserted",
+    });
+  }
+  try {
+    if (backend.commitIdentityBatch) {
+      await backend.commitIdentityBatch(run, commits, undefined, prefetch);
+    } else {
+      for (const commit of commits) {
+        await commitRowIdentity(
+          backend,
+          run,
+          commit.table,
+          commit.legacyId,
+          commit.target,
+          commit.category,
+        );
+      }
+    }
+    for (const commit of commits) {
+      reconciler.classify("thread_records", commit.legacyId, commit.category);
+    }
+  } catch (error) {
+    for (const row of bundle.records.filter((item) =>
+      commits.some((commit) => commit.legacyId === String(item.id))
+    )) {
+      await quarantineRow(
+        backend,
+        run,
+        reconciler,
+        "thread_records",
+        row,
+        `${failureReason}: ${errorMessage(error)}`,
+        parser,
+      );
+    }
+  }
+  for (const row of unprovable) {
+    await quarantineRow(
+      backend,
+      run,
+      reconciler,
+      "thread_records",
+      row,
+      `${failureReason}: no exact source_revision ownership evidence`,
+      parser,
+    );
+  }
+}
+
 interface BundleProvenanceViolation {
   table: "thread_records" | "messages" | "message_chunks";
   id: string;
@@ -584,6 +739,7 @@ function validateBundleProvenance(
   bundle: LegacyThreadBundle,
   sourceIds: Set<number>,
   projectIds: Set<number>,
+  harness?: HarnessSlug,
 ): { threadReason?: string; rows: BundleProvenanceViolation[] } {
   const rows: BundleProvenanceViolation[] = [];
   const projectId = numberColumn(bundle.thread, "project_id", Number.NaN);
@@ -603,7 +759,13 @@ function validateBundleProvenance(
   }
   for (const row of bundle.messages) {
     const sourceRecordId = numberColumn(row, "source_record_id", Number.NaN);
-    if (Number.isFinite(sourceRecordId) && !recordIds.has(sourceRecordId)) {
+    if (harness === "codex" && !Number.isFinite(sourceRecordId)) {
+      rows.push({
+        table: "messages",
+        id: String(row.id),
+        reason: "source_record_id отсутствует; невозможно доказать Codex source locator line",
+      });
+    } else if (Number.isFinite(sourceRecordId) && !recordIds.has(sourceRecordId)) {
       rows.push({
         table: "messages",
         id: String(row.id),
@@ -611,9 +773,22 @@ function validateBundleProvenance(
       });
     }
   }
+  const messages = new Map(bundle.messages.map((row) => [row.id, row]));
   for (const row of bundle.chunks) {
-    const sourceRecordId = numberColumn(row, "source_record_id", Number.NaN);
-    if (Number.isFinite(sourceRecordId) && !recordIds.has(sourceRecordId)) {
+    let sourceRecordId = numberColumn(row, "source_record_id", Number.NaN);
+    if (harness === "codex" && !Number.isFinite(sourceRecordId)) {
+      const parent = messages.get(row.message_id);
+      sourceRecordId = parent
+        ? numberColumn(parent, "source_record_id", Number.NaN)
+        : Number.NaN;
+    }
+    if (harness === "codex" && !Number.isFinite(sourceRecordId)) {
+      rows.push({
+        table: "message_chunks",
+        id: String(row.id),
+        reason: "source_record_id отсутствует; невозможно доказать Codex source locator line",
+      });
+    } else if (Number.isFinite(sourceRecordId) && !recordIds.has(sourceRecordId)) {
       rows.push({
         table: "message_chunks",
         id: String(row.id),
@@ -848,6 +1023,7 @@ async function prepareDialogueChildren(
   recovered: RecoveredThread,
   dialogue: DialogueTarget,
   identityPrefetch: LegacyIdentityPrefetch,
+  threadRecordTargets: ReadonlyMap<string, RevisionTarget>,
 ): Promise<PreparedDialogueChildCommit[]> {
   const parser = { name: recovered.parserName, version: recovered.parserVersion };
   const prepared: PreparedDialogueChildCommit[] = [];
@@ -872,16 +1048,27 @@ async function prepareDialogueChildren(
       });
     }
   };
-  await add(
-    "thread_records",
-    bundle.records.map((row) => ({
+  const recordBindings = bundle.records.map((row) => {
+    if (row.source_file_id === null) {
+      return {
+        row,
+        target: dialogue.revisionId,
+        created: dialogue.createdRevision,
+      };
+    }
+    const exactSourceTarget = threadRecordTargets.get(String(row.id));
+    if (!exactSourceTarget) {
+      throw new Error(
+        `thread_records:${row.id} has no exact source_revision ownership evidence`,
+      );
+    }
+    return {
       row,
-      target: row.source_file_id !== null
-        ? recovered.sourceRevision.revisionId
-        : dialogue.revisionId,
-      created: recovered.sourceRevision.created || dialogue.createdRevision,
-    })),
-  );
+      target: exactSourceTarget.revisionId,
+      created: exactSourceTarget.created,
+    };
+  });
+  await add("thread_records", recordBindings);
 
   const legacyMessages = new Map(bundle.messages.map((message) => [String(message.id), message]));
   const messageBindings: Array<{ row: LegacyMessageRow; target: RecordId; created: boolean }> = [];
@@ -931,6 +1118,9 @@ export async function runLegacyMigration(
   const validatedAuthorization = await validateRunAuthorization(options, verifiedSnapshot);
   const { authorization, safety: validatedSafety, attestation } = validatedAuthorization;
   await options.backend.configureHostMappingApproval?.(authorization.hostMapping);
+  await options.backend.configureAuthenticatedPreflightScope?.(
+    authenticatedPreflightScope(authorization),
+  );
   const reader = new LegacySnapshotReader(options.snapshotPath);
   const reconciler = new RowReconciler(reader.totals);
   const recovery = { raw: 0, payload: 0, normalized: 0 };
@@ -1295,7 +1485,13 @@ export async function runLegacyMigration(
         await enforceThreadSpeedCheckpoint();
       }
       const bundle = reader.threadBundle(thread);
-      const provenance = validateBundleProvenance(bundle, sourceIds, projectIds);
+      const agent = agents.get(thread.agent_id);
+      const provenance = validateBundleProvenance(
+        bundle,
+        sourceIds,
+        projectIds,
+        agent?.slug,
+      );
       if (provenance.threadReason || provenance.rows.length > 0) {
         await quarantineInvalidBundleProvenance(
           options.backend,
@@ -1306,7 +1502,6 @@ export async function runLegacyMigration(
         );
         continue;
       }
-      const agent = agents.get(thread.agent_id);
       if (!agent) {
         await quarantineRow(
           options.backend,
@@ -1325,16 +1520,178 @@ export async function runLegacyMigration(
         );
         continue;
       }
-      const canonicalImportPolicy = canonicalImportPolicyForThread(
+      const approvedImportPolicy = canonicalImportPolicyForThread(
         bundle,
         agent.slug,
         authorization.currentLiveProbe.dialogueKeys,
         sourceById,
       );
+      const identityPrefetch = await prefetchDialogueIdentities(options.backend, bundle, run);
+      const mapped = prefetchedLegacyIdentity(
+        identityPrefetch,
+        "threads",
+        String(thread.id),
+      )?.target;
+      const preferredSource = uniqueSourceIds(bundle.records)
+        .map((id) => sources.get(id)?.target)
+        .find((source): source is SourceTarget => source !== undefined);
+      const linkedSources = uniqueSourceIds(bundle.records)
+        .map((id) => sources.get(id)?.target)
+        .filter((source): source is SourceTarget => source !== undefined);
+      const threadRecordRevisionTargets = new Map<string, RevisionTarget>();
+      for (const record of bundle.records) {
+        if (record.source_file_id === null) continue;
+        const state = sources.get(record.source_file_id);
+        const revision = state?.target.selectedRevision ?? state?.revisions.at(-1);
+        if (revision) threadRecordRevisionTargets.set(String(record.id), revision);
+      }
+      const exactSourceShaCandidates = [...new Set([
+        ...uniqueSourceIds(bundle.records).flatMap((id) =>
+          sources.get(id)?.revisions.map((revision) => revision.sha256) ?? []
+        ),
+        ...(bundle.records.length > 0
+          ? [sha256hex(`${bundle.records.map((row) => row.payload).join("\n")}\n`)]
+          : []),
+      ])];
+      let exactIdentity: Awaited<ReturnType<LegacyMigrationBackend["threadIdentityContext"]>>;
+      let exactDialogueId: RecordId | undefined;
+      let threadHostAssignmentConsumed = false;
+      try {
+        const identityContexts = linkedSources.length > 0
+          ? await Promise.all(linkedSources.map((source) =>
+              options.backend.threadIdentityContext(agent, source, thread)
+            ))
+          : [await options.backend.threadIdentityContext(agent, undefined, thread)];
+        exactIdentity = identityContexts[0]!;
+        if (identityContexts.some((identity) =>
+          String(identity.installationId) !== String(exactIdentity.installationId) ||
+          String(identity.hostId) !== String(exactIdentity.hostId) ||
+          String(identity.osAccountId) !== String(exactIdentity.osAccountId)
+        )) {
+          throw new Error(`multi-source thread identity mismatch: threads:${thread.id}`);
+        }
+        threadHostAssignmentConsumed = true;
+        exactDialogueId = await options.backend.preflightDialogueDedup({
+          thread,
+          installationId: exactIdentity.installationId,
+          sourceSha256Candidates: exactSourceShaCandidates,
+          authoritativeDialogueId: mapped,
+        });
+      } catch (error) {
+        const parser = {
+          name: LEGACY_MIGRATION_ADAPTER_NAME,
+          version: LEGACY_MIGRATION_ADAPTER_VERSION,
+        };
+        await quarantineRow(
+          options.backend,
+          run,
+          reconciler,
+          "threads",
+          thread,
+          `exact dialogue identity failed: ${errorMessage(error)}`,
+          parser,
+          threadHostAssignmentConsumed,
+        );
+        await accountSourceOwnedThreadRecords(
+          options.backend,
+          run,
+          reconciler,
+          bundle,
+          threadRecordRevisionTargets,
+          identityPrefetch,
+          `parent threads:${thread.id} exact dialogue identity failed`,
+          parser,
+        );
+        await quarantineCanonicalBundleChildren(
+          options.backend,
+          run,
+          reconciler,
+          bundle,
+          `parent threads:${thread.id} exact dialogue identity failed`,
+          parser,
+        );
+        continue;
+      }
+      if (exactDialogueId && options.backend.commitExistingDialogueRow) {
+        try {
+          const threadRecordTargets = new Map<string, RecordId>();
+          for (const [legacyId, revision] of threadRecordRevisionTargets) {
+            threadRecordTargets.set(legacyId, revision.revisionId);
+          }
+          const existingInput: ExistingDialogueWriteInput = {
+            thread,
+            agent,
+            installationId: exactIdentity.installationId,
+            dialogueId: exactDialogueId,
+            sourceSha256Candidates: exactSourceShaCandidates,
+            authoritativeDialogueId: mapped,
+            legacyIdentityPrefetch: identityPrefetch,
+            threadRecordTargets,
+          };
+          const committed = await options.backend.commitExistingDialogueRow(
+            run,
+            existingInput,
+            bundle,
+          );
+          for (const commit of committed.commits) {
+            reconciler.classify(commit.table, commit.legacyId, commit.category);
+          }
+          continue;
+        } catch (error) {
+          const parser = {
+            name: LEGACY_MIGRATION_ADAPTER_NAME,
+            version: LEGACY_MIGRATION_ADAPTER_VERSION,
+          };
+          await quarantineRow(
+            options.backend,
+            run,
+            reconciler,
+            "threads",
+            thread,
+            `existing dialogue ownership failed: ${errorMessage(error)}`,
+            parser,
+            true,
+          );
+          await accountSourceOwnedThreadRecords(
+            options.backend,
+            run,
+            reconciler,
+            bundle,
+            threadRecordRevisionTargets,
+            identityPrefetch,
+            `parent threads:${thread.id} existing dialogue ownership failed`,
+            parser,
+          );
+          await quarantineCanonicalBundleChildren(
+            options.backend,
+            run,
+            reconciler,
+            bundle,
+            `parent threads:${thread.id} existing dialogue ownership failed`,
+            parser,
+          );
+          continue;
+        }
+      }
+      const canonicalImportPolicy: DialogueWriteInput["canonicalImportPolicy"] | undefined =
+        exactDialogueId
+          ? "match_existing"
+          : approvedImportPolicy === "import_deleted"
+            ? "import_deleted"
+            // Compatibility for synthetic backends which cannot provide the
+            // ownership-only transaction. The concrete writer never admits a
+            // merely probe-listed dialogue without an exact DB identity.
+            : !options.backend.commitExistingDialogueRow
+              ? approvedImportPolicy
+              : undefined;
       if (!canonicalImportPolicy) {
+        const parser = {
+          name: HARNESS_TOOLS[agent.slug].parser.parserName,
+          version: HARNESS_TOOLS[agent.slug].parser.parserVersion,
+        };
         const reason =
-          `canonical import denied: ${agent.slug}:${thread.external_id} is absent from the ` +
-          `approved live corpus and its linked legacy sources are not all deleted_in_source`;
+          `canonical import denied: ${agent.slug}:${thread.external_id} has no exact live ` +
+          `dialogue identity and its linked legacy sources are not all deleted_in_source`;
         await quarantineRow(
           options.backend,
           run,
@@ -1342,23 +1699,30 @@ export async function runLegacyMigration(
           "threads",
           thread,
           reason,
+          parser,
+          true,
         );
-        await quarantineBundleChildren(
+        await accountSourceOwnedThreadRecords(
+          options.backend,
+          run,
+          reconciler,
+          bundle,
+          threadRecordRevisionTargets,
+          identityPrefetch,
+          `parent threads:${thread.id} canonical import denied`,
+          parser,
+        );
+        await quarantineCanonicalBundleChildren(
           options.backend,
           run,
           reconciler,
           bundle,
           `parent threads:${thread.id} canonical import denied`,
+          parser,
         );
         continue;
       }
-      const identityPrefetch = await prefetchDialogueIdentities(options.backend, bundle, run);
-      const mapped = prefetchedLegacyIdentity(
-        identityPrefetch,
-        "threads",
-        String(thread.id),
-      )?.target;
-      let preflightIdentity: Awaited<ReturnType<LegacyMigrationBackend["threadIdentityContext"]>> | undefined;
+      let preflightIdentity = exactIdentity;
       let provisionalReplay: RevisionTarget | undefined;
       let recovered: RecoveredThread;
       try {
@@ -1404,6 +1768,7 @@ export async function runLegacyMigration(
         const parser = error instanceof LegacyDialogueDedupConflictError
           ? { parserName: LEGACY_MIGRATION_ADAPTER_NAME, parserVersion: LEGACY_MIGRATION_ADAPTER_VERSION }
           : HARNESS_TOOLS[agent.slug].parser;
+        const quarantineParser = { name: parser.parserName, version: parser.parserVersion };
         await quarantineRow(
           options.backend,
           run,
@@ -1411,15 +1776,26 @@ export async function runLegacyMigration(
           "threads",
           thread,
           `recovery failed: ${errorMessage(error)}`,
-          { name: parser.parserName, version: parser.parserVersion },
+          quarantineParser,
+          true,
         );
-        await quarantineBundleChildren(
+        await accountSourceOwnedThreadRecords(
+          options.backend,
+          run,
+          reconciler,
+          bundle,
+          threadRecordRevisionTargets,
+          identityPrefetch,
+          `parent threads:${thread.id} recovery failed`,
+          quarantineParser,
+        );
+        await quarantineCanonicalBundleChildren(
           options.backend,
           run,
           reconciler,
           bundle,
           `parent threads:${thread.id} recovery failed`,
-          { name: parser.parserName, version: parser.parserVersion },
+          quarantineParser,
         );
         continue;
       }
@@ -1457,6 +1833,7 @@ export async function runLegacyMigration(
               legacyIdentityPrefetch: identityPrefetch,
               canonicalImportPolicy,
               authoritativeDialogueId: mapped,
+              threadRecordTargets: threadRecordRevisionTargets,
             },
             bundle,
           );
@@ -1482,6 +1859,7 @@ export async function runLegacyMigration(
           legacyIdentityPrefetch: identityPrefetch,
           canonicalImportPolicy,
           authoritativeDialogueId: mapped,
+          threadRecordTargets: threadRecordRevisionTargets,
         });
         const childCommits = await prepareDialogueChildren(
           run,
@@ -1490,6 +1868,7 @@ export async function runLegacyMigration(
           recovered,
           dialogue,
           identityPrefetch,
+          threadRecordRevisionTargets,
         );
         const category: MigrationCategory = mapped || !dialogue.createdDialogue ? "matched" : "inserted";
         const commits: MigrationIdentityCommit[] = [{
@@ -1554,8 +1933,19 @@ export async function runLegacyMigration(
           thread,
           `write failed: ${errorMessage(error)}`,
           quarantineParser,
+          true,
         );
-        await quarantineBundleChildren(
+        await accountSourceOwnedThreadRecords(
+          options.backend,
+          run,
+          reconciler,
+          bundle,
+          threadRecordRevisionTargets,
+          identityPrefetch,
+          `parent threads:${thread.id} write failed`,
+          quarantineParser,
+        );
+        await quarantineCanonicalBundleChildren(
           options.backend,
           run,
           reconciler,
@@ -1608,14 +1998,14 @@ export async function runLegacyMigration(
       ? await options.backend.reconciliationForRun(run, reader.totals)
       : reconciler.report();
     const hostAttribution = await options.backend.hostAttributionReport(run);
-    const committedHostRows = (["projects", "source_files", "threads"] as const)
+    const attributedHostRows = (["projects", "source_files", "threads"] as const)
       .reduce((sum, table) => {
         const counters = committedReconciliation.tables[table];
-        return sum + counters.matched + counters.inserted;
+        return sum + counters.matched + counters.inserted + counters.quarantined;
       }, 0);
     const assignmentCoverageExact = !options.backend.durableAttribution || (
       hostAttribution.uncertainty.length === 0 &&
-      hostAttribution.actualAssignments.length === committedHostRows &&
+      hostAttribution.actualAssignments.length === attributedHostRows &&
       hostAttribution.actualAssignments.length === authorization.hostMapping.assignments.length &&
       hostAttribution.actualAssignments.every((actual) => {
         const approved = authorization.hostMapping.assignments.find((candidate) =>
@@ -1709,7 +2099,7 @@ export async function runLegacyMigrationWithSurreal(
       path.resolve(options.safetyContext.archiveRoot) !== path.resolve(options.archiveRoot)) {
     throw new Error("restore safety archiveRoot does not match Surreal migration runner archiveRoot");
   }
-  const live = await probeLiveCorpusFromDb(options.db);
+  const live = await probeMigrationApprovalBaselineFromDb(options.db);
   return runLegacyMigration({
     ...options,
     authorization: options.authorization

@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { RecordId } from "surrealdb";
-import { runLegacyMigration, runLegacyMigrationWithSurreal } from "../src/migration/run.ts";
+import {
+  probeMigrationApprovalBaselineFromDb,
+  runLegacyMigration,
+  runLegacyMigrationWithSurreal,
+} from "../src/migration/run.ts";
 import { hashFile } from "../src/sources/snapshot/hashing.ts";
 import { deterministicId, sha256hex } from "../src/db/transactions.ts";
 import {
@@ -26,9 +30,10 @@ import {
   migrationApprovalKeyFingerprint,
   validateMigrationSafetyEvidence,
   writeMigrationPreflightApprovalArtifact,
+  type MigrationPreflightApproval,
 } from "../src/migration/authorization.ts";
 import { expectedSuccessfulRestoreCheckNames } from "../src/backup/restore-test.ts";
-import { buildPreflightReport, probeLiveCorpusFromDb } from "../src/migration/preflight.ts";
+import { buildPreflightReport } from "../src/migration/preflight.ts";
 import {
   ensureHarness,
   ensureHarnessInstallation,
@@ -51,6 +56,8 @@ import {
   finishLiveTestFile,
 } from "./db-test-utils.ts";
 import { isolatedRestoreTargetEvidence } from "./restore-target-fixture.ts";
+import { codexParser } from "../src/parsers/codex/index.ts";
+import { collectDialogues } from "../src/parsers/shared/parser.ts";
 
 const testDb = await dbTest();
 
@@ -94,12 +101,16 @@ function approvedHost(identity: {
 }
 
 async function authorizedOptions(
-  db: Parameters<typeof probeLiveCorpusFromDb>[0],
+  db: Parameters<typeof probeMigrationApprovalBaselineFromDb>[0],
   snapshot: ContentAddressedSnapshot,
   mappings: ApprovedLegacyHostMapping[],
   temp: string,
+  options: {
+    checkRawFiles?: boolean;
+    approval?: MigrationPreflightApproval;
+  } = {},
 ) {
-  const live = await probeLiveCorpusFromDb(db);
+  const live = await probeMigrationApprovalBaselineFromDb(db);
   const hostMapping = buildLegacyHostMappingApproval(
     snapshot.snapshotPath,
     snapshot.snapshotSha256,
@@ -118,18 +129,18 @@ async function authorizedOptions(
     snapshotSha256: snapshot.snapshotSha256,
     identity,
     live,
-    checkRawFiles: false,
+    checkRawFiles: options.checkRawFiles ?? false,
   });
-  const approvedAtMs = Date.now() - 3_000;
-  const approval = buildMigrationPreflightApproval({
+  const approval = options.approval ?? buildMigrationPreflightApproval({
     report,
     snapshotSizeBytes: snapshot.snapshotSizeBytes,
-    checkRawFiles: false,
+    checkRawFiles: options.checkRawFiles ?? false,
     liveProbe: live,
     hostMappingArtifactSha256: hostMapping.artifactSha256,
     approvedBy: "integration-test",
-    approvedAt: new Date(approvedAtMs).toISOString(),
+    approvedAt: new Date(Date.now() - 3_000).toISOString(),
   });
+  const approvedAtMs = Date.parse(approval.approvedAt);
   const suffix = crypto.randomUUID();
   const attemptId = suffix.replaceAll("-", "");
   const restoreNamespace = `baka_restore_test_${attemptId}`;
@@ -412,6 +423,7 @@ testDb("migration run: synthetic SQLite → SurrealDB, повтор без ду�
       ...(await authorizedOptions(t.db, snapshot, common.approvedHostMappings, temp)),
     });
     expect(first.status).toBe("completed");
+    expect(first.assignmentCoverageOk).toBe(true);
     expect(first.recovery).toEqual({ raw: 1, payload: 0, normalized: 0 });
     expect(first.reconciliation).toMatchObject({
       legacyTotal: 14,
@@ -1014,6 +1026,10 @@ testDb("legacy split-write APIs fail closed and stale startup removes only prove
     );
     const backend = new SurrealLegacyMigrationBackend(t.db, archiveRoot, identity, mappings);
     backend.configureHostMappingApproval(authorized.authorization.hostMapping);
+    backend.configureAuthenticatedPreflightScope({
+      snapshotSha256: snapshot.snapshotSha256,
+      missingRawBackups: new Map(),
+    });
     const run = await backend.startRun({
       legacyDbPath: snapshot.snapshotPath,
       legacyDbSha256: snapshot.snapshotSha256,
@@ -1241,6 +1257,165 @@ testDb("stale-run cleanup preserves shared live state, pointers and preexisting 
   }
 }, 30_000);
 
+testDb("legacy_missing_raw requires signed exact ENOENT and retries without duplicates", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "baka-migration-missing-backup-"));
+  const archiveRoot = path.join(temp, "archive");
+  const sha = "a".repeat(64);
+  const dbPath = path.join(temp, "missing-backup.sqlite");
+  const legacy = new Database(dbPath, { create: true });
+  createLegacySchema(legacy);
+  legacy.run(`INSERT INTO agent_systems VALUES (1, 'claude-code', 'Claude Code', 'file_tree')`);
+  legacy.run(
+    `INSERT INTO source_files VALUES (
+      1, 1, '/Users/test/.claude/projects/missing.jsonl', '/Users/test/.claude/projects',
+      'missing.jsonl', 'deleted_in_source', 123, 1, ?, NULL, '2026-01-01T00:00:00Z')`,
+    [sha],
+  );
+  legacy.run(
+    `INSERT INTO raw_backups VALUES (1, 1, ?, ?, 123, 'active')`,
+    [path.join(temp, "does-not-exist.jsonl"), sha],
+  );
+  const normalizedContent = "recovered only after exact source ownership";
+  const normalizedPayload = JSON.stringify({
+    payload: { content: [{ text: normalizedContent }] },
+  });
+  legacy.run(
+    `INSERT INTO threads VALUES (1, 1, NULL, 'missing-raw-thread', 'Missing raw', NULL, NULL)`,
+  );
+  legacy.run(
+    `INSERT INTO thread_records VALUES (10, 1, 1, 0, 'event', NULL, ?)`,
+    [normalizedPayload],
+  );
+  legacy.run(`INSERT INTO messages VALUES (20, 1, 10, NULL, 0, 'user', NULL)`);
+  legacy.run(
+    `INSERT INTO message_chunks VALUES (30, 20, 10, 0, 'text', ?, NULL, ?, ?)`,
+    [
+      "/payload/content/0/text",
+      sha256hex(normalizedContent),
+      Buffer.byteLength(normalizedContent),
+    ],
+  );
+  legacy.close();
+  const snapshot = await contentAddressSnapshot(dbPath);
+  const t = await createTestDb();
+  try {
+    const identity = {
+      hostUuid: "migration-missing-backup-host",
+      hostname: "migration-missing-backup",
+      platform: "darwin",
+      arch: "arm64",
+      osUsername: "test",
+      homePath: "/Users/test",
+    };
+    const base = {
+      db: t.db,
+      archiveRoot,
+      identity,
+      approvedHostMappings: approvedHost(identity),
+      bakaCommit: "test",
+      schemaVersion: 5,
+    };
+    const first = await runLegacyMigrationWithSurreal({
+      ...base,
+      ...snapshot,
+      ...(await authorizedOptions(t.db, snapshot, base.approvedHostMappings, temp)),
+    });
+    expect(first.status).toBe("completed_with_errors");
+    expect(first.assignmentCoverageOk).toBe(true);
+    expect(first.reconciliation.tables.raw_backups).toMatchObject({
+      inserted: 0,
+      quarantined: 1,
+      lost: 0,
+    });
+    const [revision] = await t.db.query<[
+      Array<{ id: RecordId; snapshot_kind: string; raw_archive_path?: string }>,
+    ]>("SELECT id, snapshot_kind, raw_archive_path FROM source_revision WHERE sha256 = $sha", { sha });
+    expect(revision).toHaveLength(0);
+    const [rawMapping] = await t.db.query<[Array<{ target: RecordId }>]>(
+      `SELECT target FROM legacy_identity_map
+       WHERE legacy_table = "raw_backups" AND legacy_id = "1"`,
+    );
+    expect(rawMapping).toHaveLength(0);
+    const [unprovenRecordMapping] = await t.db.query<[Array<{ target: RecordId }>]>(
+      `SELECT target FROM legacy_identity_map
+       WHERE legacy_table = "thread_records" AND legacy_id = "10"`,
+    );
+    expect(unprovenRecordMapping).toHaveLength(0);
+    expect(first.reconciliation.tables.thread_records).toMatchObject({
+      matched: 0,
+      inserted: 0,
+      quarantined: 1,
+      lost: 0,
+    });
+
+    const retry = await runLegacyMigrationWithSurreal({
+      ...base,
+      ...snapshot,
+      ...(await authorizedOptions(
+        t.db,
+        snapshot,
+        base.approvedHostMappings,
+        temp,
+        { checkRawFiles: true },
+      )),
+    });
+    expect(retry.status).toBe("completed");
+    expect(retry.reconciliation.tables.raw_backups).toMatchObject({
+      matched: 0,
+      inserted: 1,
+      quarantined: 0,
+      lost: 0,
+    });
+    expect(retry.reconciliation.tables.thread_records).toMatchObject({
+      inserted: 1,
+      quarantined: 0,
+      lost: 0,
+    });
+    const [admittedRevision] = await t.db.query<[
+      Array<{ snapshot_kind: string; raw_archive_path?: string }>,
+    ]>("SELECT snapshot_kind, raw_archive_path FROM source_revision WHERE sha256 = $sha", { sha });
+    expect(admittedRevision).toEqual([{ snapshot_kind: "legacy_missing_raw" }]);
+    const [resolved] = await t.db.query<[
+      Array<{ resolved_at?: Date; resolution?: string }>,
+    ]>(`SELECT resolved_at, resolution FROM migration_quarantine
+       WHERE lineage_key = "raw_backups:1"`);
+    expect(resolved).toHaveLength(1);
+    expect(resolved?.[0]?.resolved_at).toBeDefined();
+    expect(resolved?.[0]?.resolution).toStartWith("retry_mapped:");
+
+    const idempotent = await runLegacyMigrationWithSurreal({
+      ...base,
+      ...snapshot,
+      ...(await authorizedOptions(
+        t.db,
+        snapshot,
+        base.approvedHostMappings,
+        temp,
+        { checkRawFiles: true },
+      )),
+    });
+    expect(idempotent.status).toBe("completed");
+    expect(idempotent.reconciliation.tables.raw_backups).toMatchObject({
+      matched: 1,
+      inserted: 0,
+      quarantined: 0,
+      lost: 0,
+    });
+    const [counts] = await t.db.query<[Array<{ revisions: number; mappings: number }>]>(
+      `RETURN [{
+        revisions: count((SELECT VALUE id FROM source_revision WHERE sha256 = $sha)),
+        mappings: count((SELECT VALUE id FROM legacy_identity_map
+          WHERE legacy_table = "raw_backups" AND legacy_id = "1"))
+      }];`,
+      { sha },
+    );
+    expect(counts?.[0]).toEqual({ revisions: 1, mappings: 1 });
+  } finally {
+    await dropTestDb(t);
+    await rm(temp, { recursive: true, force: true });
+  }
+}, 30_000);
+
 testDb("legacy_missing_raw: поздний repaired backup заполняет NONE при том же SHA", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "baka-migration-repair-integration-"));
   const archiveRoot = path.join(temp, "archive");
@@ -1321,7 +1496,193 @@ testDb("legacy_missing_raw: поздний repaired backup заполняет NO
   }
 }, 30_000);
 
-testDb("existing live identity rejects a different legacy canonical revision without corpus writes", async () => {
+testDb("Codex exact live ownership rejects wrong lines and null source provenance", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "baka-migration-codex-line-ownership-"));
+  const archiveRoot = path.join(temp, "archive");
+  const rawPath = path.join(import.meta.dir, "fixtures", "codex", "basic-dialogue.jsonl");
+  const raw = await readFile(rawPath, "utf8");
+  const parsed = (await collectDialogues(await codexParser.parse(rawPath)))[0]!;
+  if (!parsed.externalId) throw new Error("Codex fixture dialogue has no external id");
+  const externalId = parsed.externalId;
+  const legacyMessage = parsed.messages.find((message) =>
+    message.role === "user" && message.humanAuthored === true &&
+    message.chunks.some((chunk) => chunk.kind === "text")
+  )!;
+  const legacyChunk = legacyMessage.chunks.find((chunk) => chunk.kind === "text")!;
+  const sourceLine = Number(legacyChunk.sourceLocator?.match(/#L(\d+)$/u)?.[1]);
+  expect(Number.isSafeInteger(sourceLine)).toBe(true);
+
+  const makeSnapshot = async (
+    name: string,
+    baseId: number,
+    withNormalizedOwnership: boolean,
+    nullSourceProvenance = false,
+  ): Promise<ContentAddressedSnapshot> => {
+    const rawHash = await hashFile(rawPath);
+    const dbPath = path.join(temp, `${name}.sqlite`);
+    const legacy = new Database(dbPath, { create: true });
+    createLegacySchema(legacy);
+    legacy.run(`INSERT INTO agent_systems VALUES (1, 'codex', 'Codex', 'jsonl')`);
+    legacy.run(
+      `INSERT INTO source_files VALUES (
+        ?, 1, ?, '/Users/test/.codex/sessions', ?, 'deleted_in_source', ?, 1, ?, ?,
+        '2026-01-01T00:00:00Z')`,
+      [
+        baseId,
+        `/Users/test/.codex/sessions/${name}.jsonl`,
+        `${name}.jsonl`,
+        rawHash.sizeBytes,
+        rawHash.sha256,
+        rawHash.headHash,
+      ],
+    );
+    legacy.run(
+      `INSERT INTO raw_backups VALUES (?, ?, ?, ?, ?, 'active')`,
+      [baseId, baseId, rawPath, rawHash.sha256, rawHash.sizeBytes],
+    );
+    legacy.run(
+      `INSERT INTO threads VALUES (?, 1, NULL, ?, 'Codex line ownership', NULL, NULL)`,
+      [baseId, externalId],
+    );
+    for (const [index, payload] of raw.trimEnd().split("\n").entries()) {
+      legacy.run(
+        `INSERT INTO thread_records VALUES (?, ?, ?, ?, 'event', NULL, ?)`,
+        [baseId * 100 + index, baseId, baseId, index, payload],
+      );
+    }
+    if (withNormalizedOwnership) {
+      const messageId = baseId * 1_000 + 1;
+      const chunkId = baseId * 1_000 + 2;
+      const sourceRecordId = nullSourceProvenance
+        ? null
+        : baseId * 100 + sourceLine - 1;
+      legacy.run(
+        `INSERT INTO messages VALUES (?, ?, ?, NULL, ?, ?, NULL)`,
+        [messageId, baseId, sourceRecordId, legacyMessage.sequence, legacyMessage.role],
+      );
+      legacy.run(
+        `INSERT INTO message_chunks VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+        [
+          chunkId,
+          messageId,
+          sourceRecordId,
+          legacyChunk.sequence,
+          legacyChunk.rawKind ?? legacyChunk.kind,
+          sha256hex(legacyChunk.content ?? ""),
+          Buffer.byteLength(legacyChunk.content ?? ""),
+        ],
+      );
+    }
+    legacy.close();
+    return contentAddressSnapshot(dbPath);
+  };
+
+  const liveSnapshot = await makeSnapshot("live-codex", 10, false);
+  const ownershipSnapshot = await makeSnapshot("legacy-codex", 20, true);
+  const nullOwnershipSnapshot = await makeSnapshot("null-codex", 30, true, true);
+  const t = await createTestDb();
+  try {
+    const identity = {
+      hostUuid: "migration-codex-line-host",
+      hostname: "migration-codex-line-host",
+      platform: "darwin",
+      arch: "arm64",
+      osUsername: "test",
+      homePath: "/Users/test",
+    };
+    const base = {
+      db: t.db,
+      archiveRoot,
+      identity,
+      approvedHostMappings: approvedHost(identity),
+      bakaCommit: "test",
+      schemaVersion: 5,
+    };
+    const live = await runLegacyMigrationWithSurreal({
+      ...base,
+      ...liveSnapshot,
+      ...(await authorizedOptions(t.db, liveSnapshot, base.approvedHostMappings, temp)),
+    });
+    expect(live.status).toBe("completed");
+    const [canonicalMessage] = await t.db.query<[Array<{ id: RecordId }>]>(
+      "SELECT id FROM message WHERE sequence = $sequence LIMIT 1",
+      { sequence: legacyMessage.sequence },
+    );
+    expect(canonicalMessage).toHaveLength(1);
+    await t.db.query(
+      "UPDATE chunk SET source_locator = $locator WHERE message = $message",
+      {
+        locator: (legacyChunk.sourceLocator ?? "/immutable/codex.jsonl#L1")
+          .replace(/#L\d+$/u, "#L999"),
+        message: canonicalMessage?.[0]?.id,
+      },
+    );
+
+    const rejected = await runLegacyMigrationWithSurreal({
+      ...base,
+      ...ownershipSnapshot,
+      ...(await authorizedOptions(t.db, ownershipSnapshot, base.approvedHostMappings, temp)),
+    });
+    expect(rejected.status).toBe("completed_with_errors");
+    expect(rejected.reconciliation.tables.threads).toMatchObject({ quarantined: 1, lost: 0 });
+    expect(rejected.reconciliation.tables.messages).toMatchObject({ quarantined: 1, lost: 0 });
+    expect(rejected.reconciliation.tables.message_chunks).toMatchObject({ quarantined: 1, lost: 0 });
+    const [wrongLineMappings] = await t.db.query<[number]>(
+      `RETURN count((SELECT VALUE id FROM legacy_identity_map WHERE
+        (legacy_table = "threads" AND legacy_id = "20") OR
+        (legacy_table = "messages" AND legacy_id = "20001") OR
+        (legacy_table = "message_chunks" AND legacy_id = "20002")));`,
+    );
+    expect(wrongLineMappings).toBe(0);
+    const [revisionCount] = await t.db.query<[number]>(
+      "RETURN count((SELECT VALUE id FROM dialogue_revision));",
+    );
+    expect(revisionCount).toBe(1);
+
+    await t.db.query(
+      "UPDATE chunk SET source_locator = $locator WHERE message = $message",
+      { locator: legacyChunk.sourceLocator, message: canonicalMessage?.[0]?.id },
+    );
+    const retry = await runLegacyMigrationWithSurreal({
+      ...base,
+      ...ownershipSnapshot,
+      ...(await authorizedOptions(t.db, ownershipSnapshot, base.approvedHostMappings, temp)),
+    });
+    expect(retry.status).toBe("completed");
+    expect(retry.reconciliation.tables.threads).toMatchObject({ matched: 1, quarantined: 0 });
+    expect(retry.reconciliation.tables.messages).toMatchObject({ matched: 1, quarantined: 0 });
+    expect(retry.reconciliation.tables.message_chunks).toMatchObject({ matched: 1, quarantined: 0 });
+
+    await t.db.query(
+      "UPDATE chunk SET source_locator = $locator WHERE message = $message",
+      {
+        locator: (legacyChunk.sourceLocator ?? "/immutable/codex.jsonl#L1")
+          .replace(/#L\d+$/u, "#L999"),
+        message: canonicalMessage?.[0]?.id,
+      },
+    );
+    const nullRejected = await runLegacyMigrationWithSurreal({
+      ...base,
+      ...nullOwnershipSnapshot,
+      ...(await authorizedOptions(t.db, nullOwnershipSnapshot, base.approvedHostMappings, temp)),
+    });
+    expect(nullRejected.status).toBe("completed_with_errors");
+    expect(nullRejected.reconciliation.tables.messages).toMatchObject({ quarantined: 1, lost: 0 });
+    expect(nullRejected.reconciliation.tables.message_chunks).toMatchObject({ quarantined: 1, lost: 0 });
+    const [nullProvenanceMappings] = await t.db.query<[number]>(
+      `RETURN count((SELECT VALUE id FROM legacy_identity_map WHERE
+        (legacy_table = "threads" AND legacy_id = "30") OR
+        (legacy_table = "messages" AND legacy_id = "30001") OR
+        (legacy_table = "message_chunks" AND legacy_id = "30002")));`,
+    );
+    expect(nullProvenanceMappings).toBe(0);
+  } finally {
+    await dropTestDb(t);
+    await rm(temp, { recursive: true, force: true });
+  }
+}, 30_000);
+
+testDb("exact live identity owns historical legacy rows without canonical writes and retries idempotently", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "baka-migration-history-integration-"));
   const archiveRoot = path.join(temp, "archive");
   const rawA = path.join(import.meta.dir, "fixtures", "claude-code", "basic-dialogue.jsonl");
@@ -1406,19 +1767,58 @@ testDb("existing live identity rejects a different legacy canonical revision wit
       Array<{ current_revision: RecordId }>,
     ]>("SELECT current_revision FROM dialogue LIMIT 1");
     const current = String(before?.[0]?.current_revision);
+    const [priorMigration] = await t.db.query<[Array<{ id: RecordId }>]>(
+      "SELECT id, started_at FROM migration_meta ORDER BY started_at DESC LIMIT 1",
+    );
+    await t.db.query(
+      `CREATE ONLY migration_quarantine:historical_thread SET migration = $migration,
+         legacy_table = "threads", legacy_id = "20", raw_payload = {},
+         reason = "historical ownership retry", parser_name = "legacy", parser_version = "1",
+         retryable = true, attempts = 1, lineage_key = "threads:20",
+         first_failed_at = time::now(), last_failed_at = time::now();
+       CREATE ONLY migration_quarantine:historical_record SET migration = $migration,
+         legacy_table = "thread_records", legacy_id = "2000", raw_payload = {},
+         reason = "historical ownership retry", parser_name = "legacy", parser_version = "1",
+         retryable = true, attempts = 1, lineage_key = "thread_records:2000",
+         first_failed_at = time::now(), last_failed_at = time::now();`,
+      { migration: priorMigration?.[0]?.id },
+    );
 
-    const rejected = await runLegacyMigrationWithSurreal({
+    const ownershipAuthorization = await authorizedOptions(
+      t.db,
+      legacySnapshot,
+      base.approvedHostMappings,
+      temp,
+    );
+    const firstOwnership = await runLegacyMigrationWithSurreal({
       ...base,
       ...legacySnapshot,
-      ...(await authorizedOptions(t.db, legacySnapshot, base.approvedHostMappings, temp)),
+      ...ownershipAuthorization,
     });
-    expect(rejected.status).toBe("completed_with_errors");
-    expect(rejected.reconciliation.tables.threads).toMatchObject({
-      matched: 0,
+    expect(firstOwnership.status).toBe("completed");
+    expect(firstOwnership.assignmentCoverageOk).toBe(true);
+    expect(firstOwnership.reconciliation.tables.threads).toMatchObject({
+      matched: 1,
       inserted: 0,
-      quarantined: 1,
+      quarantined: 0,
       lost: 0,
     });
+    expect(firstOwnership.reconciliation.tables.thread_records).toMatchObject({
+      matched: (await readFile(rawB, "utf8")).trimEnd().split("\n").length,
+      inserted: 0,
+      quarantined: 0,
+      lost: 0,
+    });
+    const [resolvedLineage] = await t.db.query<[
+      Array<{ resolved_at?: Date; resolution?: string }>,
+    ]>(`SELECT resolved_at, resolution FROM migration_quarantine WHERE id IN [
+      migration_quarantine:historical_thread,
+      migration_quarantine:historical_record
+    ]`);
+    expect(resolvedLineage).toHaveLength(2);
+    expect(resolvedLineage?.every((row) =>
+      row.resolved_at !== undefined && row.resolution?.startsWith("retry_mapped:") === true
+    )).toBe(true);
     const [after] = await t.db.query<[
       Array<{ current_revision: RecordId }>,
     ]>("SELECT current_revision FROM dialogue LIMIT 1");
@@ -1433,6 +1833,56 @@ testDb("existing live identity rejects a different legacy canonical revision wit
       { current: before?.[0]?.current_revision },
     );
     expect(nonCurrentSearch).toBe(0);
+
+    const retryAuthorization = await authorizedOptions(
+      t.db,
+      legacySnapshot,
+      base.approvedHostMappings,
+      temp,
+      { approval: ownershipAuthorization.authorization.approval },
+    );
+    const secondOwnership = await runLegacyMigrationWithSurreal({
+      ...base,
+      ...legacySnapshot,
+      ...retryAuthorization,
+    });
+    expect(secondOwnership.status).toBe("completed");
+    expect(secondOwnership.reconciliation).toMatchObject({
+      inserted: 0,
+      quarantined: 0,
+      lost: 0,
+      ok: true,
+    });
+    const [countsAfterRetry] = await t.db.query<[
+      Array<{ revisions: number; dialogues: number; mappings: number }>,
+    ]>(`RETURN [{
+      revisions: count((SELECT VALUE id FROM dialogue_revision)),
+      dialogues: count((SELECT VALUE id FROM dialogue)),
+      mappings: count((SELECT VALUE id FROM legacy_identity_map
+        WHERE legacy_table IN ["threads", "thread_records"]))
+    }];`);
+    expect(countsAfterRetry?.[0]).toEqual({
+      revisions: 1,
+      dialogues: 1,
+      mappings: 2 * (1 + (await readFile(rawB, "utf8")).trimEnd().split("\n").length),
+    });
+
+    const [liveDialogue] = await t.db.query<[
+      Array<{ harness_installation: RecordId }>,
+    ]>("SELECT harness_installation FROM dialogue LIMIT 1");
+    await t.db.query(
+      `CREATE ONLY dialogue:external_non_migration_drift SET
+       identity_key = "external:drift", harness_installation = $installation,
+       external_id = "external-non-migration-drift",
+       first_seen_at = time::now(), last_seen_at = time::now()`,
+      { installation: liveDialogue?.[0]?.harness_installation },
+    );
+    await expect(runLegacyMigrationWithSurreal({
+      ...base,
+      ...legacySnapshot,
+      ...retryAuthorization,
+      reportPath: path.join(temp, `migration-report-drift-${crypto.randomUUID()}.json`),
+    })).rejects.toThrow("live-probe evidence stale");
   } finally {
     await dropTestDb(t);
     await rm(temp, { recursive: true, force: true });
@@ -1508,6 +1958,196 @@ testDb("payload replay uses dedicated provenance and cannot repair same-SHA lega
     expect(String(original?.current_revision)).toBe(String(originalRevision?.id));
     expect(replayRevision?.snapshot_kind).toBe("legacy_migration_replay");
     expect(replayRevision?.raw_archive_path).toMatch(/^raw\/claude-code\//);
+  } finally {
+    await dropTestDb(t);
+    await rm(temp, { recursive: true, force: true });
+  }
+}, 30_000);
+
+testDb("multi-source thread records bind to their own exact source revision", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "baka-migration-multi-source-"));
+  const archiveRoot = path.join(temp, "archive");
+  const dbPath = path.join(temp, "multi-source.sqlite");
+  const legacy = new Database(dbPath, { create: true });
+  createLegacySchema(legacy);
+  legacy.run(`INSERT INTO agent_systems VALUES (1, 'claude-code', 'Claude Code', 'file_tree')`);
+  for (const id of [1, 2]) {
+    legacy.run(
+      `INSERT INTO source_files VALUES (
+        ?, 1, ?, '/Users/test/.claude', ?, 'deleted_in_source', 10, ?, ?, NULL,
+        '2026-01-01T00:00:00Z')`,
+      [id, `/Users/test/.claude/multi-${id}.jsonl`, `multi-${id}.jsonl`, id, String(id).repeat(64)],
+    );
+  }
+  legacy.run(`INSERT INTO threads VALUES (1, 1, NULL, 'multi-source-thread', 'Multi', NULL, NULL)`);
+  legacy.run(`INSERT INTO thread_records VALUES (10, 1, 1, 0, 'event', NULL, ?)`, [
+    JSON.stringify({ source: 1 }),
+  ]);
+  legacy.run(`INSERT INTO thread_records VALUES (11, 1, 2, 1, 'event', NULL, ?)`, [
+    JSON.stringify({ source: 2 }),
+  ]);
+  legacy.close();
+  const snapshot = await contentAddressSnapshot(dbPath);
+  const identity = {
+    hostUuid: "multi-source-host",
+    hostname: "multi-source-host",
+    platform: "darwin",
+    arch: "arm64",
+    osUsername: "test",
+    homePath: "/Users/test",
+  };
+  const mappings = [{
+    mappingId: "multi-source-host",
+    host: identity,
+    sourceFileIds: [1, 2],
+  }];
+  const t = await createTestDb();
+  try {
+    const report = await runLegacyMigrationWithSurreal({
+      db: t.db,
+      archiveRoot,
+      identity,
+      ...snapshot,
+      ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
+      bakaCommit: "test",
+      schemaVersion: 5,
+      recoverSnapshot: async (input) => input.source === "payload"
+        ? {
+            externalId: input.threadExternalId,
+            messages: [{
+              sequence: 0,
+              role: "user",
+              humanAuthored: true,
+              visibleToUser: true,
+              chunks: [{ sequence: 0, kind: "text", content: "multi", metadata: {} }],
+              usageEvents: [],
+              metadata: {},
+            }],
+            metadata: {},
+          }
+        : undefined,
+    });
+    expect(report.status).toBe("completed");
+    expect(report.assignmentCoverageOk).toBe(true);
+    const [rows] = await t.db.query<[Array<{
+      legacy_id: string;
+      target: RecordId;
+      location: RecordId;
+    }>]>(`SELECT legacy_id, target, target.source_location AS location
+       FROM legacy_identity_map WHERE legacy_table = "thread_records" ORDER BY legacy_id`);
+    const [sources] = await t.db.query<[Array<{ legacy_id: string; target: RecordId }>]>(
+      `SELECT legacy_id, target FROM legacy_identity_map
+       WHERE legacy_table = "source_files" ORDER BY legacy_id`,
+    );
+    expect(rows).toHaveLength(2);
+    expect(sources).toHaveLength(2);
+    expect(String(rows?.[0]?.location)).toBe(String(sources?.[0]?.target));
+    expect(String(rows?.[1]?.location)).toBe(String(sources?.[1]?.target));
+    expect(String(rows?.[0]?.target)).not.toBe(String(rows?.[1]?.target));
+  } finally {
+    await dropTestDb(t);
+    await rm(temp, { recursive: true, force: true });
+  }
+}, 30_000);
+
+testDb("active denial and deleted no-message failure preserve exact source-owned records", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "baka-migration-source-owned-exclusions-"));
+  const archiveRoot = path.join(temp, "archive");
+  const dbPath = path.join(temp, "source-owned.sqlite");
+  const legacy = new Database(dbPath, { create: true });
+  createLegacySchema(legacy);
+  legacy.run(`INSERT INTO agent_systems VALUES (1, 'claude-code', 'Claude Code', 'file_tree')`);
+  legacy.run(
+    `INSERT INTO source_files VALUES
+     (1, 1, '/Users/test/.claude/active.jsonl', '/Users/test/.claude', 'active.jsonl',
+      'active', 10, 1, ?, NULL, NULL),
+     (2, 1, '/Users/test/.claude/deleted.jsonl', '/Users/test/.claude', 'deleted.jsonl',
+      'deleted_in_source', 10, 2, ?, NULL, '2026-01-01T00:00:00Z')`,
+    ["a".repeat(64), "b".repeat(64)],
+  );
+  legacy.run(
+    `INSERT INTO threads VALUES
+     (1, 1, NULL, 'active-non-dialogue', 'Active artifact', NULL, NULL),
+     (2, 1, NULL, 'deleted-no-message', 'Deleted empty', NULL, NULL)`,
+  );
+  legacy.run(
+    `INSERT INTO thread_records VALUES
+     (10, 1, 1, 0, 'event', NULL, ?),
+     (20, 2, 2, 0, 'event', NULL, ?)`,
+    [JSON.stringify({ text: "active artifact" }), "not-json"],
+  );
+  legacy.run(`INSERT INTO messages VALUES (100, 1, 10, NULL, 0, 'user', NULL)`);
+  legacy.run(
+    `INSERT INTO message_chunks VALUES (1000, 100, 10, 0, 'input_text', '/text', NULL, ?, ?)`,
+    [sha256hex("active artifact"), Buffer.byteLength("active artifact")],
+  );
+  legacy.close();
+  const snapshot = await contentAddressSnapshot(dbPath);
+  const identity = {
+    hostUuid: "source-owned-host",
+    hostname: "source-owned-host",
+    platform: "darwin",
+    arch: "arm64",
+    osUsername: "test",
+    homePath: "/Users/test",
+  };
+  const mappings = [{ mappingId: "source-owned", host: identity, sourceFileIds: [1, 2] }];
+  const t = await createTestDb();
+  try {
+    const authorized = await authorizedOptions(t.db, snapshot, mappings, temp);
+    const common = {
+      db: t.db,
+      archiveRoot,
+      identity,
+      ...snapshot,
+      bakaCommit: "test",
+      schemaVersion: 5,
+      recoverSnapshot: async () => undefined,
+    };
+    const first = await runLegacyMigrationWithSurreal({ ...common, ...authorized });
+    expect(first.status).toBe("completed_with_errors");
+    expect(first.assignmentCoverageOk).toBe(true);
+    expect(first.reconciliation.tables.threads).toMatchObject({ quarantined: 2, lost: 0 });
+    expect(first.reconciliation.tables.thread_records).toMatchObject({
+      inserted: 2,
+      quarantined: 0,
+      lost: 0,
+    });
+    expect(first.reconciliation.tables.messages).toMatchObject({ quarantined: 1, lost: 0 });
+    expect(first.reconciliation.tables.message_chunks).toMatchObject({ quarantined: 1, lost: 0 });
+    const [firstCounts] = await t.db.query<[Array<{ dialogues: number; recordMaps: number }>]>(
+      `RETURN [{
+        dialogues: count((SELECT VALUE id FROM dialogue)),
+        recordMaps: count((SELECT VALUE id FROM legacy_identity_map
+          WHERE legacy_table = "thread_records"))
+      }];`,
+    );
+    expect(firstCounts?.[0]).toEqual({ dialogues: 0, recordMaps: 2 });
+
+    const retryAuthorization = await authorizedOptions(
+      t.db,
+      snapshot,
+      mappings,
+      temp,
+      { approval: authorized.authorization.approval },
+    );
+    const retry = await runLegacyMigrationWithSurreal({ ...common, ...retryAuthorization });
+    expect(retry.status).toBe("completed_with_errors");
+    expect(retry.assignmentCoverageOk).toBe(true);
+    expect(retry.reconciliation.tables.thread_records).toMatchObject({
+      matched: 2,
+      inserted: 0,
+      quarantined: 0,
+      lost: 0,
+    });
+    const [retryCounts] = await t.db.query<[Array<{ dialogues: number; recordMaps: number }>]>(
+      `RETURN [{
+        dialogues: count((SELECT VALUE id FROM dialogue)),
+        recordMaps: count((SELECT VALUE id FROM legacy_identity_map
+          WHERE legacy_table = "thread_records"))
+      }];`,
+    );
+    expect(retryCounts?.[0]).toEqual(firstCounts?.[0]);
   } finally {
     await dropTestDb(t);
     await rm(temp, { recursive: true, force: true });
@@ -2015,10 +2655,11 @@ testDb("runtime consumes exact source_relation/project_relation assignments", as
       lost: 0,
     });
     expect(report.hostAttribution.actualAssignments).toEqual(
-      authorized.authorization.hostMapping.assignments.filter((row) => row.legacyId !== "2"),
+      authorized.authorization.hostMapping.assignments,
     );
+    expect(report.assignmentCoverageOk).toBe(true);
     expect(report.hostAttribution.approvedMappings).toEqual([
-      { mappingId: "host-a", hostUuid: "relational-host", attributedRows: 3 },
+      { mappingId: "host-a", hostUuid: "relational-host", attributedRows: 4 },
     ]);
   } finally {
     await dropTestDb(t);
@@ -2509,7 +3150,7 @@ testDb("all reliable dialogue keys must agree before any corpus/model/search wri
       legacy_replay_revision: undefined,
     });
     expect(afterAgree.counts.legacy_replay_revision).toBe(
-      Number(beforeConflict.counts.legacy_replay_revision) + 1,
+      beforeConflict.counts.legacy_replay_revision,
     );
     const agreeRerun = await runLegacyMigrationWithSurreal({
       ...agreeCommon,

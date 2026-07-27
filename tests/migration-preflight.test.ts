@@ -286,6 +286,27 @@ describe("migration preflight report (§15.2)", () => {
     expect(report.missingRawBackup.fileMissingOnDisk).toBe(1); // rb2
   });
 
+  test("preflight signs only typed ENOENT as missing, not other stat failures", async () => {
+    const snapshot = await ensureLegacySnapshot(legacyDbPath, archiveRoot);
+    const accessDenied = Object.assign(new Error("permission denied"), { code: "EACCES" });
+    const analysis = await analyzeLegacySnapshot(snapshot.snapshotPath, IDENTITY, {
+      snapshotSha256: snapshot.sha256,
+      checkRawFiles: true,
+      rawFileStat: async (rawPath) => {
+        if (rawPath === "/nonexistent/raw/b.jsonl") throw accessDenied;
+        return {};
+      },
+    });
+    expect(analysis.missingRawBackup.fileMissingOnDisk).toBe(0);
+    const statFailure = analysis.problems.find((problem) =>
+      problem.table === "raw_backups" && problem.recordId === "2"
+    );
+    expect(statFailure?.reason).toBe(
+      "raw backup stat failed (EACCES): /nonexistent/raw/b.jsonl",
+    );
+    expect(statFailure?.reason.startsWith("raw backup файл отсутствует на диске: ")).toBe(false);
+  });
+
   test("каждая проблема с конкретным record ID", () => {
     const key = (p: { table: string; recordId: string }) => `${p.table}:${p.recordId}`;
     const keys = new Set(report.problems.map(key));

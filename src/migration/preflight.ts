@@ -297,9 +297,15 @@ function tableRecon(total: number, seen: number, withProblems: number): TableRec
 export async function analyzeLegacySnapshot(
   snapshotPath: string,
   identity: LocalIdentity,
-  options: { snapshotSha256?: string; checkRawFiles?: boolean } = {},
+  options: {
+    snapshotSha256?: string;
+    checkRawFiles?: boolean;
+    /** Test seam; production always uses node:fs/promises stat. */
+    rawFileStat?: (rawPath: string) => Promise<unknown>;
+  } = {},
 ): Promise<LegacyAnalysis> {
   const checkRawFiles = options.checkRawFiles ?? true;
+  const rawFileStat = options.rawFileStat ?? stat;
   const problems: PreflightProblem[] = [];
   const db = new Database(snapshotPath, { readonly: true });
   try {
@@ -475,27 +481,39 @@ export async function analyzeLegacySnapshot(
       }
     }
     const backupProblems = new Set<number>();
-    const fileExists = new Map<string, boolean>();
+    const fileStatus = new Map<string, {
+      status: "present" | "missing" | "stat_error";
+      errorCode?: string;
+    }>();
     const backupFileOk = new Map<number, boolean>(); // source_file_id → файл есть
     if (checkRawFiles) {
       for (const rb of backupPaths) {
-        let ok = fileExists.get(rb.archive_path);
-        if (ok === undefined) {
+        let observed = fileStatus.get(rb.archive_path);
+        if (observed === undefined) {
           try {
-            await stat(rb.archive_path);
-            ok = true;
-          } catch {
-            ok = false;
+            await rawFileStat(rb.archive_path);
+            observed = { status: "present" };
+          } catch (error) {
+            const errorCode = typeof (error as NodeJS.ErrnoException | undefined)?.code === "string"
+              ? (error as NodeJS.ErrnoException).code
+              : undefined;
+            observed = {
+              status: errorCode === "ENOENT" ? "missing" : "stat_error",
+              ...(errorCode ? { errorCode } : {}),
+            };
           }
-          fileExists.set(rb.archive_path, ok);
+          fileStatus.set(rb.archive_path, observed);
         }
+        const ok = observed.status === "present";
         backupFileOk.set(rb.source_file_id, ok);
         if (!ok) {
           backupProblems.add(rb.id);
           problems.push({
             table: "raw_backups",
             recordId: String(rb.id),
-            reason: `raw backup файл отсутствует на диске: ${rb.archive_path}`,
+            reason: observed.status === "missing"
+              ? `raw backup файл отсутствует на диске: ${rb.archive_path}`
+              : `raw backup stat failed (${observed.errorCode ?? "UNKNOWN"}): ${rb.archive_path}`,
           });
         }
       }
@@ -806,7 +824,7 @@ export async function analyzeLegacySnapshot(
       missingRawBackup: {
         withoutBackupRow: withoutBackup.length,
         fileMissingOnDisk: checkRawFiles
-          ? [...fileExists.values()].filter((ok) => !ok).length
+          ? [...fileStatus.values()].filter((observed) => observed.status === "missing").length
           : 0,
       },
       withinLegacy: {
