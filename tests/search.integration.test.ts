@@ -2,8 +2,8 @@
  * Integration-тесты full-text search (этап 6, docs/plan.md §12, §14) на
  * живом SurrealDB: BM25 по search_document находит известные фразы,
  * фильтры работают, сегментированный длинный документ находится по фразе
- * из середины, старые revisions не в обычной выдаче, reasoning/tool/system
- * контент — только через forensic mode, rebuild пересоздаёт projection.
+ * из середины, старые revisions не в обычной выдаче, а отключённый глобальный
+ * forensic mode fail closed без scan; rebuild пересоздаёт projection.
  * Плюс: vector over-fetch при активных фильтрах §14 (документ вне
  * глобального top-50 находится с --harness), vector mode уважает limit,
  * provider ↔ space сопоставляется включая provider.
@@ -11,7 +11,8 @@
  * hybrid pipeline (diversification) выполняются всегда.
  */
 
-import { beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { RecordId } from "surrealdb";
 import type { ParsedDialogue, ParsedMessage } from "../src/domain/canonical-types.ts";
 import {
@@ -42,15 +43,24 @@ import {
 import {
   dedupByMessage,
   diversifyByDialogue,
+  searchHybrid,
   searchVector,
   VectorSearchUnavailable,
 } from "../src/search/hybrid.ts";
 import { rebuildSearchProjection } from "../src/search/rebuild.ts";
 import { SEGMENTATION_VERSION } from "../src/search/segmenter.ts";
+import { computeSearchCorpusFingerprint } from "../src/search/evaluation.ts";
 import type { EmbeddingProvider } from "../src/embeddings/provider.ts";
-import { createSpace } from "../src/embeddings/spaces.ts";
+import { createSpace, physicalTableName } from "../src/embeddings/spaces.ts";
 import { selectAll, selectOne } from "../src/db/repositories/helpers.ts";
-import { createTestDb, dbTest, dropTestDb, isDbAvailable, type TestDb } from "./db-test-utils.ts";
+import {
+  createTestDb,
+  dbTest,
+  dropTestDb,
+  finishLiveTestFile,
+  isDbAvailable,
+  type TestDb,
+} from "./db-test-utils.ts";
 
 // Прогрев кеша доступности; сами тесты регистрируются через testDb.
 beforeAll(async () => {
@@ -59,6 +69,10 @@ beforeAll(async () => {
 
 /** `test` при живой БД, иначе явный `test.skip` (проверка один раз на файл). */
 const testDb = await dbTest();
+
+afterAll(async () => {
+  await finishLiveTestFile();
+});
 
 const USER_PHRASE = "запечённые яблоки с корицей";
 const MIDDLE_MARKER = "срединный маркер абракадабра";
@@ -117,6 +131,7 @@ function dialogueV1(externalId: string): ParsedDialogue {
           vendor: "moonshot",
           canonicalName: "k3",
           serviceProvider: "kimi",
+          reasoningEffort: "high",
         },
         chunks: [
           { sequence: 0, kind: "thought", content: REASONING_MARKER, metadata: {} },
@@ -270,6 +285,37 @@ async function seedV1(t: TestDb, externalId: string) {
 }
 
 describe("full-text search (integration)", () => {
+  testDb("search corpus fingerprint детерминирован и замечает projection drift", async () => {
+    const t = await createTestDb();
+    try {
+      await seedV1(t, "session_fingerprint");
+      const first = await computeSearchCorpusFingerprint(t.db, 1);
+      const repeated = await computeSearchCorpusFingerprint(t.db, 2);
+      expect(repeated).toEqual(first);
+      expect(first.documents).toBeGreaterThan(1);
+      await t.db.query(
+        "UPDATE search_document SET content_sha256 = $sha WHERE id = (SELECT VALUE id FROM search_document ORDER BY id LIMIT 1)[0]",
+        { sha: "f".repeat(64) },
+      );
+      await expect(computeSearchCorpusFingerprint(t.db, 2)).rejects.toThrow(
+        /stored content hash mismatch/,
+      );
+      const replacement = "валидный projection drift";
+      await t.db.query(
+        "UPDATE search_document SET content = $content, content_sha256 = $sha WHERE id = (SELECT VALUE id FROM search_document ORDER BY id LIMIT 1)[0]",
+        {
+          content: replacement,
+          sha: createHash("sha256").update(replacement).digest("hex"),
+        },
+      );
+      const drifted = await computeSearchCorpusFingerprint(t.db, 2);
+      expect(drifted.documents).toBe(first.documents);
+      expect(drifted.sha256).not.toBe(first.sha256);
+    } finally {
+      await dropTestDb(t);
+    }
+  });
+
   testDb("обычный поиск находит известную фразу, контекст и фильтры работают", async () => {
     const t = await createTestDb();
     try {
@@ -283,7 +329,12 @@ describe("full-text search (integration)", () => {
       expect(hit.dialogueTitle).toBe("Поисковый диалог");
       expect(hit.harness).toBe("kimi-code");
       expect(hit.host).toBe("search-host");
+      expect(hit.user).toBe("example");
       expect(hit.workspace).toBe("project");
+      expect(hit.vendor).toBe("moonshot");
+      expect(hit.role).toBe("user");
+      expect(hit.reasoningEffort).toBeUndefined();
+      expect(hit.sourcePath).toBe("/tmp/sessions/wd_x/session_s/agents/main/wire.jsonl");
       expect(hit.revisionId).toContain("dialogue_revision:");
       expect(hit.timestamp).toContain("2026-07-20");
 
@@ -294,6 +345,15 @@ describe("full-text search (integration)", () => {
       expect(await searchText(t.db, "яблоки", filters({ workspace: "other" }))).toHaveLength(0);
       expect(await searchText(t.db, "яблоки", filters({ host: "search-host" }))).toHaveLength(1);
       expect(await searchText(t.db, "яблоки", filters({ host: "other-host" }))).toHaveLength(0);
+      expect(await searchText(t.db, "яблоки", filters({ user: "example" }))).toHaveLength(1);
+      expect(await searchText(t.db, "яблоки", filters({ user: "other" }))).toHaveLength(0);
+      expect(await searchText(t.db, "яблоки", filters({ vendor: "moonshot" }))).toHaveLength(1);
+      expect(await searchText(t.db, "яблоки", filters({ vendor: "openai" }))).toHaveLength(0);
+      expect(await searchText(t.db, "яблоки", filters({ role: "user" }))).toHaveLength(1);
+      expect(await searchText(t.db, "яблоки", filters({ role: "assistant" }))).toHaveLength(0);
+      expect(
+        await searchText(t.db, "яблоки", filters({ reasoningEffort: "high" })),
+      ).toHaveLength(0);
       expect(
         await searchText(t.db, "яблоки", filters({ documentType: "user_prompt" })),
       ).toHaveLength(1);
@@ -345,15 +405,32 @@ describe("full-text search (integration)", () => {
       expect(hits.length).toBeGreaterThan(0);
       expect(hits[0]!.documentType).toBe("assistant_final");
       expect(hits[0]!.snippet).toContain("абракадабра");
+      expect(hits[0]).toMatchObject({
+        user: "example",
+        vendor: "moonshot",
+        role: "assistant",
+        reasoningEffort: "high",
+        sourcePath: "/tmp/sessions/wd_x/session_s/agents/main/wire.jsonl",
+      });
       // фильтр по модели (raw и canonical)
       expect(await searchText(t.db, "абракадабра", filters({ model: "k3" }))).not.toHaveLength(0);
       expect(await searchText(t.db, "абракадабра", filters({ model: "gpt-5" }))).toHaveLength(0);
+      expect(
+        await searchText(t.db, "абракадабра", filters({ reasoningEffort: "high" })),
+      ).not.toHaveLength(0);
+      expect(
+        await searchText(t.db, "абракадабра", filters({ reasoningEffort: "low" })),
+      ).toHaveLength(0);
+      expect(
+        await searchText(t.db, "абракадабра", filters({ role: "assistant" })),
+      ).not.toHaveLength(0);
+      expect(await searchText(t.db, "абракадабра", filters({ role: "user" }))).toHaveLength(0);
     } finally {
       await dropTestDb(t);
     }
   });
 
-  testDb("старые revisions не в обычной выдаче; forensic --all-revisions их видит", async () => {
+  testDb("старые revisions не в обычной выдаче; forensic --all-revisions fail closed", async () => {
     const t = await createTestDb();
     try {
       const { ctx, key } = await seedV1(t, "session_revisions");
@@ -373,18 +450,17 @@ describe("full-text search (integration)", () => {
       );
       expect(stale).toHaveLength(0);
 
-      // forensic без --all-revisions: chunk'и v1 тоже не видны
-      expect(await searchForensic(t.db, "абракадабра", filters())).toHaveLength(0);
-      // forensic --all-revisions: chunk v1 находится
-      const all = await searchForensic(t.db, "абракадабра", filters({ allRevisions: true }));
-      expect(all).toHaveLength(1);
-      expect(all[0]!.kind).toBe("text");
+      // Canonical v1 chunks сохранены, но глобальный chunk_content index
+      // отключён: legacy forensic API отказывает до любого DB scan.
+      expect(
+        searchForensic(t.db, "абракадабра", filters({ allRevisions: true })),
+      ).rejects.toThrow("forensic search отключён");
     } finally {
       await dropTestDb(t);
     }
   });
 
-  testDb("reasoning/tool контент доступен только через forensic mode", async () => {
+  testDb("reasoning/tool контент не попадает в normal projection; forensic fail closed", async () => {
     const t = await createTestDb();
     try {
       await seedV1(t, "session_forensic");
@@ -394,17 +470,16 @@ describe("full-text search (integration)", () => {
       // обычный поиск reasoning/tool НЕ видит
       expect(await searchText(t.db, "ксиволь", filters())).toHaveLength(0);
       expect(await searchText(t.db, "йолопуки", filters())).toHaveLength(0);
-      // forensic без флагов: только kind=text → тоже не видит
-      expect(await searchForensic(t.db, "ксиволь", filters())).toHaveLength(0);
-      expect(await searchForensic(t.db, "йолопуки", filters())).toHaveLength(0);
-      // --include-reasoning: thought находится
-      const reasoning = await searchForensic(t.db, "ксиволь", filters({ includeReasoning: true }));
-      expect(reasoning).toHaveLength(1);
-      expect(reasoning[0]!.kind).toBe("thought");
-      // --include-tools: tool_result находится
-      const tools = await searchForensic(t.db, "йолопуки", filters({ includeTools: true }));
-      expect(tools).toHaveLength(1);
-      expect(tools[0]!.kind).toBe("tool_result");
+      expect(
+        searchForensic(
+          t.db,
+          "ксиволь",
+          filters({ includeReasoning: true, role: "assistant", reasoningEffort: "high" }),
+        ),
+      ).rejects.toThrow("forensic search отключён");
+      expect(
+        searchForensic(t.db, "йолопуки", filters({ includeTools: true })),
+      ).rejects.toThrow("forensic search отключён");
     } finally {
       await dropTestDb(t);
     }
@@ -464,8 +539,8 @@ describe("full-text search (integration)", () => {
   });
 });
 
-describe("forensic --include-system (integration)", () => {
-  testDb("system/developer контент доступен только через forensic --include-system (§12.1)", async () => {
+describe("отключённый forensic --include-system (integration)", () => {
+  testDb("system/developer контент не попадает в normal projection; forensic fail closed", async () => {
     const t = await createTestDb();
     try {
       const ctx = await makeCtx(t);
@@ -478,19 +553,12 @@ describe("forensic --include-system (integration)", () => {
       // обычный поиск system/developer НЕ видит
       expect(await searchText(t.db, "фыркол", filters())).toHaveLength(0);
       expect(await searchText(t.db, "жумбра", filters())).toHaveLength(0);
-      // forensic без флага: только kind=text → тоже не видит
-      expect(await searchForensic(t.db, "фыркол", filters())).toHaveLength(0);
-      expect(await searchForensic(t.db, "жумбра", filters())).toHaveLength(0);
-      // --include-system: оба kinds находятся
-      const system = await searchForensic(t.db, "фыркол", filters({ includeSystem: true }));
-      expect(system).toHaveLength(1);
-      expect(system[0]!.kind).toBe("system");
-      const developer = await searchForensic(t.db, "жумбра", filters({ includeSystem: true }));
-      expect(developer).toHaveLength(1);
-      expect(developer[0]!.kind).toBe("developer");
-      // --include-system НЕ включает thought/tool (флаги независимы)
-      expect(await searchForensic(t.db, "ксиволь", filters({ includeSystem: true }))).toHaveLength(0);
-      expect(await searchForensic(t.db, "йолопуки", filters({ includeSystem: true }))).toHaveLength(0);
+      expect(
+        searchForensic(t.db, "фыркол", filters({ includeSystem: true })),
+      ).rejects.toThrow("forensic search отключён");
+      expect(
+        searchForensic(t.db, "жумбра", filters({ includeSystem: true })),
+      ).rejects.toThrow("forensic search отключён");
     } finally {
       await dropTestDb(t);
     }
@@ -572,7 +640,12 @@ describe("vector search: over-fetch, limit, provider (integration)", () => {
           role: "assistant",
           humanAuthored: false,
           timestamp: new Date("2026-07-20T10:01:00Z"),
-          model: { rawModelName: "kimi-code/k3", vendor: "moonshot", canonicalName: "k3" },
+          model: {
+            rawModelName: "kimi-code/k3",
+            vendor: "moonshot",
+            canonicalName: "k3",
+            reasoningEffort: "medium",
+          },
           chunks: [{ sequence: 0, kind: "text", content: `Ответ на ${prompt}`, metadata: {} }],
         }),
       ],
@@ -582,6 +655,7 @@ describe("vector search: over-fetch, limit, provider (integration)", () => {
 
   testDb("документ редкого harness'а вне глобального top-50 находится с --harness; limit уважается; provider сверяется", async () => {
     const t = await createTestDb();
+    const physicalTable = physicalTableName("search_overfetch_16");
     try {
       const ctx = await makeCtx(t);
       // 60 decoy-диалогов kimi-code (вектор = query, dist 0).
@@ -616,6 +690,7 @@ describe("vector search: over-fetch, limit, provider (integration)", () => {
         dimensions: VECTOR_DIMS,
         activate: true,
       });
+      expect(space.physical_table).toBe(physicalTable);
       // Векторы пишем напрямую (без worker'а): детерминированные расстояния.
       const docs = await selectAll<{ id: RecordId; harness?: string }>(
         t.db,
@@ -653,6 +728,54 @@ describe("vector search: over-fetch, limit, provider (integration)", () => {
       const rare = await searchVector(t.db, provider, "запрос", filters({ harness: "codex" }));
       expect(rare.length).toBeGreaterThan(0);
       expect(rare.every((h) => h.harness === "codex")).toBe(true);
+      expect(rare.every((h) => h.user === "example" && h.vendor === "moonshot")).toBe(true);
+      expect(
+        rare.every(
+          (h) => h.sourcePath === "/tmp/sessions/wd_x/session_s/agents/main/wire.jsonl",
+        ),
+      ).toBe(true);
+
+      // Новые §14 filters применяются после ANN и поэтому используют over-fetch.
+      const rareAssistant = await searchVector(
+        t.db,
+        provider,
+        "запрос",
+        filters({
+          harness: "codex",
+          user: "example",
+          vendor: "moonshot",
+          role: "assistant",
+          reasoningEffort: "medium",
+        }),
+      );
+      expect(rareAssistant).toHaveLength(1);
+      expect(rareAssistant[0]).toMatchObject({
+        harness: "codex",
+        user: "example",
+        vendor: "moonshot",
+        role: "assistant",
+        reasoningEffort: "medium",
+        sourcePath: "/tmp/sessions/wd_x/session_s/agents/main/wire.jsonl",
+      });
+      expect(
+        await searchVector(t.db, provider, "запрос", filters({ harness: "codex", role: "system" })),
+      ).toHaveLength(0);
+
+      const hybrid = await searchHybrid(
+        t.db,
+        provider,
+        "редкий",
+        filters({ harness: "codex", role: "assistant", reasoningEffort: "medium" }),
+      );
+      expect(hybrid).toHaveLength(1);
+      expect(hybrid[0]).toMatchObject({
+        harness: "codex",
+        user: "example",
+        vendor: "moonshot",
+        role: "assistant",
+        reasoningEffort: "medium",
+        sourcePath: "/tmp/sessions/wd_x/session_s/agents/main/wire.jsonl",
+      });
 
       // Vector mode уважает пользовательский limit.
       const limited = await searchVector(t.db, provider, "запрос", filters({ limit: 5 }));
@@ -664,7 +787,16 @@ describe("vector search: over-fetch, limit, provider (integration)", () => {
         VectorSearchUnavailable,
       );
     } finally {
-      await dropTestDb(t);
+      // Explicitly retire the HNSW table before removing its database. Surreal
+      // otherwise may keep RocksDB index cleanup running after REMOVE DATABASE,
+      // starving a following live /export or pair of /import requests.
+      try {
+        await t.db.query(`REMOVE TABLE IF EXISTS ${physicalTable}`);
+      } finally {
+        // Database cleanup must still run if partial HNSW creation/removal
+        // itself fails.
+        await dropTestDb(t);
+      }
     }
   });
 });

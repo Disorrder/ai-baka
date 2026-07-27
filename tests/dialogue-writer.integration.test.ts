@@ -5,7 +5,7 @@
  * external id на разных installation не мержится (№16), embedding jobs.
  */
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { RecordId } from "surrealdb";
 import type { ParsedDialogue } from "../src/domain/canonical-types.ts";
 import {
@@ -29,12 +29,23 @@ import {
   type DialogueTxInput,
 } from "../src/db/repositories/corpus.ts";
 import { dialogueIdentityKey } from "../src/domain/identity.ts";
+import { codexExtractors } from "../src/search/extractors/codex.ts";
 import { kimiCodeExtractors } from "../src/search/extractors/kimi-code.ts";
 import { selectAll, selectOne } from "../src/db/repositories/helpers.ts";
-import { createTestDb, dbTest, dropTestDb, type TestDb } from "./db-test-utils.ts";
+import {
+  createTestDb,
+  dbTest,
+  dropTestDb,
+  finishLiveTestFile,
+  type TestDb,
+} from "./db-test-utils.ts";
 
 // Явный skip в отчёте, если SurrealDB недоступен (вместо молчаливого pass).
 const testDb = await dbTest();
+
+afterAll(async () => {
+  await finishLiveTestFile();
+});
 
 function makeDialogue(externalId: string, assistantText = "Ответ ассистента."): ParsedDialogue {
   return {
@@ -83,6 +94,60 @@ function makeDialogue(externalId: string, assistantText = "Ответ ассис
     ],
     metadata: {},
   };
+}
+
+function makeLargeCodexDialogue(
+  externalId: string,
+  messageCount = 177,
+  payloadBytes = 60_000,
+): ParsedDialogue {
+  const messages: ParsedDialogue["messages"] = [
+    {
+      sequence: 0,
+      role: "user",
+      rawRole: "user",
+      humanAuthored: true,
+      visibleToUser: true,
+      usageEvents: [],
+      chunks: [{ sequence: 0, kind: "text", content: "Synthetic prompt", metadata: {} }],
+      metadata: { userMessageText: "Synthetic prompt" },
+    },
+  ];
+  const smallPayload = JSON.stringify({
+    type: "synthetic_unknown_event",
+    data: "x".repeat(payloadBytes),
+  });
+  for (let sequence = 1; sequence < messageCount - 1; sequence += 1) {
+    messages.push({
+      sequence,
+      role: "unknown",
+      rawRole: "top:synthetic_unknown_event",
+      humanAuthored: false,
+      visibleToUser: false,
+      usageEvents: [],
+      chunks: [{
+        sequence: 0,
+        kind: "unknown" as const,
+        rawKind: "top:synthetic_unknown_event",
+        content: smallPayload,
+        rawEventType: "top:synthetic_unknown_event",
+        sourceLocator: `line:${sequence + 1}`,
+        metadata: {},
+      }],
+      metadata: {},
+    });
+  }
+  messages.push({
+    sequence: messageCount - 1,
+    role: "assistant",
+    rawRole: "assistant",
+    humanAuthored: false,
+    visibleToUser: true,
+    usageEvents: [],
+    chunks: [{ sequence: 0, kind: "text", content: "Synthetic answer", metadata: {} }],
+    metadata: { phase: "final_answer" },
+  });
+  return { externalId, messages, metadata: {} };
 }
 
 interface Ctx {
@@ -313,6 +378,59 @@ describe("dialogue transaction (integration)", () => {
       await dropTestDb(t);
     }
   });
+
+  testDb("parser-v2: большой Codex-диалог не дублирует content в RPC-ответе", async () => {
+    const t = await createTestDb();
+    try {
+      const ctx = await makeCtx(t, "host-uuid-large-codex");
+      const key = dialogueIdentityKey(ctx.installation.toString(), "session_large_codex", "fb");
+      const previous = makeDialogue("session_large_codex", "Previous parser revision");
+      const previousInput = txInput(ctx, previous, key);
+      previousInput.parserName = "codex";
+      previousInput.extractors = codexExtractors;
+      await writeDialogueRevision(t.db, previousInput);
+
+      const dialogue = makeLargeCodexDialogue("session_large_codex");
+      const input = txInput(ctx, dialogue, key);
+      input.parserName = "codex";
+      input.parserVersion = 2;
+      input.extractors = codexExtractors;
+      const storedContentBytes = dialogue.messages.reduce(
+        (total, message) => total + message.chunks.reduce(
+          (messageTotal, chunk) => messageTotal + Buffer.byteLength(chunk.content ?? "", "utf8"),
+          0,
+        ),
+        0,
+      );
+
+      const originalQuery = t.db.query.bind(t.db);
+      let transactionResultBytes = 0;
+      const measuredDb = new Proxy(t.db, {
+        get(target, property, receiver) {
+          if (property !== "query") return Reflect.get(target, property, receiver);
+          return async (sql: string, vars?: Record<string, unknown>) => {
+            const result = await originalQuery(sql, vars);
+            if (sql.startsWith("BEGIN;")) {
+              transactionResultBytes = Buffer.byteLength(JSON.stringify(result), "utf8");
+            }
+            return result;
+          };
+        },
+      });
+      const written = await writeDialogueRevision(measuredDb, input);
+
+      expect(written.created).toBe(true);
+      expect(written.messageCount).toBe(177);
+      expect(written.chunkCount).toBe(177);
+      expect(storedContentBytes).toBeGreaterThan(10_000_000);
+      expect(transactionResultBytes).toBeLessThan(storedContentBytes / 100);
+      expect(await tableCount(t, "dialogue_revision")).toBe(2);
+      expect(await tableCount(t, "message")).toBe(179);
+      expect(await tableCount(t, "chunk")).toBe(180);
+    } finally {
+      await dropTestDb(t);
+    }
+  }, 120_000);
 
   testDb("сценарий 9: укоротившийся диалог — новая revision без stale tail, projection переключена", async () => {
     const t = await createTestDb();

@@ -10,8 +10,14 @@ describe("loadConfig", () => {
   });
 
   test("применяет дефолты", () => {
-    const cfg = loadConfig({ BAKA_ARCHIVE_ROOT: "/tmp/archive" });
+    const cfg = loadConfig({
+      BAKA_ARCHIVE_ROOT: "/tmp/archive",
+      HOME: "/Users/test-user",
+    });
     expect(cfg.archiveRoot).toBe("/tmp/archive");
+    expect(cfg.dbRoot).toBe(
+      "/Users/test-user/Library/Application Support/ai-baka/rocksdb",
+    );
     expect(cfg.surrealUrl).toBe("ws://127.0.0.1:8901/rpc");
     expect(cfg.surrealNamespace).toBe("baka");
     expect(cfg.surrealDatabase).toBe("archive");
@@ -22,13 +28,22 @@ describe("loadConfig", () => {
   test("читает переопределения", () => {
     const cfg = loadConfig({
       BAKA_ARCHIVE_ROOT: "/tmp/archive",
+      BAKA_DB_ROOT: "/tmp/internal-db",
       SURREAL_NAMESPACE: "other",
       BAKA_ARCHIVE_ID: "uuid-1",
       BAKA_MIN_FREE_BYTES: "1024",
     });
     expect(cfg.surrealNamespace).toBe("other");
+    expect(cfg.dbRoot).toBe("/tmp/internal-db");
     expect(cfg.expectedArchiveId).toBe("uuid-1");
     expect(cfg.minFreeBytes).toBe(1024);
+  });
+
+  test("не допускает live RocksDB внутри archive root", () => {
+    expect(() => loadConfig({
+      BAKA_ARCHIVE_ROOT: "/tmp/archive",
+      BAKA_DB_ROOT: "/tmp/archive/db",
+    })).toThrow(ConfigError);
   });
 });
 

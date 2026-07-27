@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { writeFile } from "node:fs/promises";
+import { writeFileSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { Surreal } from "surrealdb";
 import {
+  applyMigrations,
   checksum,
   listMigrations,
   MigrationError,
@@ -28,6 +31,15 @@ function migrationFile(version: number, name: string, sum: string): MigrationFil
 }
 
 describe("migrations (unit)", () => {
+  test("0005 удаляет только глобальный chunk FULLTEXT index, не canonical records", async () => {
+    const migration = await readFile(
+      path.join(import.meta.dir, "..", "schema", "0005_legacy_migration_run.surql"),
+      "utf8",
+    );
+    expect(migration).toContain("REMOVE INDEX IF EXISTS chunk_content ON TABLE chunk;");
+    expect(migration).not.toMatch(/\b(?:DELETE|REMOVE TABLE)\s+chunk\b/i);
+  });
+
   test("checksum — sha256 содержимого", () => {
     expect(checksum("hello")).toBe(
       "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
@@ -101,5 +113,62 @@ describe("migrations (unit)", () => {
     expect(() =>
       planPendingMigrations(files, [appliedRow(1, "a", "s1"), appliedRow(2, "gone", "s2")]),
     ).toThrow(/файл отсутствует/);
+  });
+
+  test("applyMigrations выполняет и записывает exact snapshot при подмене файла", async () => {
+    await withTempDir(async (dir) => {
+      const appliedPath = path.join(dir, "0001_applied.surql");
+      const migrationPath = path.join(dir, "0002_exact_snapshot.surql");
+      const appliedContent = "DEFINE TABLE already_applied SCHEMAFULL;\n";
+      const original = "DEFINE TABLE exact_original SCHEMAFULL;\n";
+      const replacement = "DEFINE TABLE attacker_replacement SCHEMAFULL;\n";
+      await writeFile(appliedPath, appliedContent);
+      await writeFile(migrationPath, original);
+
+      const executed: string[] = [];
+      let ledgerChecksum: unknown;
+      let mutationTriggered = false;
+      const applied: AppliedMigration = {
+        // planPendingMigrations обращается к row.version уже после загрузки и
+        // checksum всех файлов: это детерминированная точка TOCTOU-подмены.
+        get version() {
+          if (!mutationTriggered) {
+            writeFileSync(migrationPath, replacement);
+            mutationTriggered = true;
+          }
+          return 1;
+        },
+        name: "applied",
+        checksum: checksum(appliedContent),
+        applied_at: new Date(),
+        baka_commit: "old-commit",
+        surrealdb_version: "old-server",
+      };
+      const db = {
+        query: async (sql: string, vars?: Record<string, unknown>) => {
+          if (sql.includes("DEFINE TABLE IF NOT EXISTS schema_migration")) return [];
+          if (sql.startsWith("SELECT version, name, checksum")) return [[applied]];
+          if (sql.includes("CREATE schema_migration SET")) {
+            ledgerChecksum = vars?.checksum;
+            return [];
+          }
+          executed.push(sql);
+          return [];
+        },
+      } as unknown as Surreal;
+
+      const result = await applyMigrations(db, {
+        schemaDir: dir,
+        bakaCommit: "test-commit",
+        surrealdbVersion: "test-server",
+      });
+
+      expect(mutationTriggered).toBe(true);
+      expect(await readFile(migrationPath, "utf8")).toBe(replacement);
+      expect(executed).toEqual([original]);
+      expect(ledgerChecksum).toBe(checksum(original));
+      expect(ledgerChecksum).not.toBe(checksum(replacement));
+      expect(result).toEqual({ applied: [2], version: 2 });
+    });
   });
 });

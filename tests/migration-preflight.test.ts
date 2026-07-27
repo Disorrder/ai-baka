@@ -6,7 +6,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ensureLegacySnapshot } from "../src/migration/legacy-snapshot.ts";
@@ -162,7 +162,7 @@ describe("legacy snapshot (§15.3)", () => {
     const first = await ensureLegacySnapshot(otherDb, archiveRoot);
     expect(first.reused).toBe(false);
     const second = await ensureLegacySnapshot(otherDb, archiveRoot);
-    expect(second.reused).toBe(true); // sidecar: vacuum не повторялся
+    expect(second.reused).toBe(true); // новый full-hash snapshot совпал с существующим
 
     // mtime не меняется в ту же миллисекунду гарантированно — меняем и размер
     const db2 = new Database(otherDb);
@@ -171,6 +171,25 @@ describe("legacy snapshot (§15.3)", () => {
     const third = await ensureLegacySnapshot(otherDb, archiveRoot);
     expect(third.reused).toBe(false);
     expect(third.sha256).not.toBe(first.sha256);
+  });
+
+  test("same-size/same-mtime source replacement не может переиспользовать stale sidecar", async () => {
+    const source = path.join(dir, "same-stat.sqlite");
+    const db = new Database(source, { create: true });
+    db.run("CREATE TABLE t (value TEXT)");
+    db.run("INSERT INTO t VALUES ('AAAA')");
+    db.close();
+    const before = await stat(source);
+    const first = await ensureLegacySnapshot(source, archiveRoot);
+
+    const changed = new Database(source);
+    changed.run("UPDATE t SET value = 'BBBB'");
+    changed.close();
+    expect((await stat(source)).size).toBe(before.size);
+    await utimes(source, before.atime, before.mtime);
+    const second = await ensureLegacySnapshot(source, archiveRoot);
+    expect(second.sha256).not.toBe(first.sha256);
+    expect(second.reused).toBe(false);
   });
 });
 
@@ -242,7 +261,7 @@ describe("migration preflight report (§15.2)", () => {
     expect(r.lost).toBe(0);
     expect(r.ok).toBe(true);
     expect(r.tables.threads).toEqual({ total: 7, accounted: 7, withProblems: 3, lost: 0 });
-    expect(r.tables.thread_records).toEqual({ total: 9, accounted: 9, withProblems: 1, lost: 0 });
+    expect(r.tables.thread_records).toEqual({ total: 9, accounted: 9, withProblems: 3, lost: 0 });
     expect(r.tables.messages).toEqual({ total: 3, accounted: 3, withProblems: 1, lost: 0 });
     expect(r.tables.message_chunks).toEqual({ total: 2, accounted: 2, withProblems: 1, lost: 0 });
     expect(r.tables.raw_backups).toEqual({ total: 3, accounted: 3, withProblems: 2, lost: 0 });

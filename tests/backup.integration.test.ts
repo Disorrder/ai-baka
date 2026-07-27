@@ -9,39 +9,58 @@
  */
 
 import { afterAll, beforeAll, describe, expect } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { runLogicalBackup, type BackupManifest } from "../src/backup/backup.ts";
-import { RESTORE_NAMESPACE, runRestoreTest } from "../src/backup/restore-test.ts";
+import {
+  coreTablesForSchemaVersion,
+  manifestPathForExport,
+  runLogicalBackup,
+  type BackupManifest,
+} from "../src/backup/backup.ts";
+import {
+  RESTORE_NAMESPACE,
+  RestoreTestAttemptError,
+  isRestoreNamespace,
+  runRestoreTest,
+} from "../src/backup/restore-test.ts";
 import { buildRawManifest, hashRawManifest, verifyRawFiles } from "../src/backup/raw-verify.ts";
 import { loadConfig, type AppConfig } from "../src/config.ts";
+import { applyMigrations, SCHEMA_DIR } from "../src/db/migrations.ts";
 import { hashFile } from "../src/sources/snapshot/hashing.ts";
 import {
   createTestDb,
   dbTest,
   dropTestDb,
+  finishLiveTestFile,
   isDbAvailable,
   TEST_NAMESPACE,
   SURREAL_PASS,
   SURREAL_URL,
   SURREAL_USER,
   type TestDb,
+  withLiveServerOperationGuard,
 } from "./db-test-utils.ts";
+import { isolatedRestoreTargetEvidence } from "./restore-target-fixture.ts";
 
 // Явный skip в отчёте, если SurrealDB не поднят (вместо молчаливого return).
 const testDb = await dbTest();
+// Этот drill включает export, import, десятки query и cleanup. Фоновая работа
+// RocksDB под нагрузкой suite может пересечь общий 30s; конечный локальный
+// предел всё ещё ловит настоящее зависание.
+const RESTORE_DRILL_TEST_TIMEOUT_MS = 60_000;
 
 let t: TestDb;
 let archiveRoot: string;
 let cfg: AppConfig;
 let rawHashes: { sha256: string; sizeBytes: number };
+let rawRel: string;
 
 beforeAll(async () => {
   if (!(await isDbAvailable())) return;
   t = await createTestDb();
   archiveRoot = await mkdtemp(path.join(tmpdir(), "baka-backup-it-"));
-  const rawRel = "raw/codex/session__" + "a".repeat(64) + ".jsonl";
+  rawRel = "raw/codex/session__" + "a".repeat(64) + ".jsonl";
   const rawAbs = path.join(archiveRoot, rawRel);
   await mkdir(path.dirname(rawAbs), { recursive: true });
   await writeFile(rawAbs, '{"type":"user","text":"hello"}\n');
@@ -63,14 +82,35 @@ beforeAll(async () => {
       basename = "session.jsonl", presence_status = "active", missing_complete_scans = 0,
       first_seen_at = $now, last_seen_at = $now;
     CREATE sync_run:test SET kind = "live_sync", status = "completed",
-      started_at = $now, host = host:test, baka_commit = "test", schema_version = 4;
+      started_at = $now, host = host:test, baka_commit = "test", schema_version = 5;
     CREATE source_revision:test SET source_location = source_location:test,
       sha256 = $sha, size_bytes = $size, mtime_ms = 0, head_hash = NONE,
       raw_archive_path = $rawPath, snapshot_kind = "regular_copy", captured_at = $now,
       parser_name = "codex", parser_version = "1", parse_status = "parsed",
       sync_run = sync_run:test;
+    CREATE source_revision:legacy_missing SET source_location = source_location:test,
+      sha256 = $missingSha, size_bytes = 0, mtime_ms = 0, head_hash = NONE,
+      raw_archive_path = NONE, snapshot_kind = "legacy_missing_raw", captured_at = $now,
+      parser_name = "legacy", parser_version = "1", parse_status = "unsupported",
+      sync_run = sync_run:test;
+    CREATE migration_meta:test SET status = "completed", started_at = $now,
+      finished_at = $now, sync_run = sync_run:test;
+    CREATE migration_quarantine:test SET migration = migration_meta:test,
+      legacy_table = "threads", legacy_id = "anonymized-1", raw_payload = { anonymized: true },
+      reason = "anonymized_fixture", parser_name = "legacy-migration-adapter",
+      parser_version = "1", retryable = false, attempts = 1,
+      lineage_key = "threads:anonymized-1", previous_attempt = NONE,
+      first_failed_at = $now, last_failed_at = $now, resolved_at = NONE, resolution = NONE;
+    CREATE migration_row_commit:test SET migration = migration_meta:test,
+      legacy_table = "threads", legacy_id = "anonymized-1", category = "quarantined",
+      target = migration_quarantine:test, committed_at = $now;
     `,
-    { sha: rawHashes.sha256, size: rawHashes.sizeBytes, rawPath: rawRel },
+    {
+      sha: rawHashes.sha256,
+      missingSha: "b".repeat(64),
+      size: rawHashes.sizeBytes,
+      rawPath: rawRel,
+    },
   );
 
   cfg = loadConfig({
@@ -84,18 +124,89 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  if (t) await dropTestDb(t);
-  if (archiveRoot) await rm(archiveRoot, { recursive: true, force: true });
+  try {
+    if (t) await dropTestDb(t);
+    if (archiveRoot) await rm(archiveRoot, { recursive: true, force: true });
+  } finally {
+    await finishLiveTestFile();
+  }
 });
 
 describe("backup → restore:test → raw:verify", () => {
+  testDb("schema 4 backup restores with pre-0005 checks and removes its namespace", async () => {
+    const schema4Db = await createTestDb(false);
+    const schema4Root = await mkdtemp(path.join(tmpdir(), "baka-backup-schema4-it-"));
+    try {
+      const schemaDir = path.join(schema4Root, "schema");
+      await mkdir(schemaDir, { recursive: true });
+      for (const file of [
+        "0001_initial.surql",
+        "0002_search_documents.surql",
+        "0003_embedding_spaces.surql",
+        "0004_legacy_migration_metadata.surql",
+      ]) {
+        await copyFile(path.join(SCHEMA_DIR, file), path.join(schemaDir, file));
+      }
+      await applyMigrations(schema4Db.db, {
+        schemaDir,
+        bakaCommit: "anonymized-test",
+        surrealdbVersion: "test",
+      });
+      const schema4Cfg = loadConfig({
+        BAKA_ARCHIVE_ROOT: schema4Root,
+        SURREAL_URL,
+        SURREAL_USER,
+        SURREAL_PASS,
+        SURREAL_NAMESPACE: TEST_NAMESPACE,
+        SURREAL_DATABASE: schema4Db.name,
+      });
+
+      const result = await withLiveServerOperationGuard(
+        "http-export",
+        () => runLogicalBackup(schema4Cfg),
+      );
+      expect(result.manifest.schemaVersion).toBe(4);
+      expect(Object.keys(result.manifest.recordCounts).sort()).toEqual(
+        [...coreTablesForSchemaVersion(4)].sort(),
+      );
+      expect(result.manifest.recordCounts).not.toHaveProperty("migration_row_commit");
+      expect(result.manifest.recordCounts).not.toHaveProperty("migration_quarantine");
+
+      const report = await withLiveServerOperationGuard(
+        "http-import",
+        () => runRestoreTest(schema4Cfg, {
+          exportPath: result.exportPath,
+          targetEvidence: isolatedRestoreTargetEvidence(),
+        }),
+      );
+      expect(report.ok).toBe(true);
+      expect(report.schemaVersion).toBe(4);
+      const schema4RawManifestSha256 = result.manifest.rawManifestSha256;
+      if (!schema4RawManifestSha256) throw new Error("schema 4 backup omitted raw manifest hash");
+      expect(report.rawManifestSha256).toBe(schema4RawManifestSha256);
+      expect(report.checks.every((check) => check.ok)).toBe(true);
+      expect(report.checks.some((check) => check.name.includes("migration_row_commit"))).toBe(false);
+      expect(report.checks.some((check) => check.name.includes("migration_quarantine"))).toBe(false);
+      const [rootInfo] = await schema4Db.db.query<[unknown]>("INFO FOR ROOT");
+      expect(JSON.stringify(rootInfo)).not.toContain(report.namespace);
+    } finally {
+      await dropTestDb(schema4Db);
+      await rm(schema4Root, { recursive: true, force: true });
+    }
+  }, RESTORE_DRILL_TEST_TIMEOUT_MS);
+
   testDb("logical backup: export + manifest", async () => {
-    const result = await runLogicalBackup(cfg);
+    const result = await withLiveServerOperationGuard(
+      "http-export",
+      () => runLogicalBackup(cfg),
+    );
     const manifest: BackupManifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
-    expect(manifest.schemaVersion).toBe(4);
+    expect(manifest.schemaVersion).toBe(5);
     expect(manifest.namespace).toBe(TEST_NAMESPACE);
     expect(manifest.database).toBe(t.name);
-    expect(manifest.recordCounts.source_revision).toBe(1);
+    expect(manifest.recordCounts.source_revision).toBe(2);
+    expect(manifest.recordCounts.migration_row_commit).toBe(1);
+    expect(manifest.recordCounts.migration_quarantine).toBe(1);
     expect(manifest.recordCounts.dialogue).toBe(0);
     expect(manifest.exportSha256).toMatch(/^[0-9a-f]{64}$/);
     // exportSha256 должен совпадать с фактическим файлом
@@ -109,12 +220,28 @@ describe("backup → restore:test → raw:verify", () => {
   });
 
   testDb("restore drill: counts, инварианты, search-probe, cleanup", async () => {
-    const backup = await runLogicalBackup(cfg);
-    const report = await runRestoreTest(cfg, { exportPath: backup.exportPath });
+    const backup = await withLiveServerOperationGuard(
+      "http-export",
+      () => runLogicalBackup(cfg),
+    );
+    const report = await withLiveServerOperationGuard(
+      "http-import",
+      () => runRestoreTest(cfg, {
+        exportPath: backup.exportPath,
+        targetEvidence: isolatedRestoreTargetEvidence(),
+      }),
+    );
     for (const check of report.checks) {
       expect(check.ok, `${check.name}: ${check.detail}`).toBe(true);
     }
     expect(report.ok).toBe(true);
+    expect(report.schemaVersion).toBe(5);
+    expect(report.checks.map((check) => check.name)).toContain(
+      "invariant: migration_row_commit migration/target",
+    );
+    expect(report.checks.map((check) => check.name)).toContain(
+      "invariant: migration_quarantine migration/previous_attempt",
+    );
     // namespace drill'а удалён после себя
     const probe = await createTestDb(false);
     try {
@@ -123,15 +250,107 @@ describe("backup → restore:test → raw:verify", () => {
     } finally {
       await dropTestDb(probe);
     }
+  }, RESTORE_DRILL_TEST_TIMEOUT_MS);
+
+  testDb("два concurrent restore drill используют независимые namespace", async () => {
+    const backup = await withLiveServerOperationGuard(
+      "http-export",
+      () => runLogicalBackup(cfg),
+    );
+    const [first, second] = await withLiveServerOperationGuard(
+      "http-import",
+      () => Promise.all([
+        runRestoreTest(cfg, {
+          exportPath: backup.exportPath,
+          targetEvidence: isolatedRestoreTargetEvidence(),
+        }),
+        runRestoreTest(cfg, {
+          exportPath: backup.exportPath,
+          targetEvidence: isolatedRestoreTargetEvidence(),
+        }),
+      ]),
+    );
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(first.namespace).not.toBe(second.namespace);
+    expect(isRestoreNamespace(first.namespace)).toBe(true);
+    expect(isRestoreNamespace(second.namespace)).toBe(true);
+  });
+
+  testDb("restore drill читает raw из standalone off-device bundle root", async () => {
+    const backup = await withLiveServerOperationGuard(
+      "http-export",
+      () => runLogicalBackup(cfg),
+    );
+    const bundleRoot = await mkdtemp(path.join(tmpdir(), "baka-offline-restore-it-"));
+    try {
+      const bundleArchive = path.join(bundleRoot, "archive");
+      const bundledExport = path.join(
+        bundleArchive,
+        "backups",
+        "surreal",
+        path.basename(backup.exportPath),
+      );
+      await mkdir(path.dirname(bundledExport), { recursive: true });
+      await mkdir(path.dirname(manifestPathForExport(bundledExport)), { recursive: true });
+      await copyFile(backup.exportPath, bundledExport);
+      await copyFile(backup.manifestPath, manifestPathForExport(bundledExport));
+      const bundledRaw = path.join(bundleArchive, rawRel);
+      await mkdir(path.dirname(bundledRaw), { recursive: true });
+      await copyFile(path.join(archiveRoot, rawRel), bundledRaw);
+
+      // cfg.archiveRoot намеренно указывает на отсутствующий исходный архив:
+      // raw references обязаны разрешиться только через bundleArchive.
+      const report = await withLiveServerOperationGuard(
+        "http-import",
+        () => runRestoreTest(
+          {
+            ...cfg,
+            archiveRoot: path.join(bundleRoot, "original-archive-is-offline"),
+            // Deliberately nonexistent source namespace: a live-source query
+            // would fail, while standalone restore uses only RESTORE_NAMESPACE.
+            surrealNamespace: "source_namespace_must_not_be_queried",
+          },
+          {
+            exportPath: bundledExport,
+            rawArchiveRoot: bundleArchive,
+            targetEvidence: isolatedRestoreTargetEvidence(),
+          },
+        ),
+      );
+      expect(report.rawArchiveRoot).toBe(path.resolve(bundleArchive));
+      const rawCheck = report.checks.find((check) => check.name === "raw references");
+      expect(rawCheck?.ok, rawCheck?.detail).toBe(true);
+      expect(report.ok).toBe(true);
+    } finally {
+      await rm(bundleRoot, { recursive: true, force: true });
+    }
   });
 
   testDb("restore drill отклоняет битый export ДО импорта", async () => {
-    const backup = await runLogicalBackup(cfg);
+    const backup = await withLiveServerOperationGuard(
+      "http-export",
+      () => runLogicalBackup(cfg),
+    );
     // «Портим» export, не трогая manifest
     await writeFile(backup.exportPath, "corrupted");
-    await expect(runRestoreTest(cfg, { exportPath: backup.exportPath })).rejects.toThrow(
-      /exportSha256 не совпадает/,
-    );
+    const error = await withLiveServerOperationGuard("http-import", async () => {
+      try {
+        await runRestoreTest(cfg, {
+          exportPath: backup.exportPath,
+          targetEvidence: isolatedRestoreTargetEvidence(),
+        });
+      } catch (error) {
+        if (error instanceof RestoreTestAttemptError) return error;
+        throw error;
+      }
+      throw new Error("restore unexpectedly accepted corrupt export");
+    });
+    expect(error).toBeInstanceOf(RestoreTestAttemptError);
+    expect((error as RestoreTestAttemptError).report.failure).toEqual({
+      stage: "export_integrity",
+      code: "export_sha256_mismatch",
+    });
   });
 
   testDb("raw manifest по БД сходится с файловой системой", async () => {

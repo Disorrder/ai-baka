@@ -8,8 +8,8 @@
  * №12 (orphan raw находит validate).
  */
 
-import { describe, expect } from "bun:test";
-import { chmod, cp, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { afterAll, describe, expect } from "bun:test";
+import { cp, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { RecordId } from "surrealdb";
@@ -17,6 +17,7 @@ import type { AppConfig } from "../src/config.ts";
 import { runSync, type SyncSummary } from "../src/sync/sync-run.ts";
 import { runValidation } from "../src/validate.ts";
 import { selectAll, selectOne } from "../src/db/repositories/helpers.ts";
+import { snapshotSource } from "../src/sources/snapshot/raw-snapshot.ts";
 import {
   setLocationRevisions,
   updateSourceRevisionParse,
@@ -29,6 +30,7 @@ import {
   createTestDb,
   dbTest,
   dropTestDb,
+  finishLiveTestFile,
   type TestDb,
 } from "./db-test-utils.ts";
 
@@ -38,6 +40,10 @@ const TOOLS_ID = "session_22222222-bbbb-4ccc-8ddd-222222222222";
 
 // Явный skip в отчёте, если SurrealDB недоступен (вместо молчаливого pass).
 const testDb = await dbTest();
+
+afterAll(async () => {
+  await finishLiveTestFile();
+});
 
 interface SyncEnv {
   t: TestDb;
@@ -62,6 +68,7 @@ async function makeSyncEnv(): Promise<SyncEnv> {
   });
   const cfg: AppConfig = {
     archiveRoot,
+    dbRoot: path.join(base, "db"),
     surrealUrl: SURREAL_URL,
     surrealUser: SURREAL_USER,
     surrealPass: SURREAL_PASS,
@@ -319,28 +326,72 @@ describe("structured sync (integration)", () => {
     const env = await makeSyncEnv();
     try {
       const statePath = basicState(env);
-      await chmod(statePath, 0o000);
-      try {
-        const summary = await runSync(env.cfg, syncOptions(env));
-        expect(summary.counters.ingestErrors).toBeGreaterThan(0);
-        // Смешанный parse-view не собирался: basic-сессия НЕ распарсена
-        // (диалог только от tools-сессии), current_revision её wire-файла
-        // не двинулся — честный retry на следующем sync.
-        expect(await tableCount(env.t, "dialogue")).toBe(1);
-        const loc = await selectOne<{ current_revision?: RecordId }>(
-          env.t.db,
-          "SELECT current_revision FROM source_location WHERE relative_path = $rel",
-          { rel: `wd_test/${BASIC_ID}/agents/main/wire.jsonl` },
-        );
-        expect(loc).toBeDefined();
-        expect(loc!.current_revision ?? null).toBeNull();
-      } finally {
-        await chmod(statePath, 0o644);
-      }
+      let injectedFailures = 0;
+      const summary = await runSync(env.cfg, {
+        ...syncOptions(env),
+        snapshotSource: async (sourcePath, options) => {
+          if (path.resolve(sourcePath) === path.resolve(statePath)) {
+            injectedFailures += 1;
+            throw new Error("deterministic snapshot fixture failure");
+          }
+          return snapshotSource(sourcePath, options);
+        },
+      });
+      expect(injectedFailures).toBe(1);
+      expect(summary.counters.ingestErrors).toBeGreaterThan(0);
+      // Ошибка одного snapshot остаётся локальной к этой сессии, а не
+      // превращается в root-level failure, скрывающий соседнюю сессию.
+      expect(summary.errors).toEqual([]);
+      // Смешанный parse-view не собирался: basic-сессия НЕ распарсена
+      // (диалог только от tools-сессии), current_revision её wire-файла
+      // не двинулся — честный retry на следующем sync.
+      expect(await tableCount(env.t, "dialogue")).toBe(1);
+      const toolsDialogue = await selectOne<{ id: RecordId }>(
+        env.t.db,
+        "SELECT id FROM dialogue WHERE external_id = $id",
+        { id: TOOLS_ID },
+      );
+      expect(toolsDialogue).toBeDefined();
+      const loc = await selectOne<{ id: RecordId; current_revision?: RecordId }>(
+        env.t.db,
+        "SELECT id, current_revision FROM source_location WHERE relative_path = $rel",
+        { rel: `wd_test/${BASIC_ID}/agents/main/wire.jsonl` },
+      );
+      expect(loc).toBeDefined();
+      expect(loc!.current_revision ?? null).toBeNull();
+      const failedState = await selectOne<{ id: RecordId }>(
+        env.t.db,
+        "SELECT id FROM source_location WHERE relative_path = $rel",
+        { rel: `wd_test/${BASIC_ID}/state.json` },
+      );
+      const snapshotError = await selectOne<{
+        source_record_key?: string;
+        error_code: string;
+        resolved_at?: Date;
+      }>(
+        env.t.db,
+        `SELECT source_record_key, error_code, resolved_at FROM ingest_error
+         WHERE stage = "snapshot" LIMIT 1`,
+      );
+      expect(snapshotError).toEqual(expect.objectContaining({
+        source_record_key: failedState!.id.toString(),
+        error_code: "snapshot_exception",
+      }));
+      expect(snapshotError!.resolved_at).toBeUndefined();
       // После восстановления доступа сессия собирается и парсится.
       const retry = await runSync(env.cfg, syncOptions(env));
       expect(retry.status).toBe("completed");
       expect(await tableCount(env.t, "dialogue")).toBe(2);
+      const resolvedSnapshotError = await selectOne<{
+        resolved_at?: Date;
+        resolution?: string;
+      }>(
+        env.t.db,
+        `SELECT resolved_at, resolution FROM ingest_error
+         WHERE stage = "snapshot" LIMIT 1`,
+      );
+      expect(resolvedSnapshotError?.resolved_at).toBeDefined();
+      expect(resolvedSnapshotError?.resolution).toBe("resync:snapshot_succeeded");
     } finally {
       await env.cleanup();
     }

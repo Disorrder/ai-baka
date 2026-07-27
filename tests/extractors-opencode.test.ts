@@ -37,7 +37,7 @@ async function parseFixture(name: string): Promise<ParsedDialogue[]> {
 describe("opencode extractors: user_prompt", () => {
   test("обычный user prompt → opencode_user_message_text", async () => {
     expect(openCodeExtractors.harnessSlug).toBe("opencode");
-    expect(EXTRACTOR_VERSION).toBe(2);
+    expect(EXTRACTOR_VERSION).toBe(3);
     expect(openCodeExtractors.extractorVersion).toBe(EXTRACTOR_VERSION);
     const [dialogue] = await parseFixture("basic");
     const user = dialogue!.messages.find((m) => m.role === "user")!;

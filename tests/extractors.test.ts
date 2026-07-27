@@ -5,6 +5,8 @@ import { codexParser } from "../src/parsers/codex/index.ts";
 import { kimiCodeParser } from "../src/parsers/kimi-code/index.ts";
 import { codexExtractors } from "../src/search/extractors/codex.ts";
 import { kimiCodeExtractors } from "../src/search/extractors/kimi-code.ts";
+import { prepareSearchDocuments } from "../src/db/repositories/corpus.ts";
+import { searchDocumentRecordId } from "../src/sync/canonical-hash.ts";
 import type { ParsedDialogue } from "../src/domain/canonical-types.ts";
 
 async function parseCodex(name: string): Promise<ParsedDialogue> {
@@ -56,6 +58,30 @@ describe("codex extractors", () => {
     expect(extracted.extractionMethod).toBe("fallback_visible_assistant_text");
     expect(extracted.content).toBe("Частичный ответ на второй вопрос: вызов в src/cli.ts");
     expect(extracted.content).not.toContain("Ответ на первый вопрос");
+  });
+
+  test("projection: каждый user prompt получает свой assistant final", async () => {
+    const dialogue = await parseCodex("stale-final.jsonl");
+    const docs = prepareSearchDocuments(dialogue, "rev_turn_projection", codexExtractors);
+    const prompts = docs.filter((doc) => doc.documentType === "user_prompt");
+    const finals = docs.filter((doc) => doc.documentType === "assistant_final");
+
+    expect(prompts.map((doc) => doc.content)).toEqual([
+      "Первый вопрос: что делает parseConfig?",
+      "Второй вопрос: а где она вызывается?",
+    ]);
+    expect(finals.map((doc) => doc.content)).toEqual([
+      "Ответ на первый вопрос: parseConfig читает TOML.",
+      "Частичный ответ на второй вопрос: вызов в src/cli.ts",
+    ]);
+    expect(finals.map((doc) => doc.method)).toEqual([
+      "codex_final_answer_phase",
+      "fallback_visible_assistant_text",
+    ]);
+    expect(finals.map((doc) => doc.recordKey)).toEqual([
+      searchDocumentRecordId("rev_turn_projection", "assistant_final", 0, 0),
+      searchDocumentRecordId("rev_turn_projection", "assistant_final", 1, 0),
+    ]);
   });
 });
 
@@ -120,5 +146,23 @@ describe("kimi-code extractors", () => {
     expect(final.extractionMethod).toBe("fallback_visible_assistant_text");
     expect(final.content).toBe("Ответ на второй вопрос.");
     expect(final.content).not.toContain("Ответ на первый вопрос");
+  });
+
+  test("projection: harness fallback сохраняет реальный unknown-origin prompt и его final", async () => {
+    const dialogue = await parseKimi(
+      "unknown-origin/session_44444444-dddd-4eee-8fff-444444444444",
+    );
+    const docs = prepareSearchDocuments(dialogue, "rev_unknown_origin", kimiCodeExtractors);
+    const prompts = docs.filter((doc) => doc.documentType === "user_prompt");
+    const finals = docs.filter((doc) => doc.documentType === "assistant_final");
+
+    expect(prompts.map((doc) => [doc.content, doc.method])).toEqual([
+      ["Первый вопрос: что делает parseConfig?", "kimi_code_turn_prompt_user"],
+      ["Второй вопрос без origin в wire", "fallback_visible_user_text"],
+    ]);
+    expect(finals.map((doc) => doc.content)).toEqual([
+      "Ответ на первый вопрос: parseConfig читает TOML.",
+      "Ответ на второй вопрос.",
+    ]);
   });
 });
