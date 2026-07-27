@@ -667,7 +667,7 @@ export async function deriveEligibleOperatorExclusions(
   try {
     const agents = new Map(reader.agents().map((row) => [row.id, row.slug]));
     const sources = new Map(reader.sourceFiles().map((row) => [row.id, row]));
-    const [liveDialogues, liveRevisions, durableMappings, sourceRevisions] = await Promise.all([
+    const [liveDialogues, liveRevisions, smallMappings, sourceRevisions] = await Promise.all([
       selectAll<{ harness?: string; external_id: string }>(
         db,
         `SELECT harness_installation.harness.slug AS harness, external_id FROM dialogue
@@ -681,7 +681,7 @@ export async function deriveEligibleOperatorExclusions(
       selectAll<{ legacy_table: LegacyTable; legacy_id: string; target: RecordId }>(
         db,
         `SELECT legacy_table, legacy_id, target FROM legacy_identity_map
-         WHERE legacy_table IN ["threads", "source_files", "thread_records"]`,
+         WHERE legacy_table IN ["threads", "source_files"]`,
       ),
       selectAll<{ id: RecordId; source_location: RecordId; sha256: string }>(
         db,
@@ -689,17 +689,47 @@ export async function deriveEligibleOperatorExclusions(
          WHERE record::exists(source_location)`,
       ),
     ]);
+    const threadAndSourceTargets = new Map<string, string[]>();
+    for (const row of smallMappings) {
+      if (row.legacy_table !== "threads" && row.legacy_table !== "source_files") continue;
+      const key = `${row.legacy_table}:${row.legacy_id}`;
+      const targets = threadAndSourceTargets.get(key) ?? [];
+      targets.push(String(row.target));
+      threadAndSourceTargets.set(key, targets);
+    }
+    const candidateRecordIds: string[] = [];
+    for (const thread of reader.threads()) {
+      const harness = agents.get(thread.agent_id);
+      if (!harness) continue;
+      const threadTargets = threadAndSourceTargets.get(`threads:${String(thread.id)}`);
+      if (threadTargets?.length === 1) continue;
+      const bundle = reader.threadBundle(thread);
+      for (const row of bundle.records) {
+        if (row.source_file_id !== null) candidateRecordIds.push(String(row.id));
+      }
+    }
+    const RECORD_BATCH = 50_000;
+    for (let i = 0; i < candidateRecordIds.length; i += RECORD_BATCH) {
+      const batch = candidateRecordIds.slice(i, i + RECORD_BATCH);
+      const rows = await selectAll<{ legacy_table: LegacyTable; legacy_id: string; target: RecordId }>(
+        db,
+        `SELECT legacy_table, legacy_id, target FROM legacy_identity_map
+         WHERE legacy_table = "thread_records" AND legacy_id IN $ids`,
+        { ids: batch },
+      );
+      for (const row of rows) {
+        if (row.legacy_table !== "thread_records") continue;
+        const key = `${row.legacy_table}:${row.legacy_id}`;
+        const targets = threadAndSourceTargets.get(key) ?? [];
+        targets.push(String(row.target));
+        threadAndSourceTargets.set(key, targets);
+      }
+    }
     const dialogueKeys = new Set(liveDialogues.map((row) => `${row.harness ?? "?"}:${row.external_id}`));
     const revisionDialogueKeys = new Set(liveRevisions
       .filter((row) => row.source_dialogue_id && row.sha256)
       .map((row) => `${row.sha256}:${row.source_dialogue_id}`));
-    const durableTargets = new Map<string, string[]>();
-    for (const row of durableMappings) {
-      const key = `${row.legacy_table}:${row.legacy_id}`;
-      const targets = durableTargets.get(key) ?? [];
-      targets.push(String(row.target));
-      durableTargets.set(key, targets);
-    }
+    const durableTargets = threadAndSourceTargets;
     const exactRevisionTargets = new Map<string, string[]>();
     for (const revision of sourceRevisions) {
       const key = `${String(revision.source_location)}:${revision.sha256}`;
