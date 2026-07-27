@@ -40,7 +40,7 @@ import { selectAll } from "../db/repositories/helpers.ts";
 import type { LocalIdentity } from "../sync/host-identity.ts";
 
 /** Таблицы плана §15.5 — фактическое соответствие фиксируется в отчёте. */
-const EXPECTED_TABLES = [
+export const EXPECTED_TABLES = [
   "agent_systems",
   "projects",
   "source_files",
@@ -229,27 +229,29 @@ export async function probeLiveCorpus(cfg: AppConfig): Promise<LiveCorpusProbe> 
     return probe;
   }
   try {
-    const revisions = await selectAll<{ sha256: string }>(
-      db,
-      `SELECT sha256 FROM source_revision`,
-    );
-    for (const row of revisions) probe.revisionSha256.add(row.sha256);
-    const dialogues = await selectAll<{ external_id: string; harness: string | null }>(
-      db,
-      `SELECT external_id, harness_installation.harness.slug AS harness
-       FROM dialogue WHERE external_id IS NOT NONE`,
-    );
-    for (const row of dialogues) {
-      probe.dialogueKeys.add(`${row.harness ?? "?"}:${row.external_id}`);
-    }
-    probe.available = true;
-    probe.note = `live corpus: ${revisions.length} source_revision, ${dialogues.length} dialogue с external_id`;
+    return await probeLiveCorpusFromDb(db);
   } catch (err) {
     probe.note = `запрос к SurrealDB не удался: ${err instanceof Error ? err.message : err}`;
   } finally {
     await db.close();
   }
   return probe;
+}
+
+/** Read-only live probe over an already authenticated connection. */
+export async function probeLiveCorpusFromDb(db: Surreal): Promise<LiveCorpusProbe> {
+  const revisions = await selectAll<{ sha256: string }>(db, `SELECT sha256 FROM source_revision`);
+  const dialogues = await selectAll<{ external_id: string; harness: string | null }>(
+    db,
+    `SELECT external_id, harness_installation.harness.slug AS harness
+     FROM dialogue WHERE external_id IS NOT NONE`,
+  );
+  return {
+    available: true,
+    note: `live corpus: ${revisions.length} source_revision, ${dialogues.length} dialogue с external_id`,
+    revisionSha256: new Set(revisions.map((row) => row.sha256)),
+    dialogueKeys: new Set(dialogues.map((row) => `${row.harness ?? "?"}:${row.external_id}`)),
+  };
 }
 
 /** Fingerprint префикса пути для host:legacy-<fingerprint> (§15.6 п.3). */
@@ -271,6 +273,11 @@ function pathPrefix(p: string): string {
 function count(db: Database, table: string): number {
   const row = db.query<{ c: number }, []>(`SELECT COUNT(*) AS c FROM ${table}`).get();
   return row?.c ?? 0;
+}
+
+function hasColumn(db: Database, table: string, column: string): boolean {
+  return db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all()
+    .some((row) => row.name === column);
 }
 
 /**
@@ -338,9 +345,12 @@ export async function analyzeLegacySnapshot(
     }
 
     // --- Диалоги: LEFT JOIN-семантика — тред с битым agent_id НЕ теряется ---
+    const threadHasProject = hasColumn(db, "threads", "project_id");
     const threads = db
-      .query<{ id: number; external_id: string; agent_id: number }, []>(
-        `SELECT id, external_id, agent_id FROM threads`,
+      .query<{ id: number; external_id: string; agent_id: number; project_id?: number | null }, []>(
+        threadHasProject
+          ? `SELECT id, external_id, agent_id, project_id FROM threads`
+          : `SELECT id, external_id, agent_id, NULL AS project_id FROM threads`,
       )
       .all()
       .map((t) => ({ ...t, slug: agentSlugById.get(t.agent_id) ?? null }));
@@ -353,6 +363,15 @@ export async function analyzeLegacySnapshot(
           table: "threads",
           recordId: String(t.id),
           reason: `agent_id=${t.agent_id} отсутствует в agent_systems (orphan thread, harness неизвестен)`,
+        });
+      }
+      if (t.project_id !== null && t.project_id !== undefined &&
+          !projectRows.some((project) => project.id === t.project_id)) {
+        threadProblems.add(t.id);
+        problems.push({
+          table: "threads",
+          recordId: String(t.id),
+          reason: `project_id=${t.project_id} отсутствует в projects (orphan thread project)`,
         });
       }
     }
@@ -422,6 +441,39 @@ export async function analyzeLegacySnapshot(
     const sourceFileIds = new Set(
       db.query<{ id: number }, []>(`SELECT id FROM source_files`).all().map((r) => r.id),
     );
+    const sourceFileProblems = new Set<number>();
+    if (hasColumn(db, "source_files", "agent_id")) {
+      for (const row of db.query<{ id: number; agent_id: number }, []>(
+        "SELECT id, agent_id FROM source_files",
+      ).all()) {
+        if (agentSlugById.has(row.agent_id)) continue;
+        sourceFileProblems.add(row.id);
+        problems.push({
+          table: "source_files",
+          recordId: String(row.id),
+          reason: `agent_id=${row.agent_id} отсутствует в agent_systems (orphan source file)`,
+        });
+      }
+    }
+    for (const row of db.query<{ id: number; source_file_id: number | null }, []>(
+      "SELECT id, source_file_id FROM thread_records",
+    ).all()) {
+      if (row.source_file_id === null) {
+        recordProblems.add(row.id);
+        problems.push({
+          table: "thread_records",
+          recordId: String(row.id),
+          reason: "source_file_id отсутствует (NULL provenance link)",
+        });
+      } else if (!sourceFileIds.has(row.source_file_id)) {
+        recordProblems.add(row.id);
+        problems.push({
+          table: "thread_records",
+          recordId: String(row.id),
+          reason: `source_file_id=${row.source_file_id} отсутствует в source_files`,
+        });
+      }
+    }
     const backupProblems = new Set<number>();
     const fileExists = new Map<string, boolean>();
     const backupFileOk = new Map<number, boolean>(); // source_file_id → файл есть
@@ -506,6 +558,23 @@ export async function analyzeLegacySnapshot(
         reason: "thread_id отсутствует в threads (orphan message)",
       });
     }
+    const threadRecordThread = new Map(
+      db.query<{ id: number; thread_id: number }, []>("SELECT id, thread_id FROM thread_records")
+        .all().map((row) => [row.id, row.thread_id]),
+    );
+    if (hasColumn(db, "messages", "source_record_id")) {
+      for (const row of db.query<{ id: number; thread_id: number; source_record_id: number | null }, []>(
+        "SELECT id, thread_id, source_record_id FROM messages WHERE source_record_id IS NOT NULL",
+      ).all()) {
+        if (threadRecordThread.get(row.source_record_id!) === row.thread_id) continue;
+        messageProblems.add(row.id);
+        problems.push({
+          table: "messages",
+          recordId: String(row.id),
+          reason: `source_record_id=${row.source_record_id} отсутствует в thread_records`,
+        });
+      }
+    }
 
     // --- message_chunks: orphan message_id ---
     const chunksTotal = count(db, "message_chunks");
@@ -530,6 +599,20 @@ export async function analyzeLegacySnapshot(
         recordId: String(row.id),
         reason: "message_id отсутствует в messages (orphan chunk)",
       });
+    }
+    if (hasColumn(db, "message_chunks", "source_record_id")) {
+      for (const row of db.query<{ id: number; thread_id: number | null; source_record_id: number | null }, []>(
+        `SELECT mc.id, m.thread_id, mc.source_record_id FROM message_chunks mc
+         LEFT JOIN messages m ON m.id = mc.message_id WHERE mc.source_record_id IS NOT NULL`,
+      ).all()) {
+        if (row.thread_id !== null && threadRecordThread.get(row.source_record_id!) === row.thread_id) continue;
+        chunkProblems.add(row.id);
+        problems.push({
+          table: "message_chunks",
+          recordId: String(row.id),
+          reason: `source_record_id=${row.source_record_id} отсутствует в thread_records`,
+        });
+      }
     }
 
     // --- Классификация диалогов (приоритет §15.4) ---
@@ -578,7 +661,7 @@ export async function analyzeLegacySnapshot(
       }
     }
 
-    // --- deleted_in_source (фактическое число из snapshot, §15.8) ---
+    // --- deleted_in_source (runtime authority — fresh signed evidence, §15.8) ---
     const deletedInSource = db
       .query<{ c: number }, []>(
         `SELECT COUNT(*) AS c FROM source_files
@@ -587,7 +670,6 @@ export async function analyzeLegacySnapshot(
       .get()?.c ?? 0;
 
     // --- source_files без raw_backups ---
-    const sourceFileProblems = new Set<number>();
     const withoutBackup = db
       .query<{ id: number }, []>(
         `SELECT sf.id FROM source_files sf
@@ -667,17 +749,17 @@ export async function analyzeLegacySnapshot(
       threads: tableRecon(count(db, "threads"), threads.length, threadProblems.size),
       thread_records: tableRecon(
         count(db, "thread_records"),
-        threadRecordsTotal - orphanRecordRows + recordProblems.size,
+        threadRecordsTotal,
         recordProblems.size,
       ),
       messages: tableRecon(
         count(db, "messages"),
-        messagesTotal - orphanMessageRows + messageProblems.size,
+        messagesTotal,
         messageProblems.size,
       ),
       message_chunks: tableRecon(
         chunksTotal,
-        chunksTotal - orphanChunkRows + chunkProblems.size,
+        chunksTotal,
         chunkProblems.size,
       ),
     };

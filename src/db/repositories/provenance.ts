@@ -350,10 +350,10 @@ export async function updateSourceRevisionParse(
 
 /**
  * Помечает unresolved ingest_errors revision'ов из ПРЕЖНИХ sync runs
- * разрешёнными: повторный parse (например, после фикса parser'а) дал
- * новый результат, и старые ошибки — исторические дубликаты одних и тех
- * же revision (§7.2, поля resolved_at/resolution). Ошибки текущего run'а
- * не трогаем — они отражают актуальное состояние.
+ * разрешёнными только после полностью успешного повторного parse. Проверка
+ * parse_status="parsed" продублирована в WHERE, поэтому ошибочный caller не
+ * может скрыть unsupported/partial/parse_error quarantine. Ошибки текущего
+ * run'а не трогаем — они отражают актуальное состояние.
  *
  * Всегда батчами: индекса по source_revision нет, per-revision UPDATE —
  * полный scan ingest_error на каждую revision.
@@ -364,14 +364,60 @@ export async function resolveStaleIngestErrors(
   currentSyncRun: RecordId,
   resolution: string,
 ): Promise<void> {
+  if (!/^reparse:parsed(?:@[a-z0-9._-]+)?$/iu.test(resolution)) {
+    throw new Error("ingest errors may be resolved only by a successful parsed outcome");
+  }
   const chunkSize = 500;
   for (let i = 0; i < sourceRevisions.length; i += chunkSize) {
     await db.query(
       `UPDATE ingest_error SET resolved_at = time::now(), resolution = $resolution
-       WHERE resolved_at IS NONE AND sync_run != $run AND source_revision IN $revs`,
+       WHERE resolved_at IS NONE AND sync_run != $run AND source_revision IN $revs
+         AND source_revision.parse_status = "parsed"`,
       { revs: sourceRevisions.slice(i, i + chunkSize), run: currentSyncRun, resolution },
     );
   }
+}
+
+/**
+ * Parser diagnostics which intentionally document immutable raw that the
+ * registered harness parser does not consume. Keep this allow-list exact:
+ * prefix/text matching would let an unrelated future `unsupported_*` failure
+ * disappear into the expected quarantine inventory without an explicit code
+ * review.
+ */
+const DOCUMENTED_UNSUPPORTED_ERROR_CODES = new Set([
+  "unsupported_ai_service_entries",
+  "unsupported_file",
+  "unsupported_path",
+]);
+
+export function isDocumentedUnsupportedErrorCode(errorCode: string): boolean {
+  return DOCUMENTED_UNSUPPORTED_ERROR_CODES.has(errorCode);
+}
+
+/**
+ * A successful snapshot is safe proof that an older snapshot failure for the
+ * same durable source_location is obsolete. Historical rows without this
+ * machine provenance intentionally do not match and remain unresolved.
+ */
+export async function resolveStaleSnapshotIngestErrors(
+  db: Surreal,
+  sourceLocation: RecordId,
+  successfulRevision: RecordId,
+  currentSyncRun: RecordId,
+): Promise<void> {
+  await db.query(
+    `UPDATE ingest_error SET resolved_at = time::now(), resolution = "resync:snapshot_succeeded"
+     WHERE resolved_at IS NONE AND sync_run != $run AND stage = "snapshot"
+       AND source_revision IS NONE AND source_record_key = $locationKey
+       AND record::exists($revision) AND $revision.source_location = $location`,
+    {
+      run: currentSyncRun,
+      location: sourceLocation,
+      locationKey: sourceLocation.toString(),
+      revision: successfulRevision,
+    },
+  );
 }
 
 export interface IngestErrorInput {
@@ -390,6 +436,38 @@ export async function createIngestError(
   input: IngestErrorInput,
 ): Promise<RecordId> {
   const now = new Date();
+  const message = input.errorMessage.slice(0, 4000);
+  const preservesIdentity =
+    (input.sourceRevision !== undefined && isDocumentedUnsupportedErrorCode(input.errorCode)) ||
+    (input.sourceRevision === undefined && input.stage === "snapshot" &&
+      input.sourceRecordKey?.startsWith("source_location:") === true);
+  if (preservesIdentity) {
+    const existing = await selectOne<{ id: RecordId }>(
+      db,
+      `SELECT id, first_failed_at FROM ingest_error
+       WHERE resolved_at IS NONE
+         AND (($rev IS NONE AND source_revision IS NONE) OR source_revision = $rev)
+         AND (($recordKey IS NONE AND source_record_key IS NONE) OR source_record_key = $recordKey)
+         AND stage = $stage AND error_code = $code AND error_message = $message
+       ORDER BY first_failed_at ASC, id ASC LIMIT 1`,
+      {
+        rev: input.sourceRevision ?? undefined,
+        recordKey: input.sourceRecordKey ?? undefined,
+        stage: input.stage,
+        code: input.errorCode,
+        message,
+      },
+    );
+    if (existing) {
+      // Keep the original record id/category/reason/parser provenance. The
+      // timestamp alone records that the same immutable failure persists.
+      await db.query("UPDATE ONLY $id SET last_failed_at = $now", {
+        id: existing.id,
+        now,
+      });
+      return existing.id;
+    }
+  }
   const created = await selectOne<{ id: RecordId }>(
     db,
     `CREATE ONLY ingest_error SET sync_run = $run, source_revision = $rev,
@@ -402,7 +480,7 @@ export async function createIngestError(
       recordKey: input.sourceRecordKey ?? undefined,
       stage: input.stage,
       code: input.errorCode,
-      message: input.errorMessage.slice(0, 4000),
+      message,
       payload: input.rawPayload !== undefined ? clean(input.rawPayload) : undefined,
       parserVersion: input.parserVersion !== undefined ? String(input.parserVersion) : undefined,
       now,

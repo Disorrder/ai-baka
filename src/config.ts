@@ -1,9 +1,13 @@
+import path from "node:path";
+import { assertDbRootLexicallySeparate } from "./db/storage-safety.ts";
 import { HARNESSES, HARNESS_ORDER, type HarnessSlug } from "./sources/adapters/harnesses.ts";
 import { parseSourceOverride } from "./sources/discovery/discovery.ts";
 
 export interface AppConfig {
   /** Корень архива (BAKA_ARCHIVE_ROOT). Обязателен. */
   archiveRoot: string;
+  /** Отдельный внутренний APFS/POSIX root живой RocksDB (BAKA_DB_ROOT). */
+  dbRoot: string;
   surrealUrl: string;
   surrealUser: string;
   surrealPass: string;
@@ -61,6 +65,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new ConfigError("BAKA_ARCHIVE_ROOT не задан (см. .env.example)");
   }
   const home = env.HOME ?? process.env.HOME ?? "";
+  const configuredDbRoot = optional(env, "BAKA_DB_ROOT");
+  if (!configuredDbRoot && !home) {
+    throw new ConfigError("BAKA_DB_ROOT или HOME должен быть задан");
+  }
+  const dbRoot = path.resolve(
+    configuredDbRoot ?? path.join(home, "Library", "Application Support", "ai-baka", "rocksdb"),
+  );
+  try {
+    assertDbRootLexicallySeparate(archiveRoot, dbRoot);
+  } catch (error) {
+    throw new ConfigError(error instanceof Error ? error.message : "BAKA_DB_ROOT небезопасен");
+  }
+  if (
+    dbRoot === path.resolve(archiveRoot) ||
+    dbRoot.startsWith(`${path.resolve(archiveRoot)}${path.sep}`)
+  ) {
+    throw new ConfigError("BAKA_DB_ROOT должен быть отдельным от BAKA_ARCHIVE_ROOT");
+  }
   const sourceOverrides: Partial<Record<HarnessSlug, string[]>> = {};
   for (const slug of HARNESS_ORDER) {
     const raw = optional(env, HARNESSES[slug].envOverride);
@@ -68,6 +90,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   return {
     archiveRoot,
+    dbRoot,
     surrealUrl: optional(env, "SURREAL_URL") ?? "ws://127.0.0.1:8901/rpc",
     surrealUser: optional(env, "SURREAL_USER") ?? "root",
     surrealPass: optional(env, "SURREAL_PASS") ?? "root",

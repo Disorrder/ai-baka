@@ -47,6 +47,15 @@ export const RRF_K = 60;
 
 export class VectorSearchUnavailable extends Error {}
 
+function compareStableId(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** Stable ordering used before all later dedup/diversification stages. */
+export function compareSearchHitsByScore(a: SearchHit, b: SearchHit): number {
+  return b.score - a.score || compareStableId(a.id, b.id);
+}
+
 /** Причина недоступности vector mode или готовый контекст (§14). */
 export async function resolveActiveSpace(db: Surreal): Promise<EmbeddingSpace> {
   const space = await getActiveSpace(db);
@@ -74,18 +83,27 @@ interface HydratedRow {
   revision_id: RecordId;
   harness?: string;
   host?: string;
+  os_user?: string;
   workspace?: string;
+  model_vendor?: string;
   model?: string;
+  reasoning_effort?: string;
+  role?: string;
+  source_path?: string;
   ts?: Date;
 }
 
 /** Есть ли активные фильтры §14 (для over-fetch в searchVector). */
-function hasFilters(filters: SearchFilters): boolean {
+export function hasSearchFilters(filters: SearchFilters): boolean {
   return Boolean(
     filters.harness ||
       filters.host ||
+      filters.user ||
       filters.workspace ||
+      filters.vendor ||
       filters.model ||
+      filters.reasoningEffort ||
+      filters.role ||
       filters.documentType ||
       filters.from ||
       filters.to ||
@@ -111,22 +129,49 @@ export async function searchVector(
   filters: SearchFilters,
 ): Promise<SearchHit[]> {
   const space = await resolveActiveSpace(db);
+  return searchVectorInSpace(db, provider, space, query, filters);
+}
+
+/**
+ * Vector ANN search по явно выбранному space.
+ *
+ * В отличие от searchVector не читает и не меняет active space. Этот seam
+ * нужен relevance evaluation (§21): candidate spaces сравниваются на одном
+ * корпусе без опасного переключения production-конфигурации между запросами.
+ */
+export async function searchVectorInSpace(
+  db: Surreal,
+  provider: EmbeddingProvider,
+  space: EmbeddingSpace,
+  query: string,
+  filters: SearchFilters,
+): Promise<SearchHit[]> {
   if (
     provider.provider !== space.provider ||
     provider.model !== space.model ||
     provider.dimensions !== space.dimensions
   ) {
     throw new VectorSearchUnavailable(
-      `provider ${provider.provider}/${provider.model}@${provider.dimensions} не совпадает с active space ${space.provider}/${space.model}@${space.dimensions}`,
+      `provider ${provider.provider}/${provider.model}@${provider.dimensions} не совпадает со space ${space.provider}/${space.model}@${space.dimensions}`,
     );
   }
   const { vectors } = await provider.embed([query]);
   const queryVector = vectors[0];
   if (!queryVector) throw new VectorSearchUnavailable("provider вернул пустой результат на query");
 
-  const k = hasFilters(filters)
-    ? Math.min(Math.max(VECTOR_TOP_K * VECTOR_OVERFETCH_FACTOR, 200), VECTOR_MAX_CANDIDATES)
-    : VECTOR_TOP_K;
+  // Normal CLI queries keep the historical top-50 floor. Evaluation may ask
+  // for a wider document pool so ten *distinct dialogues* can be ranked even
+  // when several segments from one dialogue are near-neighbours.
+  const requested = Math.min(
+    Math.max(VECTOR_TOP_K, Math.ceil(filters.limit)),
+    VECTOR_MAX_CANDIDATES,
+  );
+  const k = hasSearchFilters(filters)
+    ? Math.min(
+        Math.max(requested * VECTOR_OVERFETCH_FACTOR, 200),
+        VECTOR_MAX_CANDIDATES,
+      )
+    : requested;
   const ef = Math.max(HNSW_EF, k);
   const ann = await selectAll<AnnRow>(
     db,
@@ -151,8 +196,13 @@ export async function searchVector(
        dialogue_revision.id AS revision_id,
        dialogue.harness_installation.harness.slug AS harness,
        (dialogue.harness_installation.host.label ?? dialogue.harness_installation.host.hostname) AS host,
+       dialogue.os_account.os_username AS os_user,
        dialogue.workspace.name AS workspace,
+       (message.model.vendor.slug ?? dialogue.primary_model.vendor.slug) AS model_vendor,
        (message.raw_model_name ?? dialogue.primary_model.canonical_name) AS model,
+       message.reasoning_effort AS reasoning_effort,
+       message.role AS role,
+       dialogue_revision.source_revision.source_location.original_path AS source_path,
        (message.timestamp ?? dialogue.updated_at) AS ts
      FROM search_document WHERE id INSIDE $ids${typeClause}${clause}`,
     { ids: ann.map((row) => row.search_document), ...vars },
@@ -173,10 +223,15 @@ export async function searchVector(
       harness: doc.harness,
       host: doc.host,
       workspace: doc.workspace,
+      user: doc.os_user,
+      vendor: doc.model_vendor,
       model: doc.model,
+      reasoningEffort: doc.reasoning_effort,
+      role: doc.role,
+      sourcePath: doc.source_path,
       timestamp: doc.ts?.toISOString(),
     }))
-    .sort((a, b) => b.score - a.score)
+    .sort(compareSearchHitsByScore)
     .slice(0, filters.limit);
 }
 
@@ -196,7 +251,7 @@ export function rrfFuse(lists: SearchHit[][], k = RRF_K): SearchHit[] {
     });
   }
   return [...scores.entries()]
-    .sort((a, b) => b[1] - a[1])
+    .sort((a, b) => b[1] - a[1] || compareStableId(a[0], b[0]))
     .map(([id, score]) => ({ ...hits.get(id)!, score }));
 }
 
@@ -242,9 +297,25 @@ export async function searchHybrid(
   query: string,
   filters: SearchFilters,
 ): Promise<SearchHit[]> {
+  const space = await resolveActiveSpace(db);
+  return searchHybridInSpace(db, provider, space, query, filters);
+}
+
+/** Hybrid pipeline для candidate space без изменения active metadata (§21). */
+export async function searchHybridInSpace(
+  db: Surreal,
+  provider: EmbeddingProvider,
+  space: EmbeddingSpace,
+  query: string,
+  filters: SearchFilters,
+): Promise<SearchHit[]> {
+  const candidateLimit = Math.min(
+    Math.max(VECTOR_TOP_K, filters.limit * MAX_HITS_PER_DIALOGUE),
+    VECTOR_MAX_CANDIDATES,
+  );
   const [textHits, vectorHits] = await Promise.all([
-    searchText(db, query, { ...filters, limit: VECTOR_TOP_K }),
-    searchVector(db, provider, query, { ...filters, limit: VECTOR_TOP_K }),
+    searchText(db, query, { ...filters, limit: candidateLimit }),
+    searchVectorInSpace(db, provider, space, query, { ...filters, limit: candidateLimit }),
   ]);
   return diversifyByDialogue(dedupByMessage(rrfFuse([textHits, vectorHits]))).slice(
     0,

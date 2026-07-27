@@ -17,7 +17,10 @@
  * Переключение active не уничтожает старый space (§13.1).
  */
 
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { RecordId, type Surreal } from "surrealdb";
+import { writePrivateFileAtomic } from "../backup/safety.ts";
 import { selectAll, selectOne } from "../db/repositories/helpers.ts";
 import { embeddingJobRecordId } from "../sync/canonical-hash.ts";
 import { SEGMENTATION_VERSION } from "../search/segmenter.ts";
@@ -264,4 +267,430 @@ export async function listEmbeddingTables(db: Surreal): Promise<string[]> {
     "SELECT physical_table FROM embedding_space",
   );
   return rows.map((row) => row.physical_table);
+}
+
+interface RetireJobRow {
+  id: RecordId;
+  search_document: RecordId;
+  input_sha256: string;
+  status: string;
+  last_error?: string;
+}
+
+interface RetireVectorRow {
+  id: RecordId;
+  search_document: RecordId;
+  embedding_space: RecordId;
+  input_sha256: string;
+  dimensions: number;
+}
+
+export interface ProtectedEmbeddingSpaceBinding {
+  id: string;
+  slug: string;
+  roles: Array<"accepted" | "active">;
+  provider: string;
+  model: string;
+  dimensions: number;
+  distance: string;
+  vectorType: string;
+  segmentationVersion: string;
+  physicalTable: string;
+  active: boolean;
+  createdAt: string;
+  jobs: { count: number; sha256: string };
+  vectors: { count: number; sha256: string };
+}
+
+export interface RetireSpacePlan {
+  formatVersion: 1;
+  space: {
+    id: string;
+    slug: string;
+    provider: string;
+    model: string;
+    dimensions: number;
+    distance: string;
+    vectorType: string;
+    segmentationVersion: string;
+    physicalTable: string;
+    active: boolean;
+    createdAt: string;
+  };
+  jobs: { count: number; sha256: string };
+  vectors: { count: number; sha256: string };
+  acceptedSpaceSlug: string;
+  protectedSpaces: ProtectedEmbeddingSpaceBinding[];
+  canonicalCorpus: { documents: number; sha256: string };
+  candidateEvidencePreserved: true;
+  blockers: string[];
+  planSha256: string;
+  confirmation: string;
+}
+
+function canonicalizeRetire(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeRetire);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, item]) => [key, canonicalizeRetire(item)]));
+  }
+  return value;
+}
+
+function retireHash(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(canonicalizeRetire(value))).digest("hex");
+}
+
+function retireConfirmation(slug: string, jobs: number, vectors: number, hash: string): string {
+  return `RETIRE EMBEDDING SPACE ${slug} JOBS ${jobs} VECTORS ${vectors} ${hash}`;
+}
+
+function validateRetireSpacePlan(plan: RetireSpacePlan): void {
+  if (
+    plan.formatVersion !== 1 || !SLUG_RE.test(plan.space?.slug ?? "") ||
+    plan.space.physicalTable !== physicalTableName(plan.space.slug) ||
+    plan.space.id !== `embedding_space:${plan.space.slug}` ||
+    typeof plan.space.provider !== "string" || !plan.space.provider.trim() ||
+    typeof plan.space.model !== "string" || !plan.space.model.trim() ||
+    !Number.isSafeInteger(plan.space.dimensions) || plan.space.dimensions < 1 ||
+    plan.space.distance !== "COSINE" || plan.space.vectorType !== "F32" ||
+    typeof plan.space.segmentationVersion !== "string" ||
+    !Number.isFinite(Date.parse(plan.space.createdAt)) ||
+    !SLUG_RE.test(plan.acceptedSpaceSlug ?? "") ||
+    plan.acceptedSpaceSlug === plan.space.slug ||
+    !Array.isArray(plan.protectedSpaces) || plan.protectedSpaces.length === 0 ||
+    plan.candidateEvidencePreserved !== true ||
+    !Number.isSafeInteger(plan.jobs?.count) || plan.jobs.count < 0 ||
+    !Number.isSafeInteger(plan.vectors?.count) || plan.vectors.count < 0 ||
+    !Number.isSafeInteger(plan.canonicalCorpus?.documents) || plan.canonicalCorpus.documents < 0 ||
+    !/^[0-9a-f]{64}$/.test(plan.jobs?.sha256 ?? "") ||
+    !/^[0-9a-f]{64}$/.test(plan.vectors?.sha256 ?? "") ||
+    !/^[0-9a-f]{64}$/.test(plan.canonicalCorpus?.sha256 ?? "") ||
+    !/^[0-9a-f]{64}$/.test(plan.planSha256)
+  ) throw new Error("embedding space retire plan invalid");
+  const protectedSlugs = new Set<string>();
+  let acceptedBindings = 0;
+  let activeBindings = 0;
+  for (const protectedSpace of plan.protectedSpaces) {
+    if (
+      !SLUG_RE.test(protectedSpace?.slug ?? "") ||
+      protectedSpace.slug === plan.space.slug || protectedSlugs.has(protectedSpace.slug) ||
+      protectedSpace.id !== `embedding_space:${protectedSpace.slug}` ||
+      protectedSpace.physicalTable !== physicalTableName(protectedSpace.slug) ||
+      !Array.isArray(protectedSpace.roles) || protectedSpace.roles.length === 0 ||
+      new Set(protectedSpace.roles).size !== protectedSpace.roles.length ||
+      protectedSpace.roles.some((role) => role !== "accepted" && role !== "active") ||
+      protectedSpace.active !== protectedSpace.roles.includes("active") ||
+      typeof protectedSpace.provider !== "string" || !protectedSpace.provider.trim() ||
+      typeof protectedSpace.model !== "string" || !protectedSpace.model.trim() ||
+      !Number.isSafeInteger(protectedSpace.dimensions) || protectedSpace.dimensions < 1 ||
+      protectedSpace.distance !== "COSINE" || protectedSpace.vectorType !== "F32" ||
+      typeof protectedSpace.segmentationVersion !== "string" ||
+      !Number.isFinite(Date.parse(protectedSpace.createdAt)) ||
+      !Number.isSafeInteger(protectedSpace.jobs?.count) || protectedSpace.jobs.count < 0 ||
+      !Number.isSafeInteger(protectedSpace.vectors?.count) || protectedSpace.vectors.count < 0 ||
+      !/^[0-9a-f]{64}$/.test(protectedSpace.jobs?.sha256 ?? "") ||
+      !/^[0-9a-f]{64}$/.test(protectedSpace.vectors?.sha256 ?? "")
+    ) throw new Error("embedding space retire protected binding invalid");
+    protectedSlugs.add(protectedSpace.slug);
+    if (protectedSpace.roles.includes("accepted")) {
+      acceptedBindings += 1;
+      if (protectedSpace.slug !== plan.acceptedSpaceSlug) {
+        throw new Error("embedding space retire accepted binding mismatch");
+      }
+    }
+    if (protectedSpace.roles.includes("active")) activeBindings += 1;
+  }
+  if (acceptedBindings !== 1 || activeBindings > 1) {
+    throw new Error("embedding space retire protected roles invalid");
+  }
+  const { planSha256, confirmation, ...binding } = plan;
+  if (retireHash(binding) !== planSha256) {
+    throw new Error("embedding space retire plan SHA-256 mismatch");
+  }
+  if (
+    confirmation !== retireConfirmation(
+      plan.space.slug,
+      plan.jobs.count,
+      plan.vectors.count,
+      planSha256,
+    )
+  ) throw new Error("embedding space retire confirmation invalid");
+}
+
+async function canonicalCorpusIdentity(db: Surreal): Promise<{ documents: number; sha256: string }> {
+  const rows = await selectAll<{ id: RecordId; content_sha256: string }>(
+    db,
+    "SELECT id, content_sha256 FROM search_document ORDER BY id",
+  );
+  return {
+    documents: rows.length,
+    sha256: retireHash(rows.map((row) => ({
+      id: String(row.id),
+      contentSha256: row.content_sha256,
+    }))),
+  };
+}
+
+async function collectSpaceDerivedBinding(
+  db: Surreal,
+  space: EmbeddingSpace,
+  roles: Array<"accepted" | "active">,
+): Promise<ProtectedEmbeddingSpaceBinding> {
+  const [jobs, vectors] = await Promise.all([
+    selectAll<RetireJobRow>(
+      db,
+      `SELECT id, search_document, input_sha256, status, last_error
+       FROM embedding_job WHERE embedding_space = $space ORDER BY id`,
+      { space: space.id },
+    ),
+    selectAll<RetireVectorRow>(
+      db,
+      `SELECT id, search_document, embedding_space, input_sha256,
+         array::len(vector) AS dimensions FROM ${space.physical_table} ORDER BY id`,
+    ),
+  ]);
+  return {
+    id: String(space.id),
+    slug: space.slug,
+    roles: [...roles].sort(),
+    provider: space.provider,
+    model: space.model,
+    dimensions: space.dimensions,
+    distance: space.distance,
+    vectorType: space.vector_type,
+    segmentationVersion: space.segmentation_version,
+    physicalTable: space.physical_table,
+    active: space.active,
+    createdAt: new Date(space.created_at).toISOString(),
+    jobs: {
+      count: jobs.length,
+      sha256: retireHash(jobs.map((job) => ({
+        id: String(job.id),
+        documentId: String(job.search_document),
+        inputSha256: job.input_sha256,
+        status: job.status,
+        lastError: job.last_error?.trim() || undefined,
+      }))),
+    },
+    vectors: {
+      count: vectors.length,
+      sha256: retireHash(vectors.map((vector) => ({
+        id: String(vector.id),
+        documentId: String(vector.search_document),
+        embeddingSpaceId: String(vector.embedding_space),
+        inputSha256: vector.input_sha256,
+        dimensions: vector.dimensions,
+      }))),
+    },
+  };
+}
+
+/** Read-only exact target plan for retiring a rejected inactive candidate. */
+export async function prepareRetireSpace(
+  db: Surreal,
+  slug: string,
+  acceptedSpaceSlug: string,
+): Promise<RetireSpacePlan> {
+  if (!SLUG_RE.test(acceptedSpaceSlug) || acceptedSpaceSlug === slug) {
+    throw new Error("embedding space retire requires a distinct accepted space slug");
+  }
+  const space = await getSpaceBySlug(db, slug);
+  if (!space) throw new Error(`embedding space "${slug}" не найден`);
+  if (space.physical_table !== physicalTableName(slug)) {
+    throw new Error("embedding space physical table identity mismatch");
+  }
+  const spaces = await listSpaces(db);
+  const acceptedSpace = spaces.find((item) => item.slug === acceptedSpaceSlug);
+  if (!acceptedSpace) throw new Error(`accepted embedding space "${acceptedSpaceSlug}" не найден`);
+  const activeSpaces = spaces.filter((item) => item.active);
+  const protectedBySlug = new Map<string, { space: EmbeddingSpace; roles: Set<"accepted" | "active"> }>();
+  protectedBySlug.set(acceptedSpace.slug, { space: acceptedSpace, roles: new Set(["accepted"]) });
+  for (const activeSpace of activeSpaces) {
+    if (activeSpace.slug === slug) continue;
+    const protectedSpace = protectedBySlug.get(activeSpace.slug) ?? {
+      space: activeSpace,
+      roles: new Set<"accepted" | "active">(),
+    };
+    protectedSpace.roles.add("active");
+    protectedBySlug.set(activeSpace.slug, protectedSpace);
+  }
+  const [jobs, vectors, corpus] = await Promise.all([
+    selectAll<RetireJobRow>(
+      db,
+      `SELECT id, search_document, input_sha256, status, last_error
+       FROM embedding_job WHERE embedding_space = $space ORDER BY id`,
+      { space: space.id },
+    ),
+    selectAll<RetireVectorRow>(
+      db,
+      `SELECT id, search_document, embedding_space, input_sha256,
+         array::len(vector) AS dimensions FROM ${space.physical_table} ORDER BY id`,
+    ),
+    canonicalCorpusIdentity(db),
+  ]);
+  const protectedSpaces = await Promise.all(
+    [...protectedBySlug.values()]
+      .sort((a, b) => a.space.slug.localeCompare(b.space.slug))
+      .map(({ space: protectedSpace, roles }) =>
+        collectSpaceDerivedBinding(db, protectedSpace, [...roles])
+      ),
+  );
+  const blockers: string[] = [];
+  if (space.active) blockers.push("space is active");
+  if (activeSpaces.length > 1) blockers.push(`multiple active spaces=${activeSpaces.length}`);
+  const processing = jobs.filter((job) => job.status === "processing");
+  if (processing.length > 0) blockers.push(`processing jobs=${processing.length}`);
+  const jobBinding = jobs.map((job) => ({
+    id: String(job.id),
+    documentId: String(job.search_document),
+    inputSha256: job.input_sha256,
+    status: job.status,
+    lastError: job.last_error?.trim() || undefined,
+  }));
+  const vectorBinding = vectors.map((vector) => ({
+    id: String(vector.id),
+    documentId: String(vector.search_document),
+    embeddingSpaceId: String(vector.embedding_space),
+    inputSha256: vector.input_sha256,
+    dimensions: vector.dimensions,
+  }));
+  const binding = {
+    formatVersion: 1 as const,
+    space: {
+      id: String(space.id),
+      slug: space.slug,
+      provider: space.provider,
+      model: space.model,
+      dimensions: space.dimensions,
+      distance: space.distance,
+      vectorType: space.vector_type,
+      segmentationVersion: space.segmentation_version,
+      physicalTable: space.physical_table,
+      active: space.active,
+      createdAt: new Date(space.created_at).toISOString(),
+    },
+    jobs: { count: jobs.length, sha256: retireHash(jobBinding) },
+    vectors: { count: vectors.length, sha256: retireHash(vectorBinding) },
+    acceptedSpaceSlug,
+    protectedSpaces,
+    canonicalCorpus: corpus,
+    candidateEvidencePreserved: true as const,
+    blockers: blockers.sort(),
+  };
+  const planSha256 = retireHash(binding);
+  return {
+    ...binding,
+    planSha256,
+    confirmation: retireConfirmation(slug, jobs.length, vectors.length, planSha256),
+  };
+}
+
+export interface RetireSpaceResult {
+  slug: string;
+  jobsDeleted: number;
+  vectorsDeleted: number;
+  canonicalCorpusUnchanged: true;
+  protectedSpacesVerified: true;
+  candidateEvidencePreserved: true;
+}
+
+export function serializeRetireSpacePlan(plan: RetireSpacePlan): string {
+  validateRetireSpacePlan(plan);
+  return `${JSON.stringify(canonicalizeRetire(plan), null, 2)}\n`;
+}
+
+export async function writeRetireSpacePlan(
+  filePath: string,
+  plan: RetireSpacePlan,
+  options: { overwrite?: boolean } = {},
+): Promise<void> {
+  await writePrivateFileAtomic(filePath, serializeRetireSpacePlan(plan), options);
+}
+
+export async function loadRetireSpacePlan(filePath: string): Promise<RetireSpacePlan> {
+  let source: string;
+  try {
+    source = await readFile(filePath, "utf8");
+  } catch {
+    throw new Error("embedding_space_retire_plan_read_error");
+  }
+  let plan: RetireSpacePlan;
+  try {
+    plan = JSON.parse(source) as RetireSpacePlan;
+  } catch {
+    throw new Error("embedding_space_retire_plan_invalid_json");
+  }
+  validateRetireSpacePlan(plan);
+  return plan;
+}
+
+/**
+ * Delete only one rejected inactive space and its derived rows/table. Candidate
+ * evaluation artifacts live outside these tables and are deliberately untouched.
+ */
+export async function retireSpace(
+  db: Surreal,
+  approvedPlan: RetireSpacePlan,
+  confirmation: string,
+): Promise<RetireSpaceResult> {
+  validateRetireSpacePlan(approvedPlan);
+  if (approvedPlan.blockers.length > 0) {
+    throw new Error(`embedding space retire blocked: ${approvedPlan.blockers.join("; ")}`);
+  }
+  if (confirmation !== approvedPlan.confirmation) {
+    throw new Error("embedding space retire confirmation mismatch");
+  }
+  const current = await prepareRetireSpace(
+    db,
+    approvedPlan.space.slug,
+    approvedPlan.acceptedSpaceSlug,
+  );
+  if (current.planSha256 !== approvedPlan.planSha256 || current.blockers.length > 0) {
+    throw new Error("embedding space retire plan drifted before mutation");
+  }
+  // SurrealDB 3.2.3 can deadlock when HNSW DDL is mixed into a data
+  // transaction. Remove only the rejected derived table first, then delete
+  // its metadata/jobs atomically. A failure between the two leaves the
+  // rejected space record discoverable for repair and never mutates a
+  // protected active/accepted table.
+  await db.query(`REMOVE TABLE IF EXISTS ${approvedPlan.space.physicalTable}`);
+  await db.query(
+    `BEGIN;
+     DELETE embedding_job WHERE embedding_space = $space;
+     DELETE ONLY $space;
+     COMMIT;`,
+    { space: new RecordId("embedding_space", approvedPlan.space.slug) },
+  );
+  const [remainingSpace, remainingJobs, corpus, spaces] = await Promise.all([
+    getSpaceBySlug(db, approvedPlan.space.slug),
+    selectAll<{ id: RecordId }>(
+      db,
+      "SELECT id FROM embedding_job WHERE embedding_space = $space",
+      { space: new RecordId("embedding_space", approvedPlan.space.slug) },
+    ),
+    canonicalCorpusIdentity(db),
+    listSpaces(db),
+  ]);
+  const protectedSpaces = await Promise.all(approvedPlan.protectedSpaces.map((expected) => {
+    const protectedSpace = spaces.find((space) => space.slug === expected.slug);
+    if (!protectedSpace) throw new Error("embedding space retire removed a protected space");
+    return collectSpaceDerivedBinding(db, protectedSpace, expected.roles);
+  }));
+  if (
+    remainingSpace || remainingJobs.length > 0 ||
+    corpus.documents !== approvedPlan.canonicalCorpus.documents ||
+    corpus.sha256 !== approvedPlan.canonicalCorpus.sha256 ||
+    retireHash(protectedSpaces) !== retireHash(approvedPlan.protectedSpaces)
+  ) throw new Error("embedding space retire immediate verification failed");
+  return {
+    slug: approvedPlan.space.slug,
+    jobsDeleted: approvedPlan.jobs.count,
+    vectorsDeleted: approvedPlan.vectors.count,
+    canonicalCorpusUnchanged: true,
+    protectedSpacesVerified: true,
+    candidateEvidencePreserved: true,
+  };
 }

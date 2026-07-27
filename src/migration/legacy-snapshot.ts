@@ -12,7 +12,7 @@
 
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
-import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { hashFile, type FileHashes } from "../sources/snapshot/hashing.ts";
 
@@ -23,7 +23,7 @@ export interface LegacySnapshotResult {
   snapshotPath: string;
   sha256: string;
   sizeBytes: number;
-  /** true, если snapshot с этим hash уже существовал и копирование не понадобилось. */
+  /** true, если после fresh VACUUM+hash уже существовал идентичный snapshot. */
   reused: boolean;
 }
 
@@ -41,11 +41,9 @@ async function fsyncDir(dir: string): Promise<void> {
 }
 
 /**
- * Sidecar с stat источника на момент vacuum: если legacy index.sqlite не
- * менялся (size + mtime совпадают), snapshot переиспользуется без повторного
- * VACUUM INTO и хэширования 6+ ГБ. mtime SQLite-файла меняется при любой
- * записи, поэтому совпадение stat = источник тот же; подмена sidecar вне
- * нашего архива невозможна, а битый snapshot всплывёт на анализе.
+ * Sidecar — только audit metadata. Он никогда не авторизует reuse: одинаковые
+ * size+mtime не доказывают равенство содержимого. Решение о reuse принимается
+ * после нового VACUUM INTO и полного SHA-256 получившегося snapshot'а.
  */
 interface SnapshotSourceSidecar {
   sourcePath: string;
@@ -60,49 +58,6 @@ function sidecarPath(snapshotPath: string): string {
   return `${snapshotPath}.source.json`;
 }
 
-/** Быстрый reuse по sidecar'ам существующих snapshot'ов, null если не подошло. */
-async function reuseBySidecar(
-  dir: string,
-  sourcePath: string,
-  sourceStat: { size: number; mtimeMs: number },
-): Promise<LegacySnapshotResult | null> {
-  let names: string[];
-  try {
-    names = await readdir(dir);
-  } catch {
-    return null;
-  }
-  for (const name of names) {
-    if (!name.endsWith(".source.json")) continue;
-    let sidecar: SnapshotSourceSidecar;
-    try {
-      sidecar = JSON.parse(await readFile(path.join(dir, name), "utf8"));
-    } catch {
-      continue;
-    }
-    if (
-      sidecar.sourcePath !== sourcePath ||
-      sidecar.sourceSizeBytes !== sourceStat.size ||
-      sidecar.sourceMtimeMs !== sourceStat.mtimeMs
-    ) {
-      continue;
-    }
-    try {
-      const existing = await stat(sidecar.snapshotPath);
-      if (existing.size !== sidecar.sizeBytes) continue;
-    } catch {
-      continue;
-    }
-    return {
-      snapshotPath: sidecar.snapshotPath,
-      sha256: sidecar.sha256,
-      sizeBytes: sidecar.sizeBytes,
-      reused: true,
-    };
-  }
-  return null;
-}
-
 /**
  * Создаёт (или переиспользует) snapshot-копию legacy index.sqlite.
  * Имя результата: `index__<sha256>.sqlite` — hash содержимого, не источника.
@@ -115,9 +70,9 @@ export async function ensureLegacySnapshot(
   await mkdir(dir, { recursive: true });
   const srcStat = await stat(sourcePath);
 
-  const fast = await reuseBySidecar(dir, sourcePath, srcStat);
-  if (fast) return fast;
-
+  // Нельзя доверять только size+mtime sidecar'а: SQLite-файл может быть
+  // заменён байт-в-байт по размеру с восстановленным mtime. VACUUM INTO
+  // выполняется каждый раз; reuse решается лишь по полному SHA snapshot'а.
   const stagingPath = path.join(dir, `.staging-${crypto.randomUUID()}.sqlite`);
 
   let db: Database;

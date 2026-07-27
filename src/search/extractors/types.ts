@@ -14,7 +14,7 @@
 import type { ParsedMessage } from "../../domain/canonical-types.ts";
 
 /** Версия логики извлечения (search_document.extraction_version). */
-export const EXTRACTOR_VERSION = 2;
+export const EXTRACTOR_VERSION = 3;
 
 export interface ExtractedDocument {
   content: string;
@@ -30,7 +30,12 @@ export interface HarnessExtractors {
   /** user_prompt из одного user message; undefined — извлекать нечего. */
   extractUserPrompt(message: ParsedMessage): ExtractedDocument | undefined;
   /**
-   * assistant_final по всем сообщениям диалога.
+   * assistant_final для переданного turn-window. Corpus builder
+   * вызывает extractor от одного извлечённого user_prompt до
+   * следующего. При передаче целой revision метод по-прежнему
+   * возвращает final последнего turn'а (совместимость прямых
+   * вызовов).
+   *
    * Правила §8.3: явные final markers когда есть; НЕ «последний text
    * chunk»; без reasoning/tool; текст до и после tool activity сохраняется;
    * при неоднозначности — fallback_visible_assistant_text.

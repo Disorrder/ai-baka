@@ -5,8 +5,13 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:8901:8000"
+    environment:
+      # Decimal bytes: bounded headroom for authenticated multi-GiB logical restores.
+      SURREAL_HTTP_MAX_IMPORT_BODY_SIZE: "${SURREAL_HTTP_MAX_IMPORT_BODY_SIZE:-34359738368}"
     volumes:
-      - "${BAKA_ARCHIVE_ROOT}/db:/data/db"
+      # Persistent internal default; BAKA_DB_ROOT may select another absolute
+      # APFS/POSIX path, but live RocksDB must never fall back to archive volume ExFAT.
+      - "${BAKA_DB_ROOT:-${HOME:?HOME must be set}/Library/Application Support/ai-baka/rocksdb}:/data/db"
     command:
       - start
       - --log

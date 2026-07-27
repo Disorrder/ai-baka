@@ -5,17 +5,19 @@
  * projection и так содержит только current, §8.1) с highlights
  * (FULLTEXT-индекс с HIGHLIGHTS, schema/0002).
  *
- * Forensic режим (§12.1) — BM25 по chunk.content; включается явными
- * флагами: --include-reasoning (kind=thought), --include-tools
- * (tool_call/tool_result), --include-system (system/developer),
- * --all-revisions (не только current revision).
+ * Глобальный forensic BM25 по chunk.content отключён в schema 5: canonical
+ * chunks и historical revisions сохранены, но индекс всех физических chunks
+ * слишком дорог для обязательного backup/restore path. Legacy forensic-флаги
+ * fail closed до появления отдельной ограниченной derived projection; ни один
+ * из них не должен деградировать в table scan.
  *
  * Проверенный на SurrealDB 3.2.3 синтаксис BM25:
  *   WHERE content @0@ $q            — matches operator, 0 = номер предиката
  *   search::score(0) AS score       — BM25 score по предикату 0
  *   search::highlight('<em>', '</em>', 0) — контент с подсветкой матчей
  *
- * Деградация (§14): vector/hybrid режимы — этап 7, здесь не реализованы.
+ * Общий result/filter contract переиспользуется vector/hybrid поиском
+ * (src/search/hybrid.ts), чтобы CLI-поля не расходились между режимами.
  */
 
 import type { Surreal } from "surrealdb";
@@ -24,8 +26,12 @@ import { selectAll } from "../db/repositories/helpers.ts";
 export interface SearchFilters {
   harness?: string;
   host?: string;
+  user?: string;
   workspace?: string;
+  vendor?: string;
   model?: string;
+  reasoningEffort?: string;
+  role?: string;
   documentType?: string;
   from?: Date;
   to?: Date;
@@ -44,8 +50,9 @@ export interface SearchHit {
   snippet: string;
   documentType?: string;
   segmentNo?: number;
-  /** Forensic: kind/role чанка. */
+  /** Forensic: kind чанка. */
   kind?: string;
+  /** Нормализованная role сообщения; в forensic совпадает с chunk.role. */
   role?: string;
   /** Исходное сообщение (dedup в hybrid mode, §14). */
   messageId?: string;
@@ -55,13 +62,43 @@ export interface SearchHit {
   harness?: string;
   host?: string;
   workspace?: string;
+  user?: string;
+  vendor?: string;
   model?: string;
+  reasoningEffort?: string;
+  /** Оригинальный путь source_location, не raw archive path. */
+  sourcePath?: string;
   timestamp?: string;
 }
 
-/** Forensic mode включается любым из явных флагов §12.1. */
+export const FORENSIC_SEARCH_DISABLED_MESSAGE =
+  "forensic search отключён: глобальный индекс chunk.content удалён; " +
+  "canonical chunks и historical revisions сохранены, используйте обычный поиск по " +
+  "user_prompt/assistant_final или отдельный export диалога";
+
+export class ForensicSearchDisabledError extends Error {
+  constructor() {
+    super(FORENSIC_SEARCH_DISABLED_MESSAGE);
+    this.name = "ForensicSearchDisabledError";
+  }
+}
+
+/** Legacy forensic mode запрашивается любым из прежних явных флагов. */
 export function isForensic(filters: Pick<SearchFilters, "includeReasoning" | "includeTools" | "includeSystem" | "allRevisions">): boolean {
   return Boolean(filters.includeReasoning || filters.includeTools || filters.includeSystem || filters.allRevisions);
+}
+
+/**
+ * Fail closed до подключения к БД/выполнения query. Это не fallback: без
+ * chunk_content запрос `content @...@` не должен превращаться в полный scan.
+ */
+export function assertForensicSearchDisabled(
+  filters: Pick<
+    SearchFilters,
+    "includeReasoning" | "includeTools" | "includeSystem" | "allRevisions"
+  >,
+): void {
+  if (isForensic(filters)) throw new ForensicSearchDisabledError();
 }
 
 /** Усечь highlight-контент вокруг первого матча (highlight возвращает ВЕСЬ текст). */
@@ -87,7 +124,7 @@ interface FilterClause {
   vars: Record<string, unknown>;
 }
 
-/** Общие фильтры §14 (пути полей одинаковы для search_document и chunk). */
+/** Общие фильтры normal BM25/vector/hybrid search (§14). */
 export function buildFilterClauses(filters: SearchFilters): FilterClause {
   const clauses: string[] = [];
   const vars: Record<string, unknown> = {};
@@ -101,15 +138,33 @@ export function buildFilterClauses(filters: SearchFilters): FilterClause {
     );
     vars.f_host = filters.host;
   }
+  if (filters.user) {
+    clauses.push("dialogue.os_account.os_username = $f_user");
+    vars.f_user = filters.user;
+  }
   if (filters.workspace) {
     clauses.push("dialogue.workspace.name = $f_workspace");
     vars.f_workspace = filters.workspace;
+  }
+  if (filters.vendor) {
+    clauses.push(
+      "(message.model.vendor.slug ?? dialogue.primary_model.vendor.slug) = $f_vendor",
+    );
+    vars.f_vendor = filters.vendor;
   }
   if (filters.model) {
     clauses.push(
       "(message.raw_model_name = $f_model OR message.model.canonical_name = $f_model OR dialogue.primary_model.canonical_name = $f_model)",
     );
     vars.f_model = filters.model;
+  }
+  if (filters.reasoningEffort) {
+    clauses.push("message.reasoning_effort = $f_reasoning_effort");
+    vars.f_reasoning_effort = filters.reasoningEffort;
+  }
+  if (filters.role) {
+    clauses.push("message.role = $f_role");
+    vars.f_role = filters.role;
   }
   if (filters.from) {
     clauses.push("(message.timestamp ?? dialogue.updated_at) >= $f_from");
@@ -135,6 +190,7 @@ interface HitRow {
   segment_no?: number;
   kind?: string;
   role?: string;
+  message_role?: string;
   message_id?: unknown;
   dialogue_id: unknown;
   dialogue_title?: string;
@@ -142,7 +198,11 @@ interface HitRow {
   harness?: string;
   host?: string;
   workspace?: string;
+  os_user?: string;
+  model_vendor?: string;
   model?: string;
+  reasoning_effort?: string;
+  source_path?: string;
   ts?: Date;
 }
 
@@ -154,7 +214,7 @@ function toHit(row: HitRow): SearchHit {
     documentType: row.document_type,
     segmentNo: row.segment_no,
     kind: row.kind,
-    role: row.role,
+    role: row.role ?? row.message_role,
     messageId: row.message_id ? String(row.message_id) : undefined,
     dialogueId: String(row.dialogue_id),
     dialogueTitle: row.dialogue_title,
@@ -162,7 +222,11 @@ function toHit(row: HitRow): SearchHit {
     harness: row.harness,
     host: row.host,
     workspace: row.workspace,
+    user: row.os_user,
+    vendor: row.model_vendor,
     model: row.model,
+    reasoningEffort: row.reasoning_effort,
+    sourcePath: row.source_path,
     timestamp: row.ts?.toISOString(),
   };
 }
@@ -174,8 +238,13 @@ const CONTEXT_SELECT = `
   dialogue_revision.id AS revision_id,
   dialogue.harness_installation.harness.slug AS harness,
   (dialogue.harness_installation.host.label ?? dialogue.harness_installation.host.hostname) AS host,
+  dialogue.os_account.os_username AS os_user,
   dialogue.workspace.name AS workspace,
+  (message.model.vendor.slug ?? dialogue.primary_model.vendor.slug) AS model_vendor,
   (message.raw_model_name ?? dialogue.primary_model.canonical_name) AS model,
+  message.reasoning_effort AS reasoning_effort,
+  message.role AS message_role,
+  dialogue_revision.source_revision.source_location.original_path AS source_path,
   (message.timestamp ?? dialogue.updated_at) AS ts`;
 
 /** Обычный поиск: BM25 по search_document (только current revisions, §8.1). */
@@ -184,6 +253,7 @@ export async function searchText(
   query: string,
   filters: SearchFilters,
 ): Promise<SearchHit[]> {
+  assertForensicSearchDisabled(filters);
   const { clause, vars } = buildFilterClauses(filters);
   let typeClause = "";
   if (filters.documentType) {
@@ -198,38 +268,21 @@ export async function searchText(
        ${CONTEXT_SELECT}
      FROM search_document
      WHERE content @0@ $q${typeClause}${clause}
-     ORDER BY score DESC
+     ORDER BY score DESC, id ASC
      LIMIT $limit`,
     { q: query, limit: filters.limit, ...vars },
   );
   return rows.map(toHit);
 }
 
-/** Forensic search (§12.1): BM25 по chunk.content с фильтрами по kind. */
+/**
+ * Compatibility seam для старых library callers. Всегда отказывает до
+ * обращения к БД: schema 5 не имеет глобального chunk_content index.
+ */
 export async function searchForensic(
-  db: Surreal,
-  query: string,
-  filters: SearchFilters,
+  _db: Surreal,
+  _query: string,
+  _filters: SearchFilters,
 ): Promise<SearchHit[]> {
-  const kinds = ["text"];
-  if (filters.includeReasoning) kinds.push("thought");
-  if (filters.includeTools) kinds.push("tool_call", "tool_result");
-  if (filters.includeSystem) kinds.push("system", "developer");
-  const { clause, vars } = buildFilterClauses(filters);
-  const revisionClause = filters.allRevisions
-    ? ""
-    : " AND dialogue_revision = dialogue.current_revision";
-  const rows = await selectAll<HitRow>(
-    db,
-    `SELECT id, kind, role,
-       search::score(0) AS score,
-       search::highlight('<em>', '</em>', 0) AS hl,
-       ${CONTEXT_SELECT}
-     FROM chunk
-     WHERE content @0@ $q AND kind INSIDE $kinds${revisionClause}${clause}
-     ORDER BY score DESC
-     LIMIT $limit`,
-    { q: query, kinds, limit: filters.limit, ...vars },
-  );
-  return rows.map(toHit);
+  throw new ForensicSearchDisabledError();
 }

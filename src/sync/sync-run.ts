@@ -36,7 +36,9 @@ import {
   detectRenames,
   reconcileLocations,
   type LocationState,
+  type ReconcileResult,
   type ScanFileInfo,
+  type ScanSummary,
 } from "./location-reconciler.ts";
 import { HARNESS_TOOLS, kimiSessionDir } from "./harness-tools.ts";
 import { localIdentity } from "./host-identity.ts";
@@ -59,6 +61,7 @@ import {
   listActiveEmbeddingSpaces,
   listLocations,
   resolveStaleIngestErrors,
+  resolveStaleSnapshotIngestErrors,
   setLocationRenamedFrom,
   setLocationRevisions,
   updateLocationPresence,
@@ -81,6 +84,8 @@ export interface SyncOptions {
   preflight?: boolean;
   hostIdPath?: string;
   logger?: (event: Record<string, unknown>) => void;
+  /** Deterministic test seam; production always uses snapshotSource. */
+  snapshotSource?: typeof snapshotSource;
 }
 
 export interface SyncSummary {
@@ -245,6 +250,7 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
           fullRescan: options.fullRescan ?? false,
           dryRun,
           log,
+          snapshot: options.snapshotSource ?? snapshotSource,
         });
         counters.filesSeen += outcome.filesSeen;
         counters.filesNew += outcome.filesNew;
@@ -305,6 +311,65 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
   return { status: runStatus, syncRunId: syncRunId?.toString(), counters, errors };
 }
 
+export interface ReconcileScannedFilesOptions {
+  fullRescan: boolean;
+  deletionConfirmations: number;
+  resolvePath: (relativePath: string) => string;
+  /** Seam для regression-тестов; production читает первые 64 КБ файла. */
+  readHeadHash?: (filePath: string) => Promise<string | null>;
+}
+
+/**
+ * Нормализует fingerprint'ы scan и сверяет их с сохранёнными locations.
+ *
+ * Обычный sync защищён head_hash от изменения содержимого при тех же
+ * size/mtime. --full-rescan намеренно доверяет size_bytes + mtime_ms и не
+ * читает head_hash для совпавших файлов: большой архив не перехэшируется и
+ * не snapshot'ится целиком; new/changed по метаданным остаются changed. Это
+ * компромисс относительно docs/plan.md §10.3: изменение с полностью теми же
+ * size/mtime будет пропущено (для append-only JSONL считаем маловероятным).
+ */
+export async function reconcileScannedFiles(
+  previous: LocationState[],
+  scan: ScanSummary,
+  options: ReconcileScannedFilesOptions,
+): Promise<ReconcileResult> {
+  const previousByPath = new Map(
+    previous.map((location) => [location.relativePath, location]),
+  );
+  const scanFiles: ScanFileInfo[] = scan.files.map((file) => ({
+    ...file,
+    // mtime_ms в SurrealDB хранится как int.
+    mtimeMs: Math.round(file.mtimeMs),
+  }));
+
+  if (!options.fullRescan) {
+    const readHeadHash = options.readHeadHash ?? headFileHash;
+    for (const file of scanFiles) {
+      const previousLocation = previousByPath.get(file.relativePath);
+      if (!previousLocation?.headHash) continue;
+      if (
+        previousLocation.sizeBytes !== file.sizeBytes ||
+        previousLocation.mtimeMs !== file.mtimeMs
+      ) {
+        continue;
+      }
+      // null (не прочитался) → sentinel, гарантированно не совпадающий с
+      // sha256-hex в БД: файл считается changed, полный snapshot зафиксирует
+      // настоящую ошибку чтения.
+      file.headHash =
+        (await readHeadHash(options.resolvePath(file.relativePath))) ??
+        `unreadable:${file.relativePath}`;
+    }
+  }
+
+  return reconcileLocations(
+    previous,
+    { status: scan.status, files: scanFiles },
+    { deletionConfirmations: options.deletionConfirmations },
+  );
+}
+
 interface ProcessRootArgs {
   root: DiscoveredSourceRoot;
   /** undefined в dry-run (read-only режим, identity-записи не создаются). */
@@ -318,6 +383,7 @@ interface ProcessRootArgs {
   fullRescan: boolean;
   dryRun: boolean;
   log: Logger;
+  snapshot: typeof snapshotSource;
 }
 
 async function processSourceRoot(
@@ -391,7 +457,7 @@ async function processSourceRoot(
   // зависнуть незавершённым (finished_at = NONE).
   try {
     const prevRows = rootId ? await listLocations(db, rootId) : [];
-    const prevByPath = new Map(prevRows.map((r) => [r.relative_path, r]));
+    const prevByPath = new Map(prevRows.map((row) => [row.relative_path, row]));
     const previous: LocationState[] = prevRows.map((r) => ({
       relativePath: r.relative_path,
       presence: {
@@ -408,29 +474,15 @@ async function processSourceRoot(
     // тогда relativePath = basename, а исходный путь — сам root.
     const rootIsFile = (await stat(root.path).catch(() => undefined))?.isFile() ?? false;
 
-    // §10.3: при совпадении size/mtime с прежней revision сверяем head_hash —
-    // изменение файла с сохранёнными size/mtime не должно теряться. Первые
-    // 64 КБ читаются ТОЛЬКО для таких файлов; mtime_ms в схеме — int,
-    // fingerprint нормализуем к семантике хранения.
-    const scanFiles: ScanFileInfo[] = scan.files.map((f) => ({
-      ...f,
-      mtimeMs: Math.round(f.mtimeMs),
-    }));
-    for (const f of scanFiles) {
-      const prev = prevByPath.get(f.relativePath);
-      if (!prev?.head_hash) continue;
-      if (prev.size_bytes !== f.sizeBytes || prev.mtime_ms !== f.mtimeMs) continue;
-      const fullPath = rootIsFile ? root.path : path.join(root.path, f.relativePath);
-      // null (не прочитался) → sentinel, гарантированно не совпадающий с
-      // sha256-hex в БД: файл считается changed, полный snapshot зафиксирует
-      // настоящую ошибку чтения.
-      f.headHash = (await headFileHash(fullPath)) ?? `unreadable:${f.relativePath}`;
-    }
-
-    const reconcile = reconcileLocations(
+    const reconcile = await reconcileScannedFiles(
       previous,
-      { status: scan.status, files: scanFiles },
-      { deletionConfirmations: args.deletionConfirmations },
+      scan,
+      {
+        fullRescan: args.fullRescan,
+        deletionConfirmations: args.deletionConfirmations,
+        resolvePath: (relativePath) =>
+          rootIsFile ? root.path : path.join(root.path, relativePath),
+      },
     );
     const scanByPath = new Map(scan.files.map((f) => [f.relativePath, f]));
     const seenPaths = new Set(scan.files.map((f) => f.relativePath));
@@ -457,10 +509,7 @@ async function processSourceRoot(
     const failedSnapshotPaths = new Set<string>();
     /** Неудавшийся snapshot НОВОГО файла: rename detection пропускаем (§10.7). */
     let newSnapshotFailed = false;
-    const actions = reconcile.actions.map((a) =>
-      args.fullRescan && a.kind === "unchanged" ? { kind: "changed" as const, relativePath: a.relativePath } : a,
-    );
-    for (const action of actions) {
+    for (const action of reconcile.actions) {
       if (action.kind !== "new" && action.kind !== "changed") continue;
       const originalPath = rootIsFile ? root.path : path.join(root.path, action.relativePath);
       const location = await ensureSourceLocation(db, {
@@ -478,7 +527,7 @@ async function processSourceRoot(
 
       let snapshot;
       try {
-        snapshot = await snapshotSource(originalPath, {
+        snapshot = await args.snapshot(originalPath, {
           archiveRoot: cfg.archiveRoot,
           harness: slug,
           runId,
@@ -490,6 +539,9 @@ async function processSourceRoot(
         log({ event: "snapshot_error", path: action.relativePath, error: String(error) });
         await createIngestError(db, {
           syncRun: syncRunId,
+          // Durable machine provenance. Historical rows without this key
+          // remain fail-closed because message text is not an identity.
+          sourceRecordKey: location.id.toString(),
           stage: "snapshot",
           errorCode: error instanceof SnapshotError ? "snapshot_failed" : "snapshot_exception",
           // Путь в сообщении: иначе голое "unable to open database file"
@@ -514,6 +566,12 @@ async function processSourceRoot(
         syncRun: syncRunId,
       });
       if (revision.created) outcome.revisionsCreated += 1;
+      await resolveStaleSnapshotIngestErrors(
+        db,
+        location.id,
+        revision.id,
+        syncRunId,
+      );
       log({
         event: "snapshot",
         path: action.relativePath,
@@ -552,7 +610,7 @@ async function processSourceRoot(
       embeddingTables: args.embeddingTables,
     };
 
-    /** Итоги re-parse по revision для bulk-разрешения старых ingest_errors. */
+    /** Итоги re-parse по revision для fail-closed разрешения после parsed. */
     const parseResults = new Map<string, { revisionId: RecordId; status: string }>();
 
     const applyOutcomeToRevision = async (
@@ -578,19 +636,16 @@ async function processSourceRoot(
     };
 
     /**
-     * Re-parse (обычно после фикса parser'а) заменяет прежний результат:
-     * старые unresolved ingest_errors этих revision — исторические
-     * дубликаты, закрываем их батчами (§7.2 resolved_at/resolution).
+     * Re-parse (обычно после фикса parser'а) заменяет прежний результат
+     * только при status=parsed. Unsupported/partial/parse_error остаются
+     * актуальным quarantine и не могут быть скрыты новым неуспехом.
      */
     const resolveStaleErrors = async () => {
-      const byStatus = new Map<string, RecordId[]>();
-      for (const { revisionId, status } of parseResults.values()) {
-        const list = byStatus.get(status) ?? [];
-        list.push(revisionId);
-        byStatus.set(status, list);
-      }
-      for (const [status, ids] of byStatus) {
-        await resolveStaleIngestErrors(db, ids, syncRunId, `reparse:${status}`);
+      const parsed = [...parseResults.values()]
+        .filter((result) => result.status === "parsed")
+        .map((result) => result.revisionId);
+      if (parsed.length > 0) {
+        await resolveStaleIngestErrors(db, parsed, syncRunId, "reparse:parsed");
       }
     };
 

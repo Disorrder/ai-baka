@@ -5,10 +5,24 @@
 
 import { spawn } from "node:child_process";
 import { openSync, closeSync } from "node:fs";
+import { PassThrough, type Readable } from "node:stream";
 
 export type Compression = "zstd" | "gzip";
 
 class CompressError extends Error {}
+
+function decompressionCommand(
+  input: string,
+  readFromStdin = false,
+): { cmd: string; args: string[] } {
+  if (input.endsWith(".zst")) {
+    return { cmd: "zstd", args: ["-q", "-d", "-c", ...(readFromStdin ? [] : [input])] };
+  }
+  if (input.endsWith(".gz")) {
+    return { cmd: "gzip", args: ["-d", "-c", ...(readFromStdin ? [] : [input])] };
+  }
+  throw new CompressError(`неизвестный формат сжатия: ${input}`);
+}
 
 async function run(cmd: string, args: string[], stdoutPath?: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -55,11 +69,92 @@ export async function compressFile(
 }
 
 export async function decompressFile(input: string, output: string): Promise<void> {
-  if (input.endsWith(".zst")) {
-    await run("zstd", ["-q", "-d", "-c", input], output);
-  } else if (input.endsWith(".gz")) {
-    await run("gzip", ["-d", "-c", input], output);
-  } else {
-    throw new CompressError(`неизвестный формат сжатия: ${input}`);
+  const command = decompressionCommand(input);
+  await run(command.cmd, command.args, output);
+}
+
+/**
+ * Gives a consumer the decompressor stdout without materializing an
+ * intermediate plaintext file. Success requires both the consumer and the
+ * decompressor process to finish successfully; a consumer failure terminates
+ * the producer and the original error is preserved.
+ */
+export async function withDecompressedStream<T>(
+  input: string,
+  consume: (stream: Readable) => Promise<T>,
+  options: { inputFd?: number } = {},
+): Promise<T> {
+  if (options.inputFd !== undefined &&
+      (!Number.isSafeInteger(options.inputFd) || options.inputFd < 0)) {
+    throw new CompressError("невалидный дескриптор входного файла");
+  }
+  const { cmd, args } = decompressionCommand(input, options.inputFd !== undefined);
+  const child = spawn(cmd, args, {
+    stdio: [options.inputFd ?? "ignore", "pipe", "pipe"],
+  });
+  const childStdout = child.stdout;
+  const childStderr = child.stderr;
+  if (!childStdout || !childStderr) {
+    child.kill("SIGTERM");
+    throw new CompressError(`${cmd}: потоки декомпрессора недоступны`);
+  }
+  // Do not expose EOF until the process exit status is known. Otherwise a
+  // corrupt stream can make the SQL consumer report a misleading validation
+  // error in the short interval between stdout EOF and a non-zero close.
+  const output = new PassThrough();
+  output.setEncoding("utf8");
+  childStdout.pipe(output, { end: false });
+
+  let stderr = "";
+  childStderr.on("data", (chunk) => {
+    stderr += chunk.toString();
+  });
+  const completed = new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const fail = (error: CompressError): void => {
+      if (settled) return;
+      settled = true;
+      output.destroy(error);
+      reject(error);
+    };
+    child.once("error", (error) => {
+      fail(new CompressError(`${cmd} не найден: ${error.message}`));
+    });
+    child.once("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      if (code === 0) {
+        output.end();
+        resolve();
+        return;
+      }
+      const status = code === null ? `сигналом ${signal ?? "unknown"}` : `с кодом ${code}`;
+      const error = new CompressError(`${cmd} завершился ${status}: ${stderr.trim()}`);
+      output.destroy(error);
+      reject(error);
+    });
+  });
+  let consumerError: unknown;
+  const consumed = Promise.resolve()
+    .then(() => consume(output))
+    .catch((error) => {
+      consumerError = error;
+      childStdout.unpipe(output);
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      throw error;
+    });
+
+  try {
+    const [result] = await Promise.all([consumed, completed]);
+    return result;
+  } catch (error) {
+    childStdout.unpipe(output);
+    childStdout.destroy();
+    output.destroy();
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    // Both promises already have handlers through Promise.all. Await them here
+    // so the subprocess and consumer cannot outlive the failed recovery step.
+    await Promise.allSettled([consumed, completed]);
+    throw consumerError ?? error;
   }
 }

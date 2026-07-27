@@ -27,7 +27,10 @@ import type {
   ParsedDialogue,
   ParsedMessage,
 } from "../../domain/canonical-types.ts";
-import type { HarnessExtractors } from "../../search/extractors/types.ts";
+import type {
+  ExtractedDocument,
+  HarnessExtractors,
+} from "../../search/extractors/types.ts";
 import { SEGMENTATION_VERSION, segmentDocument } from "../../search/segmenter.ts";
 import { normalizeUsageEvents } from "../../parsers/shared/usage-normalization.ts";
 import {
@@ -126,7 +129,10 @@ export interface PreparedSearchDoc {
  * (§13.4), до транзакции. Простое правило source_chunks: каждый сегмент
  * ссылается на ВСЕ chunks исходного извлечённого документа (они покрывают
  * его целиком; точное отображение сегмент→chunk — избыточно).
- * Детерминированный id включает documentType + порядковый номер документа
+ * Каждый извлечённый user_prompt задаёт turn-window до следующего
+ * извлечённого user_prompt. Для каждого такого turn'а создаётся
+ * свой assistant_final, если в turn'е есть видимый assistant text.
+ * Детерминированный id включает documentType + порядковый номер turn'а
  * + segment_no.
  */
 export function prepareSearchDocuments(
@@ -159,15 +165,31 @@ export function prepareSearchDocuments(
     }
   };
 
-  let userPromptIndex = 0;
-  for (const message of parsed.messages) {
+  const turns: Array<{
+    messageIndex: number;
+    message: ParsedMessage;
+    prompt: ExtractedDocument;
+  }> = [];
+  for (const [messageIndex, message] of parsed.messages.entries()) {
     const extracted = extractors.extractUserPrompt(message);
     if (!extracted || extracted.content.trim().length === 0) continue;
-    pushDoc("user_prompt", userPromptIndex++, message.sequence, extracted);
+    turns.push({ messageIndex, message, prompt: extracted });
   }
-  const final = extractors.extractAssistantFinal(parsed.messages);
-  if (final && final.content.trim().length > 0) {
-    pushDoc("assistant_final", 0, final.sourceChunks[0]?.messageSequence, final);
+
+  for (const [turnIndex, turn] of turns.entries()) {
+    pushDoc("user_prompt", turnIndex, turn.message.sequence, turn.prompt);
+
+    const nextMessageIndex = turns[turnIndex + 1]?.messageIndex ?? parsed.messages.length;
+    const turnMessages = parsed.messages.slice(turn.messageIndex, nextMessageIndex);
+    const final = extractors.extractAssistantFinal(turnMessages);
+    if (final && final.content.trim().length > 0) {
+      pushDoc(
+        "assistant_final",
+        turnIndex,
+        final.sourceChunks[0]?.messageSequence,
+        final,
+      );
+    }
   }
   return docs;
 }
@@ -458,6 +480,10 @@ export async function writeDialogueRevision(
     );
     for (const chunk of message.chunks) {
       const content = chunk.content ?? "";
+      // Parser v2 preserves unknown events without truncation. Returning
+      // every created chunk would mirror all of that content in the RPC
+      // response even though the writer never consumes it; RETURN NONE
+      // keeps the one-query transaction while bounding response memory.
       tx.add(
         `CREATE ONLY type::record("chunk", ${tx.param(chunkRecordId(revisionKey, message.sequence, chunk.sequence))}) SET ` +
           [
@@ -480,8 +506,7 @@ export async function writeDialogueRevision(
                 ["metadata", Object.keys(chunk.metadata).length > 0 ? clean(chunk.metadata) : undefined],
               ])
               .split(", "),
-          ].join(", ") +
-          `;`,
+          ].join(", ") + ` RETURN NONE;`,
       );
     }
   }

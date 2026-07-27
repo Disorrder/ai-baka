@@ -9,9 +9,11 @@
  * Подсчёт токенов — эвристика chars/3.5 (консервативная для смешанного
  * русско-английского текста с кодом: для кириллицы BPE-токенов обычно
  * больше, чем chars/3.5, поэтому запас до 8192 оставлен намеренно).
- * Точный tokenizer OpenAI появится на этапе 7 — seam уже есть:
- * segmentDocument принимает counter, и его можно заменить без смены
- * логики границ (тогда bump'нуть SEGMENTATION_VERSION).
+ * segmentDocument принимает TokenCounter seam, поэтому exact tokenizer
+ * можно подставить без смены логики границ. Production exact-count workflow
+ * этапа 11 находится в src/embeddings/token-count.ts; текущий default
+ * намеренно остаётся heuristic fallback. Если exact counter применяется к
+ * самой сегментации, нужно bump'нуть SEGMENTATION_VERSION.
  *
  * Приоритет границ (§13.4): Markdown headings → абзацы → code fences
  * целиком → diff/file sections → списки → token-based split.
@@ -46,7 +48,7 @@ export const MAX_TOKENS = 8000;
 
 export type TokenCounter = (text: string) => number;
 
-/** Эвристический counter (chars/3.5); на этапе 7 заменяется точным tokenizer'ом. */
+/** Эвристический default (chars/3.5); exact counter передаётся явно. */
 export const heuristicTokenCounter: TokenCounter = (text) =>
   Math.ceil(text.length / CHARS_PER_TOKEN);
 

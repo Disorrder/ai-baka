@@ -41,6 +41,14 @@ export interface ApplyOptions {
   sentinel?: ArchiveSentinel;
 }
 
+type LoadedMigration = Readonly<
+  MigrationFile & {
+    checksum: string;
+    /** Immutable string snapshot: этот же payload хэшируется и передаётся в db.query. */
+    content: string;
+  }
+>;
+
 /** SHA-256 содержимого файла миграции (hex). */
 export function checksum(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
@@ -78,10 +86,10 @@ export async function listMigrations(dir: string = SCHEMA_DIR): Promise<Migratio
  * - версия в БД новее всех известных → ошибка (код старее базы);
  * - возвращает файлы, которые нужно применить.
  */
-export function planPendingMigrations(
-  files: Array<MigrationFile & { checksum: string }>,
-  applied: AppliedMigration[],
-): Array<MigrationFile & { checksum: string }> {
+export function planPendingMigrations<T extends Readonly<MigrationFile & { checksum: string }>>(
+  files: readonly T[],
+  applied: readonly AppliedMigration[],
+): T[] {
   const byVersion = new Map(files.map((f) => [f.version, f]));
   const maxKnown = files.length ? Math.max(...files.map((f) => f.version)) : 0;
   for (const row of applied) {
@@ -196,15 +204,19 @@ export async function applyMigrations(
   await ensureMigrationTable(db);
   const applied = await readApplied(db);
 
-  const withChecksums = await Promise.all(
-    files.map(async (f) => ({ ...f, checksum: checksum(await readFile(f.path, "utf8")) })),
+  const loaded = await Promise.all(
+    files.map(async (file): Promise<LoadedMigration> => {
+      // Строки JS неизменяемы: один snapshot исключает подмену файла между
+      // checksum-проверкой и выполнением этого же migration payload.
+      const content = await readFile(file.path, "utf8");
+      return Object.freeze({ ...file, content, checksum: checksum(content) });
+    }),
   );
-  const pending = planPendingMigrations(withChecksums, applied);
+  const pending = planPendingMigrations(loaded, applied);
 
   const appliedNow: number[] = [];
   for (const migration of pending) {
-    const content = await readFile(migration.path, "utf8");
-    await db.query(content);
+    await db.query(migration.content);
     await db.query(
       `CREATE schema_migration SET
         version = $version,

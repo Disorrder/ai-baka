@@ -34,6 +34,7 @@ import type { EmbeddingsConfig } from "../config.ts";
 import type { EmbeddingProvider } from "./provider.ts";
 import { EmbeddingProviderError } from "./provider.ts";
 import { OpenAIEmbeddingProvider } from "./openai-provider.ts";
+import { mockVector } from "./mock-provider.ts";
 import { privacyExclusion, type PrivacyPolicy } from "./privacy.ts";
 import { getSpaceBySlug, listSpaces, type EmbeddingSpace } from "./spaces.ts";
 
@@ -43,6 +44,10 @@ export const LEASE_TIMEOUT_MS = 5 * 60 * 1000;
 export const MAX_ATTEMPTS = 8;
 /** Размер батча одного вызова provider. */
 export const BATCH_SIZE = 64;
+/** Официальный предел суммы input tokens одного /v1/embeddings request. */
+export const EMBEDDING_REQUEST_TOKEN_LIMIT = 300_000;
+/** Официальный предел одного input для поддерживаемых text-embedding моделей. */
+export const EMBEDDING_INPUT_TOKEN_LIMIT = 8_192;
 /** База exponential backoff (мс). */
 export const BACKOFF_BASE_MS = 10_000;
 /** Потолок backoff (мс) — 1 час. */
@@ -51,6 +56,88 @@ export const BACKOFF_MAX_MS = 3_600_000;
 /** Exponential backoff: base * 2^(attempt-1), ограниченный потолком. */
 export function backoffMs(attempt: number): number {
   return Math.min(BACKOFF_BASE_MS * 2 ** Math.max(0, attempt - 1), BACKOFF_MAX_MS);
+}
+
+export interface EmbeddingBatchTokenEvidence {
+  /** Ровно тот текст, который будет передан provider'у. */
+  content: string;
+  /** Exact count либо сохранённая search_document.token_count оценка. */
+  tokenCount?: number;
+  /** true разрешён только для проверенного exact-token report. */
+  exact?: boolean;
+}
+
+/**
+ * Верхняя граница tokens для безопасной упаковки одного input.
+ *
+ * Exact evidence используется как есть. Для сохранённой эвристики берётся
+ * максимум с UTF-8 byte length: text-embedding-3-* использует byte-level BPE,
+ * поэтому валидный token не может покрывать меньше одного байта. Если evidence
+ * отсутствует/повреждён или byte-bound достигает per-input limit, резервируем
+ * полные 8192 tokens — это fail-closed, но всё ещё позволяет запросы ≤ 36 docs.
+ */
+export function embeddingInputTokenUpperBound(
+  evidence: EmbeddingBatchTokenEvidence,
+): number {
+  if (typeof evidence.content !== "string") {
+    throw new Error("embedding_batch_content_invalid");
+  }
+  const tokens = evidence.tokenCount;
+  if (evidence.exact) {
+    if (
+      !Number.isSafeInteger(tokens) || Number(tokens) < 0 ||
+      Number(tokens) > EMBEDDING_INPUT_TOKEN_LIMIT
+    ) {
+      throw new Error("embedding_batch_exact_token_evidence_invalid");
+    }
+    return Number(tokens);
+  }
+
+  const utf8Bytes = Buffer.byteLength(evidence.content, "utf8");
+  if (
+    tokens === undefined || !Number.isSafeInteger(tokens) || tokens < 0 ||
+    tokens >= EMBEDDING_INPUT_TOKEN_LIMIT || utf8Bytes >= EMBEDDING_INPUT_TOKEN_LIMIT
+  ) {
+    return EMBEDDING_INPUT_TOKEN_LIMIT;
+  }
+  return Math.max(utf8Bytes, tokens);
+}
+
+/**
+ * Stable greedy packing for one provider/model. Every returned request has at
+ * most `maxInputs` (and never more than BATCH_SIZE) and at most 300k tokens.
+ * Input order is preserved, so retry ordering and deterministic job identity
+ * remain unchanged.
+ */
+export function packEmbeddingRequestBatches<T>(
+  inputs: readonly T[],
+  evidenceOf: (input: T) => EmbeddingBatchTokenEvidence,
+  maxInputs = BATCH_SIZE,
+): T[][] {
+  if (!Number.isSafeInteger(maxInputs) || maxInputs < 1 || maxInputs > BATCH_SIZE) {
+    throw new Error(`embedding batch maxInputs must be 1..${BATCH_SIZE}`);
+  }
+  const batches: T[][] = [];
+  let batch: T[] = [];
+  let batchTokens = 0;
+  for (const input of inputs) {
+    const tokens = embeddingInputTokenUpperBound(evidenceOf(input));
+    if (tokens > EMBEDDING_REQUEST_TOKEN_LIMIT) {
+      throw new Error("embedding_input_exceeds_request_token_limit");
+    }
+    if (
+      batch.length > 0 &&
+      (batch.length >= maxInputs || batchTokens + tokens > EMBEDDING_REQUEST_TOKEN_LIMIT)
+    ) {
+      batches.push(batch);
+      batch = [];
+      batchTokens = 0;
+    }
+    batch.push(input);
+    batchTokens += tokens;
+  }
+  if (batch.length > 0) batches.push(batch);
+  return batches;
 }
 
 /**
@@ -126,10 +213,14 @@ export interface EmbeddingJobRow {
   completed_at?: Date;
 }
 
-interface DocRow {
+export interface EmbeddingDocumentRow {
   id: RecordId;
   content: string;
+  content_sha256: string;
+  token_count: number;
   document_type: string;
+  extraction_version: string;
+  segmentation_version: string;
   harness?: string;
   workspace?: string;
 }
@@ -156,19 +247,32 @@ const DUE_JOBS_WHERE = `(status = "pending" OR (status = "retryable_error" AND (
  */
 export async function leaseJobs(
   db: Surreal,
-  opts: { spaceId?: RecordId; limit: number; workerId: string; now?: Date },
+  opts: {
+    spaceId?: RecordId;
+    limit: number;
+    workerId: string;
+    now?: Date;
+    jobIds?: readonly RecordId[];
+  },
 ): Promise<EmbeddingJobRow[]> {
   const now = opts.now ?? new Date();
   const spaceClause = opts.spaceId ? "AND embedding_space = $space" : "";
+  const jobsClause = opts.jobIds ? "AND id INSIDE $jobIds" : "";
   const rows = await db.query<[unknown, unknown, EmbeddingJobRow[]]>(
     `BEGIN;
      LET $ids = (SELECT VALUE id FROM embedding_job
        WHERE ${DUE_JOBS_WHERE}
-       ${spaceClause} ORDER BY created_at LIMIT $limit);
+       ${spaceClause} ${jobsClause} ORDER BY created_at LIMIT $limit);
      UPDATE embedding_job SET status = "processing", locked_by = $worker, locked_at = $now
        WHERE id INSIDE $ids AND status INSIDE ["pending", "retryable_error"];
      COMMIT;`,
-    { now, limit: opts.limit, worker: opts.workerId, space: opts.spaceId },
+    {
+      now,
+      limit: opts.limit,
+      worker: opts.workerId,
+      space: opts.spaceId,
+      jobIds: opts.jobIds,
+    },
   );
   // Результаты statements: BEGIN, LET, UPDATE, COMMIT — нужен UPDATE (индекс 2).
   return rows[2] ?? [];
@@ -184,7 +288,7 @@ export interface WorkerSummary {
   batches: number;
 }
 
-export interface WorkerOptions {
+interface WorkerOptions {
   /** Только один space (slug). По умолчанию — все spaces. */
   spaceSlug?: string;
   /** Максимум jobs за запуск. */
@@ -202,6 +306,204 @@ export interface WorkerOptions {
  * отсутствующая конфигурация (API key) → понятная ошибка.
  */
 export type ProviderFactory = (space: EmbeddingSpace) => EmbeddingProvider;
+
+/**
+ * Data-only fault script for the library-owned offline provider. Functions,
+ * provider objects and delegates are deliberately not part of this contract.
+ */
+export interface OfflineMockWorkerOptions {
+  spaceSlug?: string;
+  limit?: number;
+  batchSize?: number;
+  privacy: PrivacyPolicy;
+  workerId?: string;
+  dimensionOverride?: number;
+  failures?: readonly ("retryable" | "permanent")[];
+}
+
+const offlineMockCapabilities = new WeakSet<EmbeddingProvider>();
+
+function offlineMockProvider(
+  space: EmbeddingSpace,
+  options: Pick<OfflineMockWorkerOptions, "dimensionOverride" | "failures">,
+): EmbeddingProvider {
+  const failures = [...(options.failures ?? [])];
+  const dimensions = options.dimensionOverride ?? space.dimensions;
+  const provider = Object.freeze<EmbeddingProvider>({
+    provider: "library-owned-offline-mock",
+    model: space.model,
+    dimensions: space.dimensions,
+    async embed(texts) {
+      const failure = failures.shift();
+      if (failure) {
+        throw new EmbeddingProviderError(
+          `offline_mock_${failure}_failure`,
+          failure === "retryable",
+        );
+      }
+      const promptTokens = texts.reduce((sum, text) => sum + Math.ceil(text.length / 4), 0);
+      return {
+        vectors: texts.map((text) => mockVector(text, dimensions)),
+        usage: { promptTokens, totalTokens: promptTokens },
+      };
+    },
+  });
+  offlineMockCapabilities.add(provider);
+  return provider;
+}
+
+function validateOfflineMockOptions(value: unknown): asserts value is OfflineMockWorkerOptions {
+  const plainDataObject = (item: unknown): item is Record<string, unknown> =>
+    Boolean(item) && typeof item === "object" && !Array.isArray(item) &&
+    [Object.prototype, null].includes(Object.getPrototypeOf(item)) &&
+    Object.values(Object.getOwnPropertyDescriptors(item)).every(
+      (descriptor) => descriptor.get === undefined && descriptor.set === undefined,
+    );
+  const stringArray = (item: unknown): item is string[] => {
+    if (!Array.isArray(item) || Object.getPrototypeOf(item) !== Array.prototype) return false;
+    const descriptors = Object.getOwnPropertyDescriptors(item);
+    const numericKeys = Object.keys(descriptors).filter((key) => key !== "length");
+    return numericKeys.length === item.length && Object.entries(descriptors).every(([key, descriptor]) =>
+      key === "length" ||
+      (/^(?:0|[1-9]\d*)$/.test(key) && descriptor.get === undefined &&
+        descriptor.set === undefined && typeof descriptor.value === "string"));
+  };
+  if (
+    !plainDataObject(value)
+  ) {
+    throw new Error("offline_mock_worker_options_invalid");
+  }
+  const options = value as Record<string, unknown>;
+  const allowed = new Set([
+    "spaceSlug", "limit", "batchSize", "privacy", "workerId", "dimensionOverride", "failures",
+  ]);
+  if (Object.keys(options).some((key) => !allowed.has(key))) {
+    throw new Error("offline_mock_worker_options_invalid");
+  }
+  const privacy = options.privacy;
+  const privacyKeys = new Set([
+    "excludeHarnesses", "excludeWorkspaces", "excludeDocumentTypes", "maxDocumentBytes",
+  ]);
+  if (
+    !plainDataObject(privacy) ||
+    Object.keys(privacy).some((key) => !privacyKeys.has(key)) ||
+    !stringArray(privacy.excludeHarnesses) || !stringArray(privacy.excludeWorkspaces) ||
+    !stringArray(privacy.excludeDocumentTypes) ||
+    (privacy.maxDocumentBytes !== undefined &&
+      (!Number.isSafeInteger(privacy.maxDocumentBytes) || Number(privacy.maxDocumentBytes) < 0)) ||
+    (options.spaceSlug !== undefined && typeof options.spaceSlug !== "string") ||
+    (options.workerId !== undefined && typeof options.workerId !== "string") ||
+    (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || Number(options.limit) < 1)) ||
+    (options.batchSize !== undefined &&
+      (!Number.isSafeInteger(options.batchSize) || Number(options.batchSize) < 1 ||
+        Number(options.batchSize) > BATCH_SIZE)) ||
+    (options.dimensionOverride !== undefined &&
+      (!Number.isSafeInteger(options.dimensionOverride) || Number(options.dimensionOverride) < 1)) ||
+    (options.failures !== undefined &&
+      (!stringArray(options.failures) ||
+        options.failures.some((item) => item !== "retryable" && item !== "permanent"))) ||
+    Object.values(options).some((item) => typeof item === "function")
+  ) throw new Error("offline_mock_worker_options_invalid");
+}
+
+/**
+ * Последняя fail-closed проверка непосредственно перед provider I/O.
+ *
+ * Плановый gate проверяет всю криптографически связанную invocation, но этого
+ * недостаточно после lease: другой worker мог успеть завершить именно текущий
+ * батч. Поэтому здесь повторно читаются только фактически leased rows и
+ * проверяется их точное состояние/владелец, актуальные hash/version/config и
+ * отсутствие vector. После этой функции до provider.embed нет await.
+ */
+export async function assertCurrentLeasedBatch(
+  db: Surreal,
+  space: EmbeddingSpace,
+  workerId: string,
+  runnable: readonly { job: EmbeddingJobRow; doc: EmbeddingDocumentRow }[],
+): Promise<void> {
+  const ids = runnable.map(({ job }) => String(job.id));
+  if (ids.length === 0 || new Set(ids).size !== ids.length) {
+    throw new Error("external provider current batch ids invalid");
+  }
+  const jobRecords = runnable.map(({ job }) => job.id);
+  const documentRecords = runnable.map(({ doc }) => doc.id);
+  const snapshot = await db.query<[
+    unknown,
+    EmbeddingSpace[],
+    EmbeddingJobRow[],
+    Array<Pick<
+      EmbeddingDocumentRow,
+      "id" | "content" | "content_sha256" | "extraction_version" | "segmentation_version"
+    >>,
+    Array<{ search_document: RecordId }>,
+    unknown,
+  ]>(
+    `BEGIN;
+     SELECT * FROM embedding_space WHERE id = $space;
+     SELECT * FROM embedding_job WHERE id INSIDE $jobs ORDER BY id;
+     SELECT id, content, content_sha256, extraction_version, segmentation_version
+       FROM search_document WHERE id INSIDE $documents ORDER BY id;
+     SELECT search_document FROM ${space.physical_table}
+       WHERE search_document INSIDE $documents;
+     COMMIT;`,
+    { space: space.id, jobs: jobRecords, documents: documentRecords },
+  );
+  const currentSpace = snapshot[1]?.[0];
+  if (
+    !currentSpace || currentSpace.slug !== space.slug ||
+    currentSpace.provider !== space.provider || currentSpace.model !== space.model ||
+    currentSpace.dimensions !== space.dimensions ||
+    currentSpace.physical_table !== space.physical_table ||
+    currentSpace.segmentation_version !== space.segmentation_version ||
+    currentSpace.segmentation_version !== SEGMENTATION_VERSION
+  ) {
+    throw new Error("external provider current batch space config drift");
+  }
+  const currentJobs = snapshot[2] ?? [];
+  const byId = new Map(currentJobs.map((job) => [String(job.id), job]));
+  if (currentJobs.length !== runnable.length || byId.size !== runnable.length) {
+    throw new Error("external provider current leased batch changed");
+  }
+  const currentDocs = snapshot[3] ?? [];
+  const docsById = new Map(currentDocs.map((doc) => [String(doc.id), doc]));
+  if (currentDocs.length !== runnable.length || docsById.size !== runnable.length) {
+    throw new Error("external provider current batch document set changed");
+  }
+  const vectors = snapshot[4] ?? [];
+  if (vectors.length > 0) {
+    throw new Error("external provider current batch vector already exists");
+  }
+  for (const { job: leased, doc } of runnable) {
+    const current = byId.get(String(leased.id));
+    const currentDoc = docsById.get(String(doc.id));
+    if (
+      !current || current.status !== "processing" || current.locked_by !== workerId ||
+      !current.locked_at || String(current.embedding_space) !== String(space.id) ||
+      String(current.search_document) !== String(doc.id) ||
+      current.input_sha256 !== leased.input_sha256 ||
+      new Date(current.locked_at).getTime() !== new Date(leased.locked_at!).getTime()
+    ) {
+      throw new Error(`external provider current leased job drift: ${String(leased.id)}`);
+    }
+    if (
+      !currentDoc || currentDoc.content_sha256 !== leased.input_sha256 ||
+      currentDoc.content_sha256 !== doc.content_sha256 ||
+      sha256hex(currentDoc.content) !== currentDoc.content_sha256 ||
+      String(currentDoc.extraction_version) !== String(EXTRACTOR_VERSION) ||
+      String(currentDoc.segmentation_version) !== SEGMENTATION_VERSION
+    ) {
+      throw new Error(`external provider current job hash/config drift: ${String(leased.id)}`);
+    }
+  }
+}
+
+export function privacyExclusionCode(reason: string): string {
+  if (reason.startsWith("harness ")) return "privacy_excluded_harness";
+  if (reason.startsWith("workspace ")) return "privacy_excluded_workspace";
+  if (reason.startsWith("document_type ")) return "privacy_excluded_document_type";
+  if (reason.startsWith("document ")) return "privacy_excluded_document_size";
+  return "privacy_excluded_policy";
+}
 
 /**
  * Production-фабрика worker'а (подключается в CLI): provider по
@@ -228,9 +530,9 @@ export function defaultProviderFactory(opts: { openaiApiKey?: string }): Provide
  * Прогон worker'а (§13.6): пока есть доступные jobs — lease батч, embed,
  * запись. Возвращает сводку счётчиков.
  */
-export async function runEmbeddingWorker(
+async function runEmbeddingWorkerInternal(
   db: Surreal,
-  providerFactory: ProviderFactory,
+  providerFactory: (space: EmbeddingSpace) => EmbeddingProvider,
   opts: WorkerOptions,
 ): Promise<WorkerSummary> {
   const log = opts.logger ?? (() => {});
@@ -264,6 +566,9 @@ export async function runEmbeddingWorker(
     const cached = providers.get(String(spaceId));
     if (cached) return cached;
     const provider = providerFactory(await spaceOf(spaceId));
+    if (!offlineMockCapabilities.has(provider) || !Object.isFrozen(provider)) {
+      throw new Error("generic_embedding_worker_is_mock_only");
+    }
     providers.set(String(spaceId), provider);
     return provider;
   };
@@ -294,10 +599,11 @@ export async function runEmbeddingWorker(
     if (jobs.length === 0) break;
     processed += jobs.length;
 
-    const docs = new Map<string, DocRow>();
-    for (const doc of await selectAll<DocRow>(
+    const docs = new Map<string, EmbeddingDocumentRow>();
+    for (const doc of await selectAll<EmbeddingDocumentRow>(
       db,
-      `SELECT id, content, document_type,
+      `SELECT id, content, content_sha256, token_count, document_type,
+         extraction_version, segmentation_version,
          dialogue.harness_installation.harness.slug AS harness,
          dialogue.workspace.name AS workspace
        FROM search_document WHERE id INSIDE $ids`,
@@ -316,13 +622,13 @@ export async function runEmbeddingWorker(
     for (const spaceJobs of bySpace.values()) {
       const space = await spaceOf(spaceJobs[0]!.embedding_space);
       const provider = await providerFor(spaceJobs[0]!.embedding_space);
-      const runnable: Array<{ job: EmbeddingJobRow; doc: DocRow }> = [];
+      const runnable: Array<{ job: EmbeddingJobRow; doc: EmbeddingDocumentRow }> = [];
       for (const job of spaceJobs) {
         const doc = docs.get(String(job.search_document));
         if (!doc) {
           // Документ удалён сменой projection, а job остался (не должно
           // случаться — §8.1 каскад; подстраховка): job бессмыслен.
-          await failJobs(db, [job], "permanent_error", "search_document отсутствует");
+          await failJobs(db, [job], "permanent_error", "search_document_missing");
           summary.permanentErrors += 1;
           continue;
         }
@@ -336,67 +642,122 @@ export async function runEmbeddingWorker(
           opts.privacy,
         );
         if (reason) {
-          await cancelJob(db, job, `privacy_excluded: ${reason}`, now());
+          const reasonCode = privacyExclusionCode(reason);
+          await cancelJob(db, job, reasonCode, now());
           summary.privacyExcluded += 1;
-          log({ event: "embedding_job_privacy_excluded", job: String(job.id), reason });
+          log({ event: "embedding_job_privacy_excluded", job: String(job.id), reasonCode });
           continue;
         }
         runnable.push({ job, doc });
       }
       if (runnable.length === 0) continue;
-      summary.batches += 1;
-      try {
-        const result = await provider.embed(runnable.map((r) => r.doc.content));
-        // Проверка dimension каждого вектора (сценарий №23, инвариант §23.11).
-        const wrongDimension = result.vectors.findIndex((v) => v.length !== space.dimensions);
-        if (wrongDimension >= 0 || result.vectors.length !== runnable.length) {
-          const detail =
-            result.vectors.length !== runnable.length
-              ? `provider вернул ${result.vectors.length} векторов на ${runnable.length} входов`
-              : `dimension mismatch: ожидалось ${space.dimensions}, получено ${result.vectors[wrongDimension]!.length}`;
-          await failJobs(db, runnable.map((r) => r.job), "permanent_error", detail);
-          summary.permanentErrors += runnable.length;
-          log({ event: "embedding_batch_dimension_rejected", space: space.slug, detail });
-          continue;
-        }
-        await completeBatch(db, space, runnable, result.vectors, result.usage.promptTokens, now());
-        summary.completed += runnable.length;
-        summary.promptTokens += result.usage.promptTokens;
-        log({
-          event: "embedding_batch_completed",
-          space: space.slug,
-          jobs: runnable.length,
-          promptTokens: result.usage.promptTokens,
-        });
-      } catch (error) {
-        const retryable = error instanceof EmbeddingProviderError ? error.retryable : true;
-        const message = error instanceof Error ? error.message : String(error);
-        const failedJobs = runnable.map((r) => r.job);
-        for (const job of failedJobs) {
-          const attempts = job.attempts + 1;
-          const permanent = !retryable || attempts >= MAX_ATTEMPTS;
-          await failJob(
+      const requestBatches = packEmbeddingRequestBatches(
+        runnable,
+        ({ doc }) => ({ content: doc.content, tokenCount: doc.token_count }),
+        batchSize,
+      );
+      for (const requestBatch of requestBatches) {
+        summary.batches += 1;
+        try {
+          await assertCurrentLeasedBatch(db, space, workerId, requestBatch);
+          // No await may be inserted between this capability check and embed:
+          // the generic path can drive only the provider constructed above.
+          if (!offlineMockCapabilities.has(provider) || !Object.isFrozen(provider)) {
+            throw new Error("generic_embedding_worker_is_mock_only");
+          }
+          const result = await provider.embed(requestBatch.map((r) => r.doc.content));
+          // Проверка dimension каждого вектора (сценарий №23, инвариант §23.11).
+          const wrongDimension = result.vectors.findIndex((v) => v.length !== space.dimensions);
+          if (wrongDimension >= 0 || result.vectors.length !== requestBatch.length) {
+            const detail = result.vectors.length !== requestBatch.length
+              ? `provider_vector_count_mismatch expected=${requestBatch.length} actual=${result.vectors.length}`
+              : `vector_dimension_mismatch expected=${space.dimensions} actual=${result.vectors[wrongDimension]!.length}`;
+            await failJobs(db, requestBatch.map((r) => r.job), "permanent_error", detail);
+            summary.permanentErrors += requestBatch.length;
+            log({ event: "embedding_batch_dimension_rejected", space: space.slug, detail });
+            continue;
+          }
+          await completeBatch(
             db,
-            job,
-            permanent ? "permanent_error" : "retryable_error",
-            message,
-            attempts,
-            permanent ? undefined : new Date(now().getTime() + backoffMs(attempts)),
+            space,
+            requestBatch,
+            result.vectors,
+            result.usage.promptTokens,
+            now(),
           );
-          if (permanent) summary.permanentErrors += 1;
-          else summary.failed += 1;
+          summary.completed += requestBatch.length;
+          summary.promptTokens += result.usage.promptTokens;
+          log({
+            event: "embedding_batch_completed",
+            space: space.slug,
+            jobs: requestBatch.length,
+            promptTokens: result.usage.promptTokens,
+          });
+        } catch (error) {
+          const retryable = error instanceof EmbeddingProviderError ? error.retryable : true;
+          // Provider/API messages are an untrusted privacy boundary: an HTTP
+          // response may echo rejected input. Persist and log stable codes only,
+          // while retaining the provider's retry classification.
+          const providerErrorCode =
+            error instanceof EmbeddingProviderError
+              ? retryable
+                ? "provider_retryable_error"
+                : "provider_permanent_error"
+              : "provider_unexpected_error";
+          const failedJobs = requestBatch.map((r) => r.job);
+          for (const job of failedJobs) {
+            const attempts = job.attempts + 1;
+            const permanent = !retryable || attempts >= MAX_ATTEMPTS;
+            await failJob(
+              db,
+              job,
+              permanent ? "permanent_error" : "retryable_error",
+              permanent && retryable ? "provider_retry_exhausted" : providerErrorCode,
+              attempts,
+              permanent ? undefined : new Date(now().getTime() + backoffMs(attempts)),
+            );
+            if (permanent) summary.permanentErrors += 1;
+            else summary.failed += 1;
+          }
+          log({
+            event: "embedding_batch_failed",
+            space: space.slug,
+            retryable,
+            jobs: failedJobs.length,
+            errorCode: providerErrorCode,
+          });
         }
-        log({
-          event: "embedding_batch_failed",
-          space: space.slug,
-          retryable,
-          jobs: failedJobs.length,
-          error: message.slice(0, 300),
-        });
       }
     }
   }
   return summary;
+}
+
+/**
+ * Safe generic worker used by tests/local mock providers. Any external
+ * provider is rejected before lease; production CLI must use a Stage 11
+ * candidate or accepted-full wrapper that supplies an immediate drift gate.
+ */
+export async function runEmbeddingWorker(
+  db: Surreal,
+  options: OfflineMockWorkerOptions,
+): Promise<WorkerSummary> {
+  validateOfflineMockOptions(options);
+  const frozenOptions = Object.freeze({
+    ...options,
+    privacy: Object.freeze({
+      excludeHarnesses: [...options.privacy.excludeHarnesses],
+      excludeWorkspaces: [...options.privacy.excludeWorkspaces],
+      excludeDocumentTypes: [...options.privacy.excludeDocumentTypes],
+      maxDocumentBytes: options.privacy.maxDocumentBytes,
+    }),
+    failures: Object.freeze([...(options.failures ?? [])]),
+  });
+  return runEmbeddingWorkerInternal(
+    db,
+    (space) => offlineMockProvider(space, frozenOptions),
+    frozenOptions,
+  );
 }
 
 /** Детерминированный id vector-записи: повторный run идемпотентен. */
@@ -405,10 +766,10 @@ export function vectorRecordKey(searchDocumentId: string, spaceId: string): stri
 }
 
 /** Транзакция успешного батча (§13.6 п.5): vectors + usage + jobs completed. */
-async function completeBatch(
+export async function completeBatch(
   db: Surreal,
   space: EmbeddingSpace,
-  runnable: Array<{ job: EmbeddingJobRow; doc: DocRow }>,
+  runnable: Array<{ job: EmbeddingJobRow; doc: EmbeddingDocumentRow }>,
   vectors: number[][],
   promptTokens: number,
   now: Date,
@@ -441,7 +802,7 @@ async function completeBatch(
   await db.query(statements.join("\n"), vars);
 }
 
-async function failJob(
+export async function failJob(
   db: Surreal,
   job: EmbeddingJobRow,
   status: "retryable_error" | "permanent_error",
@@ -463,7 +824,7 @@ async function failJob(
 }
 
 /** Отметить сразу несколько jobs (batch dimension rejection и пр.). */
-async function failJobs(
+export async function failJobs(
   db: Surreal,
   jobs: EmbeddingJobRow[],
   status: "retryable_error" | "permanent_error",
@@ -475,7 +836,12 @@ async function failJobs(
 }
 
 /** Job отменяется политикой приватности (§13.7): vector не создаётся. */
-async function cancelJob(db: Surreal, job: EmbeddingJobRow, reason: string, now: Date): Promise<void> {
+async function cancelJob(
+  db: Surreal,
+  job: EmbeddingJobRow,
+  reason: string,
+  now: Date,
+): Promise<void> {
   await db.query(
     `UPDATE ONLY $id SET status = "cancelled", last_error = $reason, ` +
       `locked_by = NONE, locked_at = NONE, completed_at = $now`,
@@ -504,7 +870,8 @@ export async function cancelPendingJobs(db: Surreal, spaceSlug?: string): Promis
   if (spaceSlug && !space) throw new Error(`embedding space "${spaceSlug}" не найден`);
   const rows = await selectAll<{ id: RecordId }>(
     db,
-    `UPDATE embedding_job SET status = "cancelled", locked_by = NONE, locked_at = NONE
+    `UPDATE embedding_job SET status = "cancelled", last_error = "operator_cancelled",
+       locked_by = NONE, locked_at = NONE
      WHERE status INSIDE ["pending", "retryable_error"] ${space ? "AND embedding_space = $space" : ""}
      RETURN id`,
     { space: space?.id },
