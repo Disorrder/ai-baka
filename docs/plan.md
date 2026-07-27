@@ -1,7 +1,8 @@
 # План перевода архива AI-диалогов `baka` с SQLite на SurrealDB
 
-**Статус:** целевая версия плана
-**Дата фиксации:** 24 июля 2026 года
+**Статус:** целевая версия плана; implementation/CLI этапов 0–12 —
+**CODE COMPLETE**, внешние операторские gates этапов 9–12 — открыты
+**Дата фиксации:** 24 июля 2026 года; статус обновлён 26 июля 2026 года
 **Проект:** `/path/to/ai-baka` (новый репозиторий, строится с нуля)
 **Основано на опыте:** legacy-проект `/path/to/legacy-project`
 
@@ -10,6 +11,14 @@
 SurrealDB, полная изоляция от External System, сначала проверка на живых
 источниках, затем импорт истории, отсутствие dual-write и сохранение старого
 SQLite-архива нетронутым до ручного удаления.
+
+`CODE COMPLETE` ниже означает готовность реализационных и fail-closed CLI
+контрактов, а не завершение боевой операции. До отдельного подтверждения
+оператора не считаются выполненными: live migration, платная relevance
+evaluation и полный embeddings backfill, физическая off-device provenance,
+restore точного bundle, финальные `validate`/cutover/tag, удаление migration
+adapter и физическое удаление legacy. Legacy SQLite всегда read-only;
+автоматического удаления нет.
 
 Отличия этой редакции от исходного плана:
 
@@ -33,10 +42,11 @@ SQLite-архива нетронутым до ручного удаления.
 * Qwen Code;
 * Kimi Code.
 
-Текущее состояние legacy-архива:
+Состояние legacy-архива определяется перед импортом:
 
-Размер архива, количество диалогов, сообщений и удалённых записей
-определяются preflight и хранятся только в приватном migration report.
+Размер snapshot, количество диалогов, сообщений и удалённых записей
+определяются свежим preflight. Эти показатели хранятся только в приватном
+отчёте; `expectedDeletedCount` берётся из подписанного evidence.
 
 Текущая SQLite-система уже умеет инкрементальную неразрушающую
 синхронизацию, включая сохранение диалогов после удаления исходника. Новая
@@ -60,7 +70,8 @@ SQLite-архива нетронутым до ручного удаления.
 
 1. Полностью заменить SQLite как рабочий persistence layer `baka`.
 2. Использовать отдельный экземпляр SurrealDB.
-3. Хранить физические данные SurrealDB непосредственно на archive volume.
+3. Хранить mutable физические данные SurrealDB в effective internal
+   `BAKA_DB_ROOT`; archive volume остаётся архивом raw/manifests/backups.
 4. Архивировать каждую обнаруженную версию исходного файла как неизменяемый raw snapshot.
 5. Различать:
 
@@ -209,16 +220,20 @@ baka git commit: commit SHA
 
 ```dotenv
 BAKA_ARCHIVE_ROOT=/Volumes/Archive/Conversations
+# BAKA_DB_ROOT=/absolute/internal/APFS/path
 ```
 
-Никаких захардкоженных путей внутри compose или TypeScript-кода.
+`BAKA_DB_ROOT` — optional override. Без него effective live dbRoot равен
+`${HOME}/Library/Application Support/ai-baka/rocksdb` на внутреннем диске.
+`BAKA_ARCHIVE_ROOT` не зашивается в compose или TypeScript-код; override DB
+также всегда задаётся явно.
 
 Рекомендуемая структура:
 
 ```text
 Conversations/
 ├── .baka-archive.json
-├── db/                             # RocksDB
+├── db/                             # старый/corrupt store; не runtime fallback
 ├── raw/
 │   ├── codex/
 │   ├── claude-code/
@@ -229,6 +244,7 @@ Conversations/
 │   └── kimi-code/
 ├── staging/
 │   └── <sync-run-id>/
+├── migration-input/                 # read-only input pending legacy import
 ├── backups/
 │   ├── surreal/
 │   └── manifests/
@@ -320,9 +336,10 @@ surrealdb
 | Container port   | `8000`                                  |
 | Storage          | RocksDB                                 |
 | Container path   | `/data/db`                              |
-| Host path        | `${BAKA_ARCHIVE_ROOT}/db`               |
+| Host path        | effective internal `BAKA_DB_ROOT`; default `${HOME}/Library/Application Support/ai-baka/rocksdb` |
 | Namespace        | `baka`                                  |
 | Database         | `archive`                               |
+| HTTP `/import`   | `34359738368` bytes (32 GiB, bounded)   |
 | Network exposure | только loopback                         |
 | Restart policy   | `unless-stopped`                        |
 
@@ -347,7 +364,15 @@ SURREAL_PASS=root
 SURREAL_URL=ws://127.0.0.1:8901/rpc
 SURREAL_NAMESPACE=baka
 SURREAL_DATABASE=archive
+SURREAL_HTTP_MAX_IMPORT_BODY_SIZE=34359738368
 ```
+
+`SURREAL_HTTP_MAX_IMPORT_BODY_SIZE` — целое число байт, которое compose
+передаёт с bounded default 32 GiB. Лимит ограничивает размер import-тела
+и не отключает server-side проверку. Это допустимо только при loopback
+binding и обязательной аутентификации `/import`; повышать значение можно
+лишь после проверки exact SHA/size аутентифицированного backup и измерения
+его фактического распакованного/reordered тела.
 
 OpenAI key хранится только в окружении:
 
@@ -395,8 +420,15 @@ schema/
 ├── 0001_initial.surql
 ├── 0002_search_documents.surql
 ├── 0003_embedding_spaces.surql
-└── 0004_legacy_migration_metadata.surql
+├── 0004_legacy_migration_metadata.surql
+└── 0005_legacy_migration_run.surql
 ```
+
+Текущая schema version — 5. Миграция 0005 добавляет durable migration run,
+quarantine/identity metadata, удаляет глобальный производный FULLTEXT-индекс
+`chunk_content` (canonical `chunk` records не удаляются) и допускает
+`source_revision.raw_archive_path = NONE` только для намеренного
+`snapshot_kind = legacy_missing_raw`.
 
 В базе хранится:
 
@@ -982,7 +1014,9 @@ unknown
 
 ## 8.2. Извлечение пользовательского промпта
 
-`user_prompt` строится из текстовых chunks user message, которые:
+Отдельный logical `user_prompt` строится для **каждого** user message текущей
+ревизии, если оно действительно создано человеком. В него входят текстовые
+chunks этого message, которые:
 
 * являются human-authored;
 * не являются автоматически вставленным контекстом;
@@ -1338,6 +1372,11 @@ source_format_versions[]
 
 Изменение логики нормализации повышает `parser_version`.
 
+Текущие зарегистрированные версии всех семи parser — 2;
+`EXTRACTOR_VERSION = 3`: каждый извлечённый реальный user message задаёт
+отдельный turn-window и получает собственный `assistant_final`, если в этом
+turn есть видимый ответ ассистента.
+
 Если raw revision уже распарсена старой версией, команда:
 
 ```text
@@ -1372,7 +1411,7 @@ Fixtures коммитятся в Git. Полные приватные диало
 
 # 12. Full-text search
 
-## 12.1. Два режима
+## 12.1. Основной индекс и canonical forensic data
 
 ### Обычный поиск
 
@@ -1382,22 +1421,18 @@ Fixtures коммитятся в Git. Полные приватные диало
 * финальные ответы;
 * только текущие dialogue revisions.
 
-### Forensic search
+Canonical `chunk` по-прежнему хранит reasoning, tool results, system context и
+все historical dialogue revisions. Однако глобальный FULLTEXT по каждой
+физической `chunk`-записи не является частью production search: он индексирует
+также historical revisions, не нужные обычному поиску, и усложняет восстановление.
 
-Работает по `chunk.content` и может включать:
-
-* reasoning;
-* tool results;
-* system context;
-* старые dialogue revisions.
-
-Включается явно:
-
-```text
---include-reasoning
---include-tools
---all-revisions
-```
+Legacy-флаги `--include-reasoning`, `--include-tools`, `--include-system` и
+`--all-revisions` сохранены только как fail-closed CLI compatibility contract:
+они возвращают понятную ошибку **до DB query** и никогда не деградируют в
+полный scan таблицы `chunk`. Для точечного forensic-разбора используется
+`export-thread`; если полнотекстовый forensic снова понадобится, он должен
+быть отдельной ограниченной derived projection с собственным lifecycle, а не
+индексом canonical `chunk`.
 
 ## 12.2. Analyzer
 
@@ -1447,13 +1482,12 @@ ON TABLE search_document
 FIELDS content
 FULLTEXT ANALYZER archive_mixed
 BM25 HIGHLIGHTS;
-
-DEFINE INDEX chunk_content
-ON TABLE chunk
-FIELDS content
-FULLTEXT ANALYZER archive_mixed
-BM25 HIGHLIGHTS;
 ```
+
+Migration 0002 исторически создавала также `chunk_content`; при upgrade 4→5
+migration 0005 удаляет только этот индекс через `REMOVE INDEX`, сохраняя все
+canonical chunks и historical revisions. На пустой базе последовательность
+0001→0005 имеет тот же итоговый contract.
 
 ---
 
@@ -1543,6 +1577,7 @@ key-value storage.
 ## 13.4. Сегментация длинных документов
 
 Документы не обрезаются и не пропускаются.
+Текущая `segmentation_version = "2"`; изменение алгоритма требует bump.
 
 Target:
 
@@ -1614,11 +1649,7 @@ Job становится устаревшим и переходит обратн
 
 ## 13.6. Поведение worker
 
-```text
-baka embeddings run
-```
-
-Worker:
+Library worker:
 
 1. получает lease на pending jobs;
 2. группирует inputs в batch;
@@ -1633,11 +1664,30 @@ Worker:
 7. при постоянной ошибке переводит job в `permanent_error`;
 8. не затрагивает canonical corpus.
 
-Команды:
+Generic CLI entrypoint намеренно закрыт:
+
+```text
+baka embeddings run --limit <1..64> --space <slug> --allow-paid-api
+```
+
+Это fail-closed compatibility stub: даже с указанными flags он не вызывает
+provider, потому что не имеет Stage 11 authorization. Платные вызовы доступны
+только через bounded candidate и accepted-production workflows:
 
 ```text
 baka embeddings plan
-baka embeddings run
+baka embeddings exact-tokens --model <name> --report <private.json>
+baka embeddings candidates plan --judgments <path> --spaces <three-csv> \
+  --max-documents <1..1000> --max-jobs-per-space <1..200> \
+  --selection-seed-sha256 <sha256> --report <private.json>
+baka embeddings candidates run --plan <path> --judgments <same-path> \
+  --confirm <exact-phrase> --allow-paid-api
+baka embeddings backfill plan --space <slug> --exact-report <path> \
+  --accepted-relevance <path> --max-jobs <n>
+baka embeddings backfill run --space <slug> --exact-report <path> \
+  --accepted-relevance <same-path> --confirm <exact-phrase> --max-jobs <n> \
+  --allow-paid-api
+baka embeddings audit --space <slug>
 baka embeddings status
 baka embeddings retry
 baka embeddings cancel
@@ -1658,8 +1708,13 @@ estimated vector storage
 configured price formula
 ```
 
-Цена не должна быть жёстко зашита в код: она задаётся конфигурацией или
-выводится отдельно от гарантированных расчётов.
+`exact-tokens` запускает pinned `uv` script только offline, сверяет identity
+script/package и сохраняет private report без неявного overwrite. Цена не
+зашита в код: используется только
+`OPENAI_EMBEDDING_PRICE_PER_1M_TOKENS`; без неё стоимость не угадывается.
+Candidate plan ограничен 1000 documents и 200 jobs на space, причём jobs не
+больше documents; provider batch — не более 64. Каждый paid run требует exact
+plan/corpus/privacy hashes, literal confirmation и `--allow-paid-api`.
 
 ## 13.7. Политика приватности
 
@@ -1733,11 +1788,11 @@ dialogue revision
 --to
 --role
 --document-type
---include-tools
---include-reasoning
---all-revisions
 --deleted-only
 ```
+
+Legacy forensic flags перечислены в §12.1 и намеренно fail closed; они не
+являются фильтрами normal/vector/hybrid search.
 
 Если active embedding space отсутствует или OpenAI key не настроен:
 
@@ -1805,16 +1860,21 @@ missing raw backup
 potential duplicates
 ```
 
-Отдельно проверяется, действительно ли `thread_records.payload` покрывает
-все диалоги.
+Отдельно проверяется coverage всех `thread_records.payload` и reconciliation
+по каждой legacy table. Runtime-критерий — полная сверка со свежим preflight,
+а не опубликованное историческое число.
 
 Команда:
 
 ```text
-baka migration plan --legacy-db "/Volumes/Archive/Legacy Conversations/index.sqlite"
+baka migration plan [--legacy-db <read-only-index.sqlite>] [--report <private.json>] \
+  [--skip-live] [--json]
 ```
 
-План не изменяет SurrealDB.
+План не изменяет SurrealDB и legacy, но создаёт в новом archive
+content-addressed snapshot, analysis checkpoint и private report. Для
+production approval `--skip-live` недопустим: live duplicate probe должен быть
+свежим и доступным.
 
 ## 15.3. Snapshot legacy SQLite
 
@@ -1827,7 +1887,9 @@ legacy index.sqlite
 migration-input/index__<sha256>.sqlite
 ```
 
-Оригинал остаётся нетронутым.
+Оригинал остаётся нетронутым. `migration-input` сохраняется только пока
+legacy import и его reconciliation не приняты; это не долгоживущий
+recovery artifact.
 
 ## 15.4. Приоритет источников восстановления
 
@@ -1871,6 +1933,10 @@ Legacy-записи нельзя объединять по одному OS usern
 4. Записать uncertainty в migration report.
 5. Не объединять неизвестные host автоматически.
 
+До writer оператор отдельно утверждает exact mapping artifact для всего
+snapshot. Неполный, конфликтующий, изменённый или заново самоподписанный map
+отклоняется; один OS username никогда не является достаточным host identity.
+
 ## 15.7. Deduplication
 
 Автоматический merge выполняется только по надёжным ключам:
@@ -1884,7 +1950,10 @@ Canonical content fingerprint используется только для от�
 
 ## 15.8. Deleted legacy entries
 
-Все ранее удалённые записи импортируются:
+Каждый production run берёт число ранее удалённых записей из свежего
+подписанного `expectedDeletedCount` и заново сверяет snapshot/live evidence.
+
+Все одобренные deleted records импортируются:
 
 ```text
 source_location.presence_status = deleted_in_source
@@ -1900,7 +1969,9 @@ source_revision.snapshot_kind = legacy_missing_raw
 ```
 
 Canonical данные всё равно импортируются, а отсутствие raw фиксируется в
-migration report.
+migration report. Пара `snapshot_kind = legacy_missing_raw` и
+`raw_archive_path = NONE` намеренна; `NONE` при любом другом snapshot kind —
+ошибка validation.
 
 ## 15.9. Quarantine вместо skip
 
@@ -1930,9 +2001,37 @@ quarantined = 0
 * parser version;
 * возможность повторного запуска после исправления.
 
-## 15.10. Идемпотентность
+`baka validate` проверяет unresolved rows именно в `migration_quarantine`
+(и legacy migration `ingest_error`), а retry закрывает прежнюю запись durable
+resolution, не удаляя audit trail.
 
-Повторный:
+## 15.10. Authorization, запуск и идемпотентность
+
+### CODE COMPLETE
+
+`migration run` и `retry` имеют один строгий CLI contract:
+
+```text
+baka migration run|retry [--legacy-db <read-only-index.sqlite>] \
+  --approval <exact-approved-preflight.json> \
+  --attestation <detached-ed25519-attestation.json> \
+  --host-mapping-approval <exact-host-map.json> \
+  --restore-report <strict-restore-test-v4.json> \
+  --approval-public-key <independently-configured-ed25519-spki.pem> \
+  --approval-key-sha256 <lowercase-spki-der-sha256> \
+  --report <new-exclusive-reconciliation.json> --apply [--json]
+
+baka migration status [--json]
+```
+
+Writer не создаётся до проверки exact snapshot SHA/size, table totals,
+problem set, deleted count, свежего live probe, полного host mapping,
+detached signature и независимого key fingerprint, schema >= 5, нового
+no-clobber report target и точного fresh backup/restore binding. Backup должен
+быть создан после attestation, restore — после backup и не старше 24 часов.
+Любой drift path/SHA/size/schema/namespace/database/time блокирует запуск.
+
+Повторный run или retry:
 
 ```text
 baka migration run
@@ -1947,6 +2046,29 @@ baka migration run
 * повторных embedding jobs.
 
 Каждый migration run сохраняет собственный reconciliation report.
+
+### EXTERNAL OPERATOR GATES
+
+CLI сознательно не создаёт approval, host-map approval и подпись. Оператор
+вне принимаемого evidence независимо проверяет snapshot SHA/size, все table
+totals/problems, live probe, `expectedDeletedCount`, assignments; затем
+подписывает exact approval Ed25519 key, публичный SPKI и SHA которого приходят
+по независимому trust channel.
+
+После `approvedAt`/`issuedAt` обязательна последовательность:
+
+```text
+baka backup --json
+baka restore:test <fresh-export> --raw-archive-root <archive-root> --json
+baka migration run <все обязательные flags выше>
+baka migration status --json
+baka validate --json
+```
+
+Migration считается принятой только при `status=completed`, `lost=0`,
+`quarantined=0`, `accounted=legacyTotal`, exact per-table accounting и полном
+совпадении фактических assignments с approval. До этого migration adapter
+нужен для retry/status/audit и не удаляется.
 
 ---
 
@@ -1967,24 +2089,30 @@ SurrealDB поддерживает logical export в SurrealQL и последу
 
 ```text
 backups/surreal/
-  2026-07-24T120000Z__schema-4__surreal-3.2.3.surql.zst
+  2026-07-26T120000Z__schema-5__surreal-3.2.3.surql.zst
 ```
 
-Рядом manifest:
+Связанный manifest хранится в `backups/manifests/`:
 
 ```json
 {
   "createdAt": "...",
   "surrealdbVersion": "3.2.3",
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "bakaCommit": "...",
   "namespace": "baka",
   "database": "archive",
   "recordCounts": {},
   "rawManifestSha256": "...",
-  "exportSha256": "..."
+  "exportSha256": "...",
+  "exportBytes": 123,
+  "compression": "zstd"
 }
 ```
+
+Export и manifest публикуются атомарно; incomplete `.part` не считается
+backup. Status признаёт только полностью существующую пару с повторно
+проверенными SHA/size и обязательным `rawManifestSha256` для schema 5.
 
 ## 16.2. Raw manifest
 
@@ -2021,26 +2149,157 @@ baka raw:verify
 
 RocksDB physical copy не считается единственным backup.
 
+CLI:
+
+```text
+baka backup off-device plan --destination <path> \
+  [--export <path>]... [--raw-manifest <path>] \
+  [--migration-report <path>]... [--json]
+baka backup off-device run --destination <path> \
+  [--export <path>]... [--raw-manifest <path>] \
+  [--migration-report <path>]... --confirm-physical-device [--json]
+baka backup off-device verify <bundle> [--json]
+```
+
+`plan` полностью хэширует inputs без публикации. `run` использует resume,
+`.part` + fsync + rename, no-clobber и итоговую verify; destination должен быть
+на другом filesystem. `st_dev` не доказывает отдельное физическое устройство,
+поэтому run требует ручную durable аттестацию
+`--confirm-physical-device`. Manifest/report и payload hashes доказывают
+самосогласованную целостность, но совместная подмена остаётся за внешней trust
+boundary: provenance bundle должна быть закреплена вне самого устройства
+(trusted copy/signature).
+
 ## 16.4. Restore drill
 
 ```text
-bun run db:restore:test
+baka restore:test [export] [--raw-archive-root <path>] [--json]
 ```
 
-Действия:
+Restore drill никогда не импортирует в production server и не имеет
+same-server fallback. Перед maintenance window он fail-closed проверяет:
 
-1. поднять временный пустой SurrealDB;
-2. применить schema;
-3. импортировать последний export;
-4. проверить record counts;
-5. проверить referential invariants;
-6. выполнить несколько известных search queries;
-7. проверить raw references;
-8. удалить test instance.
+* production endpoint ровно `ws://127.0.0.1:8901/rpc`;
+* container ровно `baka-surrealdb`, exact pinned image, healthy state и
+  loopback bind `127.0.0.1:8901`;
+* mounts ровно: rw bind effective internal `BAKA_DB_ROOT` → `/data/db` и два Docker local
+  anonymous volume с безопасными identity → `/data` и `/logs`; extras и
+  любые другие path mounts запрещены;
+* отсутствие активного archive lock и established clients. После этого
+  команда атомарно берёт собственный maintenance process lock, считывает и
+  закрывает read-only baseline-client и повторно проверяет identity перед
+  остановкой только immutable ID exact `baka-surrealdb`.
 
-Restore test должен выполняться до удаления legacy SQLite.
+При остановленном production container создаётся disposable SurrealDB из
+того же exact `v3.2.3@sha256:…`: уникальные allowlisted container/named-volume
+identity, новый Docker local volume, случайный `127.0.0.1` port (8901
+запрещён), никакого production/archive path mount. Exact измеренный профиль:
 
-## 16.5. Шифрование
+```text
+memory/swap       12 GiB / 12 GiB
+CPU / pids        4 / 512
+RocksDB cache     1 GiB
+RocksDB threads/jobs/subcompactions  4 / 4 / 2
+HNSW cache        256 MiB
+memory threshold  6 GiB
+HTTP import max   32 GiB
+index resume      0 (disabled)
+```
+
+Размер FULLTEXT batch не является launch-конфигурацией. Exact pinned binary
+`3.2.3+20260721.40522d1` соответствует `surrealdb-core 3.2.3` commit
+`40522d1d2fd8e30017ebc2625a14aa5435c27347`: `CommonConfig` не парсит
+`indexing_batch_size`, поэтому `SURREAL_INDEXING_BATCH_SIZE` не передаётся и
+не включается в resource profile. В core начальный scan использует compile-time
+probe 16 records, затем adaptive размер стремится к soft target 8 388 608 raw
+bytes и ограничивается максимумом 250 records; replay также читает максимум
+250. Restore evidence аттестует эти три pinned значения отдельным immutable
+объектом, не выдавая их за настройку запуска.
+
+`SURREAL_MEMORY_THRESHOLD` здесь — process-wide query guard, а не Docker
+hard cap. Threshold задан как exact 6 GiB: на 1 GiB
+SurrealDB 3.2.3 прерывал concurrent FULLTEXT build при здоровом контейнере;
+hard memory/swap cap остаётся 12/12 GiB и сохраняет 6 GiB headroom. Strict
+RestoreTestReport v5 обязателен; v4 с обязательным глобальным
+`chunk_content`, v3 со старым threshold 1 GiB или ложным утверждением
+`indexing batch 64` больше не принимаются.
+
+Credentials передаются Docker только значениями environment наследуемого
+процесса (`--env NAME` без value), а HTTP import — через stdin-config curl;
+они не могут появляться в argv, логах или report. До любого DB mutation drill
+проверяет exact export/manifest SHA и size, затем импортирует schema 4 или 5
+export в уникальный namespace `baka_restore_test_<32 hex>` disposable
+server. Проверяются:
+
+1. record counts, включая все owned physical vector tables;
+2. referential, current/source/search ownership и vector invariants;
+3. authenticated BM25 probe по `search_document.content`;
+4. raw references и `rawManifestSha256` относительно `--raw-archive-root`;
+5. exact FULLTEXT index `search_document_content` в terminal `ready`, а
+   `chunk_content` отсутствует для schema 5;
+6. cleanup в строгом порядке: started FULLTEXT indexes в обратном порядке,
+   exact attempt namespace, затем explicit idempotent finalize disposable
+   container и named volume с повторной проверкой их отсутствия.
+
+После target finalize production container всегда запускается снова тем же
+immutable ID; bounded health wait, повторная schema version и SHA-256
+канонического набора `dialogue.id/current_revision` обязаны точно совпасть с
+baseline, clients — снова отсутствовать. Maintenance lock освобождается
+последним. Только после этого success сохраняется как private no-clobber
+RestoreTestReport v5, связанный с exact export/manifest/raw hashes, unique
+namespace, schema/database/root, exact image/version, opaque data identity,
+ready `search_document_content`, подтверждённым отсутствием `chunk_content`,
+durable resource profile и полным cleanup.
+Failure/OOM сохраняет только privacy-safe stage/code, counters и cleanup
+flags: без container/volume names, ports, paths, query/content и credentials.
+Для off-device bundle передаются export из
+`<bundle>/archive/backups/surreal/` и `--raw-archive-root <bundle>/archive`.
+Production RocksDB не монтируется disposable target и не изменяется.
+
+Для multi-GiB restore compose задаёт bounded
+`SURREAL_HTTP_MAX_IMPORT_BODY_SIZE=34359738368` (32 GiB, значение в байтах).
+Это server-side admission limit, отдельный от streaming/backpressure клиента;
+без него валидный upload может быть отклонён HTTP 413 до полного чтения.
+
+Restore test обязателен до migration и до любого решения о legacy retirement,
+но сам успешный локальный report не доказывает внешнюю provenance bundle.
+
+## 16.5. One-way rebuild повреждённого RocksDB
+
+`baka recovery:rebuild` принимает exact independently pinned schema-5
+export/manifest и требует все fail-closed gates:
+
+```text
+baka recovery:rebuild <internal-export> \
+  --export-sha256 <lowercase-sha256> \
+  --manifest-sha256 <lowercase-sha256> \
+  --db-root <fresh-effective-internal-BAKA_DB_ROOT> \
+  [--work-root <separate-internal-path>] \
+  --confirm-rebuild [--json]
+```
+
+Команда аттестует остановленную corrupt production identity,
+создаёт fresh DB/work roots на одном внутреннем APFS/POSIX device,
+стримит decompression напрямую в один fsynced reordered import без plaintext
+sibling, импортирует и строит только core FULLTEXT, затем проверяет counts,
+referential/current/raw/embedding invariants и BM25. В `finally` exact staging
+container, sole reordered import и server temp удаляются. Остаются
+только verified fresh `BAKA_DB_ROOT` и private journal/report; отдельный
+retained large cache не создаётся.
+
+Rebuild не переименовывает containers и не выполняет promotion, physical
+rollback или reverse migration. После проверенного success-report
+координатор отдельно recreates Compose service с тем же exact effective
+`BAKA_DB_ROOT`, после чего повторяет status/validate/raw acceptance.
+Corrupt `${BAKA_ARCHIVE_ROOT}/db` не открывается, не копируется, не
+переименовывается и остаётся нетронутым до принятого acceptance.
+
+`migration-input/index__<sha256>.sqlite` — read-only input ещё не принятого
+legacy import, а не часть recovery. Его сохраняют только до принятой
+legacy-миграции. Точная процедура зафиксирована в
+[`rocksdb-recovery.md`](rocksdb-recovery.md).
+
+## 16.6. Шифрование
 
 Так как архив содержит приватный код, пути, промпты и ответы, предпочтительный
 формат Mac-only диска:
@@ -2066,6 +2325,11 @@ baka search <query>
 baka export-thread <dialogue-id>
 baka reparse
 baka doctor
+baka migration plan|run|retry|status
+baka relevance evaluate|full-corpus
+baka embeddings exact-tokens|candidates|backfill|audit
+baka backup off-device plan|run|verify
+baka recovery:rebuild
 ```
 
 ## 17.1. `baka sync`
@@ -2081,9 +2345,9 @@ baka doctor
 Опции:
 
 ```text
---harness
+--harness <slug>
 --full-rescan
---deletion-confirmations
+--deletion-confirmations <n>
 --no-enqueue-embeddings
 --dry-run
 --json
@@ -2108,11 +2372,17 @@ embedding spaces
 pending/retryable/permanent jobs
 raw size
 RocksDB size
-last complete sync
-last backup
-last successful restore test
-migration reconciliation
+last successful complete live sync
+last fully verified logical backup
+last strict successful restore test of that exact latest backup
+latest persisted migration reconciliation
+exact local backup → restore → raw manifest → off-device recovery chain
 ```
+
+`status` не принимает hardcoded placeholders. Он повторно проверяет durable
+artifacts и выводит trust отдельно: `integrity=verified` не означает внешнюю
+provenance, а recovery chain всегда сообщает `cutover=not_asserted`, пока
+оператор не завершил внешний gate.
 
 ## 17.3. `baka validate`
 
@@ -2129,25 +2399,77 @@ migration reconciliation
 * chunk sequence collisions;
 * search document не из current revision;
 * embedding dimension mismatch;
+* job/vector `input_sha256` не совпадает с `search_document.content_sha256`;
+* vector `embedding_space` не совпадает с owning space;
+* одна physical vector table назначена более чем одному space;
 * completed job без vector;
 * vector без completed job;
+* dangling/cross-dialogue/cross-revision ownership links;
 * unknown schema version;
-* unresolved migration quarantine.
+* unresolved `migration_quarantine` и legacy migration `ingest_error`.
+
+`raw_archive_path = NONE` считается намеренным только при
+`snapshot_kind = legacy_missing_raw`; это schema 5 migration contract, а не
+missing-file ошибка.
 
 ## 17.4. `baka doctor`
 
 Дополнительно умеет исправлять безопасные состояния:
 
 ```text
+--apply
+--allow-destructive
 --import-orphan-raw
 --remove-stale-staging
 --requeue-stuck-embeddings
 --rebuild-search-projection
 --recalculate-primary-models
 --repair-manifest
+--manifest-path <path>
+--no-enqueue-embeddings
+--json
 ```
 
-Любое destructive исправление требует явного флага.
+Inspect/dry-run — default. Orphan импортируется только при однозначной
+проверяемой provenance; иначе report содержит manual action. Apply paths
+берут preflight + process lock. Удаление staging, projection rebuild и
+manifest overwrite требуют одновременно `--apply --allow-destructive`;
+`--manifest-path` требует `--repair-manifest`.
+
+## 17.5. Search, export и reparse
+
+```text
+baka search <query> [--mode <text|vector|hybrid>] [--harness <slug>]
+  [--host <label|hostname>] [--user <os-username>] [--workspace <name>]
+  [--vendor <slug>] [--model <name>] [--reasoning-effort <value>]
+  [--role <user|assistant|system|developer|tool|unknown>]
+  [--document-type <type>] [--from <date>] [--to <date>]
+  [--deleted-only] [--include-reasoning] [--include-tools]
+  [--include-system] [--all-revisions] [--limit <n>] [--json]
+
+baka export-thread <dialogue-id> [-o|--output <path>]
+  [--include-relative-source-paths] [--force] [--json]
+
+baka reparse
+  (--source-revision <id>|--source-location <id>|--harness <slug>|--all)
+  [--parser-version <latest|n>] [--only-outdated] [--dry-run]
+  [--no-enqueue-embeddings] [--no-verify-raw] [--json]
+```
+
+Search выдаёт enriched provenance. В schema 5 legacy forensic flags вместо
+DB query дают fail-closed сообщение о выключенном глобальном индексе.
+Vector/hybrid используют privacy-safe query embedding и hybrid явно
+деградирует в text при недоступном provider. `export-thread` исключает paths
+по умолчанию, абсолютные paths — всегда; overwrite требует `--force`.
+`reparse` принимает ровно один selector, а `--dry-run` ничего не пишет.
+
+## 17.6. Paid и destructive operator workflows
+
+Все exact Stage 11 flags перечислены в §21, migration — в §15.10,
+off-device/restore — в §16. Ни один paid/destructive action не следует выводить
+из общего `--json`: требуется собственный literal confirmation, bounded limit
+и соответствующий `--allow-paid-api`, `--apply` или
+`--confirm-physical-device`.
 
 ---
 
@@ -2155,24 +2477,24 @@ migration reconciliation
 
 ```text
 src/
-├── cli/
-│   ├── commands/
-│   └── output/
-├── config/
-├── domain/
-│   ├── canonical-types.ts
-│   ├── enums.ts
-│   └── identity.ts
+├── cli.ts
+├── config.ts
+├── observability.ts
+├── doctor.ts
+├── export-thread.ts
+├── reparse.ts
+├── status.ts
+├── validate.ts
 ├── db/
 │   ├── client.ts
-│   ├── transactions.ts
 │   ├── repositories/
 │   └── migrations.ts
 ├── sources/
 │   ├── discovery/
 │   ├── scanning/
 │   ├── snapshot/
-│   └── adapters/
+│   ├── adapters/
+│   └── types.ts
 ├── parsers/
 │   ├── codex/
 │   ├── claude-code/
@@ -2190,19 +2512,34 @@ src/
 │   ├── extractors/
 │   ├── segmenter.ts
 │   ├── fulltext.ts
-│   └── hybrid.ts
+│   ├── hybrid.ts
+│   └── evaluation.ts
 ├── embeddings/
 │   ├── provider.ts
 │   ├── openai-provider.ts
 │   ├── jobs.ts
-│   └── spaces.ts
+│   ├── spaces.ts
+│   ├── token-count.ts
+│   └── backfill.ts
 ├── migration/
-│   ├── legacy-sqlite-adapter.ts
+│   ├── preflight.ts
+│   ├── authorization.ts
+│   ├── legacy-reader.ts
+│   ├── legacy-writer.ts
 │   ├── reconciliation.ts
-│   └── reports.ts
-├── backup/
-└── validation/
+│   ├── store.ts
+│   └── run.ts
+└── backup/
+    ├── backup.ts
+    ├── raw-verify.ts
+    ├── off-device.ts
+    ├── restore-test.ts
+    └── safety.ts
 ```
+
+CLI намеренно собран в одном `src/cli.ts`; каталогов
+`src/cli/commands`/`src/cli/output` нет. Дерево выше показывает основные
+операционные seams, а не исчерпывающий список всех helper files.
 
 ## 18.1. Что переиспользуется
 
@@ -2303,6 +2640,47 @@ surreal start memory
 28. Raw manifest совпадает с файловой системой.
 29. Конкурентный второй `sync` блокируется lock-файлом.
 30. Два файла с одинаковым basename и разными hash не перезаписываются.
+31. Orphan raw после rename до DB commit repairable только при однозначной
+    provenance; ambiguous и SQLite cases остаются manual, dry-run не пишет.
+32. `legacy_missing_raw + NONE` принимается, любой другой snapshot kind без
+    raw path отклоняется.
+33. Migration approval с self-hash/`approvedBy` без detached Ed25519 signature
+    и independently pinned public-key fingerprint отклоняется до writer.
+34. Изменённые snapshot path/SHA/size, table totals, problem set,
+    `expectedDeletedCount`, live probe или host assignments отклоняются.
+35. Foreign namespace/database, forged `ok:true`, mismatch export/manifest/raw
+    SHA/path/size/schema и restore старше 24 часов отклоняются до writer.
+36. Migration report публикуется no-clobber; concurrent или повторный target
+    не перезаписывается.
+37. Retry закрывает resolved quarantine с audit trail, но не удаляет старую
+    запись; per-table `accounted=total`, `lost=0` проверяется заново.
+38. Generic `embeddings run`, mock-labelled/delegating/mutated provider не
+    может вызвать provider вне specialized confirmed wrappers.
+39. Candidate plan с удалёнными blockers, изменённым corpus/privacy/selection
+    или пересчитанными outer hashes отклоняется до paid call.
+40. Privacy exclusion связывает exact category/code/job/document/evidence;
+    перестановка excluded и eligible/cancelled identities отклоняется.
+41. Judgment tamper snippet-only и dialogue+snippet отклоняется даже после
+    пересчёта judgment/report/evidence/canonical outer hashes: validator
+    нормализует authenticated authoritative corpus bytes самостоятельно.
+42. Добавление, удаление или перестановка content/proof/document/corpus
+    bindings и fresh DB drift отклоняются.
+43. Full-corpus acceptance требует независимо переданные exact judgment
+    resolved path/SHA/size; identity нельзя получить из evidence. Missing,
+    copied, changed, symlink/inode replacement, same-size rewrite и race fail.
+44. Stage11 completion создаётся только full-corpus acceptance после полного
+    eligible backfill; candidate dialogue coverage не заменяет completion.
+45. Restore attempts используют разные unique namespaces; cleanup одного
+    attempt не может удалить namespace другого, success требует полный cleanup.
+46. Restore failure до/после import сохраняет privacy-safe stage/code report;
+    corrupt/same-size export и partial/fixed-namespace report не считаются
+    successful evidence.
+47. Off-device publication проверяет traversal/symlink/unexpected files,
+    resume `.part`, concurrent no-clobber, payload/manifest/report tamper и
+    current `st_dev`; повреждённый final bundle не перезаписывается.
+48. Status строит только exact latest backup→strict restore→raw→verified
+    off-device chain и всегда оставляет external provenance/cutover отдельным
+    operator gate.
 
 ---
 
@@ -2444,14 +2822,15 @@ Embeddings ещё не вызываются.
 * analyzer;
 * BM25 indexes;
 * text search;
-* forensic search.
+* fail-closed compatibility для прежних forensic flags без table scan.
 
 Критерий:
 
 * известные фразы находятся;
 * фильтры работают;
 * старые ревизии не загрязняют обычную выдачу;
-* reasoning доступен только через forensic mode.
+* reasoning/tool/system/history сохранены в canonical data, но не попадают в
+  основной индекс.
 
 ## Этап 7. Embedding pipeline
 
@@ -2494,6 +2873,9 @@ Embeddings ещё не вызываются.
 
 ## Этап 9. Migration preflight
 
+**Статус: CODE COMPLETE; свежий production approval — EXTERNAL OPERATOR
+GATE.**
+
 Работы:
 
 * snapshot `index.sqlite`;
@@ -2514,7 +2896,14 @@ legacy total =
 
 Каждая проблема имеет конкретный record ID.
 
+Перед live import оператор обязан повторить preflight без `--skip-live`
+и независимо утвердить exact evidence. Количества, reconciliation и
+quarantine проверяются по свежему signed report, а не историческим цифрам.
+
 ## Этап 10. Миграция истории
+
+**Статус: implementation/CLI CODE COMPLETE; live import не выполнен и остаётся
+EXTERNAL OPERATOR GATE.**
 
 Работы:
 
@@ -2522,7 +2911,8 @@ legacy total =
 * импорт source provenance;
 * импорт dialogues;
 * дедупликация с live corpus;
-* импорт ранее удалённых записей;
+* импорт ранее удалённых записей; runtime authority — свежий
+  signed `expectedDeletedCount`;
 * quarantine;
 * повторный идемпотентный run;
 * reconciliation.
@@ -2541,8 +2931,13 @@ quarantined = 0
 ```
 
 Число диалогов точно объясняется migration report.
+До accepted live report migration adapter сохраняется для retry/status/audit.
 
 ## Этап 11. Полный embeddings backfill
+
+**Статус: bounded/paid workflow CODE COMPLETE; private judgment review,
+provider spend, выбор production space, полный backfill и final acceptance —
+EXTERNAL OPERATOR GATES.**
 
 Работы:
 
@@ -2552,15 +2947,22 @@ quarantined = 0
 4. запустить backfill;
 5. повторить failed jobs;
 6. проверить index;
-7. выполнить hybrid relevance evaluation.
+7. выполнить full-corpus hybrid relevance evaluation;
+8. принять её только с независимо закреплённой exact judgment identity.
 
 Критерий:
 
 * все eligible documents имеют completed vector либо документированную permanent error;
 * отсутствуют vectors неправильной dimension;
-* search quality принята на реальных запросах.
+* exact privacy exclusions связаны с job/document/code/evidence;
+* search quality принята на реальных запросах;
+* `Stage11Completion` создан только `relevance full-corpus accept`.
 
 ## Этап 12. Backup/restore и окончательный cutover
+
+**Статус: backup/off-device/restore/status contracts CODE COMPLETE; физическая
+копия, externally trusted provenance, restore exact bundle, final validate,
+cutover/tag и adapter retirement — EXTERNAL OPERATOR GATES.**
 
 Работы:
 
@@ -2569,13 +2971,14 @@ quarantined = 0
 * off-device backup;
 * restore drill;
 * final validation;
-* удалить migration adapter из основной ветки;
+* после принятого cutover отдельно решить, можно ли удалить migration adapter;
 * создать tag:
 
   ```text
   surrealdb-cutover
   ```
 
+Создание tag — отдельная git-операция только по явному решению оператора.
 Legacy-файлы остаются на диске без изменений.
 
 Их физическое удаление выполняется пользователем отдельно после периода
@@ -2585,7 +2988,9 @@ Legacy-файлы остаются на диске без изменений.
 
 # 21. Проверка качества поиска
 
-До выбора final embedding space создаётся набор из 50–100 реальных запросов:
+Stage 11 code/CLI готов, но все действия с private judgments и paid provider
+остаются operator gates. До выбора final embedding space оператор создаёт и
+независимо ревьюит private набор из 50–100 реальных запросов:
 
 ```text
 query
@@ -2595,6 +3000,10 @@ must-not-match examples
 query language
 query type
 ```
+
+Каждый query содержит expected dialogue, expected snippet и must-not-match;
+набор покрывает все десять классов ниже и языки RU/EN/mixed. Query text по
+умолчанию не включается в отчёты.
 
 Типы запросов:
 
@@ -2635,17 +3044,112 @@ hybrid BM25 + each vector space
 
 Решение принимается на основании собственного корпуса, а не общего benchmark.
 
+## 21.1. Bounded candidate evaluation
+
+Создаются ровно три candidate spaces, затем immutable bounded plan:
+
+```text
+baka embeddings candidates plan --judgments <private.json> \
+  --spaces <slug1,slug2,slug3> --max-documents <1..1000> \
+  --max-jobs-per-space <1..min(max-documents,200)> \
+  --selection-seed-sha256 <sha256> --report <private.json> \
+  [--overwrite] [--json]
+
+baka embeddings candidates run --plan <path> --judgments <same-path> \
+  --confirm <exact-plan-phrase> [--batch-size <1..64>] \
+  --allow-paid-api [--json]
+
+baka relevance evaluate --judgments <path> --report <path> \
+  --candidate-plan <path> --confirm <exact-plan-phrase> \
+  --spaces <same-three-csv> --resource-measurements <path> \
+  --documented-exclusions <path> [--modes text,vector,hybrid] \
+  --allow-paid-api [--include-query-text] [--overwrite] [--json]
+```
+
+Plan связывает exact normalized privacy, selection seed, required dialogues,
+documents/jobs и blockers. Удаление blockers, изменение corpus/privacy/plan,
+подмена provider или пересчёт только outer hashes не даёт authorization.
+Documented exclusions содержат не count, а exact stable
+`category/code/jobId/documentId/evidence`; swap исключённой и eligible row
+отклоняется.
+
+Отчёт хранит authenticated ordered hit identities и минимальное private
+content evidence. Для judgment проверки validator читает authoritative corpus
+bytes, проверяет их SHA и самостоятельно нормализует; сохранённые snippet/proof
+claims не могут аутентифицировать сами себя. Добавление, удаление, перестановка
+proof/document/corpus bindings или DB drift отклоняются.
+
+Принятие candidate metrics и выпуск `AcceptedRelevanceEvidence` formatVersion
+2 — ручное решение оператора, не автоматический результат собственного report.
+
+## 21.2. Exact count и production backfill
+
+```text
+baka embeddings exact-tokens --model <selected-model> \
+  --report <private.json> [--batch-size <n>] [--overwrite] [--json]
+
+baka embeddings backfill plan --space <selected-slug> \
+  --exact-report <path> --accepted-relevance <accepted-v2.json> \
+  --max-jobs <n> [--json]
+
+baka embeddings backfill run --space <selected-slug> \
+  --exact-report <same-path> --accepted-relevance <same-accepted-v2.json> \
+  --confirm <exact-plan-phrase> --max-jobs <n> \
+  [--batch-size <1..64>] --allow-paid-api [--json]
+
+baka embeddings audit --space <selected-slug> \
+  [--page-size <1..1000>] [--json]
+```
+
+Exact tokenizer запускается pinned `uv run --quiet --offline --script` и
+сверяет version/package/script identity. Цена существует только при явно
+настроенном `OPENAI_EMBEDDING_PRICE_PER_1M_TOKENS`. Каждый run — один
+ограниченный paid batch; retry/status сами provider не вызывают. Production
+plan обязан быть без blockers, соответствовать accepted candidate evidence,
+exact corpus/space/model/privacy и документировать permanent exclusions.
+
+## 21.3. Mandatory full-corpus acceptance
+
+Candidate evaluation не завершает Stage 11. После полного eligible backfill:
+
+```text
+baka relevance full-corpus plan --space <selected-slug> \
+  --exact-report <path> [--json]
+
+baka relevance full-corpus evaluate --space <selected-slug> \
+  --exact-report <path> --judgments <private.json> \
+  --resource-measurements <path> --documented-exclusions <path> \
+  --confirm <exact-full-corpus-phrase> --report <private.json> \
+  --allow-paid-api [--include-query-text] [--overwrite] [--json]
+
+baka relevance full-corpus accept --evidence <accepted-v1.json> \
+  --exact-report <path> --space <selected-slug> \
+  --judgments <exact-reviewed-file> \
+  --judgments-sha256 <externally-pinned-sha256> \
+  --judgments-size-bytes <exact-positive-size> [--json]
+```
+
+Expected judgment resolved path, exact-byte SHA и size поступают извне и не
+могут быть выведены из evidence или текущего файла. Missing identity,
+copied/altered identity, symlink/inode replacement, same-size rewrite и race
+fail closed. Изменение snippet-only или dialogue+snippet judgment отклоняется,
+даже если атакующий пересчитал judgment/report/evidence/canonical hashes и не
+изменил authoritative corpus bytes. Единственный constructor
+`Stage11Completion` — успешный `full-corpus accept` над exact выбранным space,
+corpus/privacy/exclusions и independently reviewed judgment artifact.
+
 ---
 
 # 22. Observability
 
-Все операции используют structured logs:
+Операционные команды используют общий privacy-safe logger из
+`src/observability.ts` там, где есть run lifecycle. Формат JSONL:
 
 ```json
 {
   "level": "info",
   "event": "source_revision_parsed",
-  "syncRunId": "...",
+  "runId": "sync_run:...",
   "sourceRevisionId": "...",
   "harness": "codex",
   "dialogues": 1,
@@ -2655,16 +3159,21 @@ hybrid BM25 + each vector space
 }
 ```
 
-По умолчанию не логируются:
+Logger разрешает только stable identifiers/codes, counters, bytes/tokens и
+timings; неизвестные/nested fields отбрасываются. Не логируются:
 
 * полный prompt;
 * полный assistant response;
 * tool result;
 * OpenAI API key;
 * raw payload;
-* DB password.
+* DB password;
+* абсолютные/относительные paths и report/output paths;
+* arbitrary error text или provider response body.
 
-Каждый run получает ID, по которому можно связать:
+Каждый run получает безопасный `runId`; если существует durable operation
+record, используется его ID, иначе генерируется operation-scoped UUID. По нему
+можно связать:
 
 * console output;
 * logs;
@@ -2672,6 +3181,10 @@ hybrid BM25 + each vector space
 * `source_scan`;
 * `ingest_error`;
 * migration report.
+
+Private reports хранятся отдельно с mode 0600/no-clobber и не становятся
+log payload. Fail-closed outer errors сообщают stable stage/code, а private
+cause/path/content остаётся внутри локальной ошибки/report boundary.
 
 ---
 
@@ -2689,67 +3202,75 @@ hybrid BM25 + each vector space
 8. Удаление исходника не удаляет raw или canonical data.
 9. Недоступный root не вызывает массовый `deleted_in_source`.
 10. Search projection содержит только текущие revisions.
-11. Embedding vector всегда соответствует content hash и embedding space.
-12. Pending/error jobs не находятся в vector table.
-13. В одной vector table находится только одно embedding space.
+11. Embedding vector соответствует exact `search_document.content_sha256`,
+    completed job `input_sha256` и owning `embedding_space`.
+12. Completed job имеет ровно соответствующий vector, а pending/error job —
+    нет; vector без completed job запрещён.
+13. В одной physical vector table находится только одно embedding space.
 14. Cached и reasoning tokens не double-counted.
-15. Ни одна migration row не теряется без quarantine.
-16. Повторный sync и migration идемпотентны.
-17. Archive может быть восстановлен из logical export + raw backup.
-18. Работа structured sync не зависит от OpenAI.
+15. Ни одна migration row не теряется без durable quarantine; exact per-table
+    `accounted=total`, а accepted production run имеет `lost=0` и
+    `quarantined=0`.
+16. Migration writer недостижим до signed approval/host-map/trust key и exact
+    fresh backup/restore validation; повторный sync/migration идемпотентен.
+17. Paid embeddings доступны только bounded/accepted workflows; permanent
+    privacy exclusions связаны с exact job/document/code/evidence.
+18. Stage 11 завершается только full-corpus acceptance с independently pinned
+    exact-byte judgment identity и authoritative corpus evidence.
+19. Archive может быть восстановлен из logical export + raw backup; strict
+    restore report связан с exact export/manifest/raw hashes и cleanup.
+20. Off-device integrity не заменяет external physical/provenance trust.
+21. Работа structured sync не зависит от OpenAI.
 
 ---
 
 # 24. Definition of Done
 
-Проект завершён, когда одновременно выполняются все условия:
+Проект завершён только когда одновременно выполнены обе группы ниже.
+Готовность кода не закрывает операторские evidence gates.
 
-### Инфраструктура
+### CODE COMPLETE / проверяемые implementation contracts
 
-* SurrealDB 3.2.3 pinned tag + digest.
-* JS SDK pinned.
-* Bind mount действительно расположен на archive volume.
-* Запуск без sentinel блокируется.
-* API доступен только через loopback.
-* `db:up/down/status/preflight` работают.
-* `disk:eject` корректно останавливает БД.
+* SurrealDB 3.2.3 и JS SDK pinned; sentinel, loopback,
+  `db:up/down/status/preflight` и `disk:eject` реализованы.
+* Все семь harness’ов, immutable/hash-addressed raw, consistent SQLite
+  snapshots, revision history, deletion state machine и host identity
+  реализованы; live sync идемпотентен.
+* Full-text/vector/hybrid по curated search projection, fail-closed legacy
+  forensic flags, segmentation v2 и HNSW audit реализованы; reasoning/tool
+  content не индексируется глобально и не эмбеддится.
+* Schema 5, migration/retry/reconciliation и fail-closed signed authorization
+  contracts реализованы.
+* Candidate/full-corpus paid gates, exact offline tokenizer и vector audit
+  реализованы; generic embeddings worker закрыт.
+* Logical/off-device backup, unique-namespace restore, validate/doctor/status и
+  privacy-safe observability contracts реализованы.
+* Legacy SQLite не изменяется и не удаляется автоматически; External System и
+  `other-project` не изменены.
 
-### Данные
+### EXTERNAL OPERATOR GATES — пока не закрыты
 
-* Все семь harness’ов синхронизируются.
-* Live sync идемпотентен.
-* Raw snapshots плоские, immutable и hash-addressed.
-* Активные SQLite-источники snapshot’ятся консистентно.
-* Старые dialogue revisions сохраняются.
-* Удалённые источники не приводят к потере архива.
-* Два ноутбука с одинаковым username различаются.
-
-### Поиск
-
-* Full-text находит известные точные фразы.
-* Semantic search находит релевантные paraphrases.
-* Hybrid search объединяет rankings.
-* Reasoning/tool content не эмбеддится.
-* Длинные ответы сегментируются без обрезки.
-* HNSW подтверждён через query plan.
-
-### Миграция
-
-* Все legacy rows учтены.
-* Все ранее удалённые entries сохранены.
-* Повторная миграция не создаёт дублей.
-* Quarantine либо пуст, либо полностью документирован.
-* Старые диалоги, отсутствующие в live sources, находятся через search.
-
-### Надёжность
-
-* Logical export создан.
-* Test restore успешен.
-* Raw manifest проверен.
-* Есть off-device backup.
-* `baka validate` не показывает критических ошибок.
-* Legacy SQLite не удалён автоматически.
-* External System и `other-project` не изменены.
+* Подтверждено, что live bind mount действительно расположен на ожидаемом
+  archive volume в момент финальной операции.
+* Создан свежий signed migration approval с exact snapshot/live/host evidence;
+  выполнен live `migration run`.
+* Все legacy rows учтены в accepted durable report; все ранее удалённые
+  entries сохранены, причём runtime authority — signed
+  `expectedDeletedCount`; `lost=0`, `quarantined=0`, retry не создаёт дублей.
+* Старые диалоги, отсутствующие в live sources, найдены через search.
+* Оператор принял private candidate relevance, цену и production space;
+  выполнен полный eligible paid backfill и independently pinned full-corpus
+  acceptance. Semantic/hybrid quality принята на реальных запросах.
+* Созданы final logical export и raw manifest, опубликован и проверен bundle на
+  подтверждённом отдельном физическом устройстве, а его provenance закреплена
+  вне bundle.
+* Выполнен strict restore exact off-device bundle; `status` показывает exact
+  recovery chain, при этом external trust подтверждён оператором.
+* Финальный `baka validate` не показывает критических ошибок; оператор принял
+  cutover и отдельно разрешил tag.
+* Только после периода эксплуатации отдельно решено, удалять ли migration
+  adapter и legacy files. Удаление legacy всегда ручное и не является
+  автоматическим шагом `baka`.
 
 ---
 

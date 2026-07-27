@@ -7,16 +7,17 @@
 (discovery `baka discover`, complete/partial scan, immutable raw snapshots,
 SQLite через `VACUUM INTO`, deletion/rename/reconcile-логика), parser
 contract + parsers/extractors всех 7 harness'ов (parser_version = 2,
-EXTRACTOR_VERSION = 2), SurrealDB writer и structured sync
+EXTRACTOR_VERSION = 3), SurrealDB writer и structured sync
 (`baka sync` / `baka status` / `baka validate`): репозитории
 `src/db/repositories/`, транзакция диалога по §10.4
 (`src/db/repositories/corpus.ts`), orchestrator `src/sync/sync-run.ts`.
 Этап 6: segmenter длинных документов (`src/search/segmenter.ts`,
 segmentation_version = "2", target 6000–7000 / hard < 8192 токенов,
 эвристика chars/3.5 с seam под точный tokenizer), BM25 full-text
-поиск (`src/search/fulltext.ts`, CLI `baka search`) и forensic search по
-chunk.content (--include-reasoning/--include-tools/--include-system/
---all-revisions), пересоздание projection — `baka search:rebuild`
+поиск (`src/search/fulltext.ts`, CLI `baka search`) по curated
+`search_document`; глобальный forensic index `chunk_content` удаляется в
+schema 5, а legacy flags fail closed до DB query. Canonical chunks/history
+сохранены. Пересоздание projection — `baka search:rebuild`
 (`src/search/rebuild.ts`).
 Этап 7: embedding pipeline (`src/embeddings/`) — provider abstraction +
 OpenAI provider (batch, dimensions, retry/backoff на 429/5xx) + mock
@@ -33,9 +34,12 @@ space:list|rebuild`. Решение о боевом space и полный backfi
 через HTTP /export (заголовки `surreal-ns`/`surreal-db`; legacy `NS`/`DB`
 в 3.x не работают) в `backups/surreal/` + manifest JSON (recordCounts,
 exportSha256) в `backups/manifests/`, zstd с fallback на gzip; restore
-drill `baka restore:test` — импорт в отдельный namespace
-`baka_restore_test` (import сам создаёт ns/db), сверка counts/инвариантов/
-search-probes, REMOVE NAMESPACE в finally, боевой ns не трогается;
+drill `baka restore:test` — отдельный exact-pinned disposable SurrealDB 3.2.3
+с fresh named volume и loopback-портом не 8901, импорт в уникальный namespace
+`baka_restore_test_<32 hex>`, сверка counts/инвариантов/двух BM25 probes,
+REMOVE INDEX/NAMESPACE, затем exact cleanup container+volume; production
+`baka-surrealdb` останавливается только внутри maintenance window и всегда
+перезапускается с проверкой неизменных schema/current-revision hash;
 `baka raw:verify` — raw manifest по source_revision + сверка файлов
 (§16.1/§16.2/§16.4); rawManifestSha256 в manifest'е backup заполняется
 (hashRawManifest по живой БД в том же lock-окне, что и export).
@@ -72,6 +76,11 @@ legacy-таблицам; `migration run` — этап 10.
   human_authored/visible_to_user хранятся bool, поэтому исходное
   "unknown" при rebuild трактуется как false (см. комментарий в
   src/search/rebuild.ts).
+- `search_document` содержит отдельный `user_prompt` для каждого
+  human-authored user message и финальные видимые assistant answers только
+  current revisions; migration 0005 удаляет только глобальный
+  `chunk_content` FULLTEXT, не canonical `chunk` records. Legacy forensic
+  flags fail closed без query/table scan.
 
 Ключевые решения этапа 7:
 
@@ -115,13 +124,47 @@ legacy-таблицам; `migration run` — этап 10.
   явный DEFINE не нужен (синтаксиса `DEFINE DATABASE ... ON NAMESPACE`
   нет); операции уровня сервера (REMOVE NAMESPACE) — через /sql без
   ns-заголовков (`sqlRoot` в src/backup/http.ts);
-- restore drill не поднимает второй контейнер: импорт в
-  `baka_restore_test` той же базы, REMOVE NAMESPACE в finally (идемпотентно
-  — перед импортом тоже чистится, на случай прошлого упавшего drill'а);
-  проверки сравнивают restored с manifest'ом и с боевой базой
-  (инварианты, BM25 probes), а не с константами;
+- compose явно передаёт `SURREAL_HTTP_MAX_IMPORT_BODY_SIZE` с bounded default
+  `34359738368` bytes (32 GiB): ограничение применяется к authenticated
+  import; повышать только после измерения проверенного backup,
+  unlimited не использовать;
+- restore drill обязан использовать второй isolated container; same-server
+  fallback запрещён. Exact профиль: memory/swap 12/12 GiB, CPU/pids 4/512,
+  RocksDB/HNSW cache 1 GiB/256 MiB, memory threshold 6 GiB, HTTP import 32 GiB,
+  RocksDB threads/jobs/subcompactions 4/4/2,
+  `--index-build-resume-interval 0`; `SURREAL_INDEXING_BATCH_SIZE` не
+  передаётся: exact pinned core не парсит такой CommonConfig key. Вместо
+  ложной настройки report отдельно аттестует compile-time adaptive indexing:
+  первый probe 16 records, soft target 8 388 608 raw bytes, максимум 250
+  records (replay также максимум 250); credentials передаются только через
+  env/stdin и не попадают в argv/log/report;
+- production maintenance preflight принимает только `baka-surrealdb` exact
+  pinned image, healthy loopback `127.0.0.1:8901` и mounts ровно
+  `{rw bind effective internal BAKA_DB_ROOT→/data/db, local anonymous volumes
+  /data и /logs}`; persistent default —
+  `<HOME>/Library/Application Support/ai-baka/rocksdb`, override допускает
+  другой абсолютный внутренний APFS/POSIX path, но не archive volume ExFAT;
+  проверяет отсутствие чужого lock/client, затем держит собственный process
+  lock до restart и сравнения schema/current baseline;
+- lifecycle ordering: production stop → isolated start → restore → reverse
+  cleanup FULLTEXT indexes → REMOVE NAMESPACE → explicit idempotent target
+  finalize (container, затем volume, с доказанной отсутствующей identity) →
+  production restart/health/baseline → только после этого RestoreTestReport v5;
+- `recovery:rebuild` — отдельный one-way production flow: authenticated
+  schema-5 export → fresh final `BAKA_DB_ROOT` + отдельный internal work root →
+  staged import/index/verification → exact staging-container removal + temp cleanup →
+  private durable journal/report. Вход требует exact independently pinned
+  `--export-sha256`, `--manifest-sha256`, effective internal
+  `BAKA_DB_ROOT` и `--confirm-rebuild`. Команда не делает container-name
+  cutover/promotion, physical rollback или reverse migration; после success
+  координатор отдельно recreates Compose с тем же `BAKA_DB_ROOT`.
+  Corrupt `archive/db` не открывается/не копируется/не переименовывается
+  и остаётся нетронутым до acceptance; `migration-input`
+  сохраняется только как read-only input до pending legacy import, а не
+  как retained recovery cache;
 - `baka backup` берёт preflight + lock (консистентный snapshot относительно
-  sync), `restore:test` и `raw:verify` — read-only по архиву, без lock'а;
+  sync), `restore:test` берёт отдельный maintenance lock, `raw:verify` остаётся
+  read-only по архиву без lock'а;
 - тело /export стримится на диск (`Bun.write(tmp, response)`), НЕ
   arrayBuffer в память; export и manifest пишутся атомарно: tmp-файл с
   суффиксом `.part` (не матчится latestExportPath) + fsync + rename;
@@ -176,10 +219,12 @@ legacy-таблицам; `migration run` — этап 10.
 - rename detection: 2+ отсутствующих источника с тем же SHA →
   неоднозначность, новый файл — независимый location (§10.7);
 - unknown-события сохраняются ПОЛНОСТЬЮ (без slice(0, 4000)) во всех 7
-  parser'ах (§7.3) — parser_version = 2 у всех; EXTRACTOR_VERSION = 2:
-  граница turn'а — последний user message с humanAuthored true/unknown
-  (общий findLastTurnBoundary), codex final_answer ищется только после
-  неё; kimi raw role → role="unknown" + rawRole; cachedInputTokens =
+  parser'ах (§7.3) — parser_version = 2 у всех; EXTRACTOR_VERSION = 3:
+  каждый извлечённый реальный user message образует отдельный turn-window
+  и получает свой assistant_final; harness-specific fallback сохраняет
+  реальные prompts с humanAuthored=unknown, но исключает false/system-generated;
+  codex final_answer ищется только внутри turn-window; kimi raw role →
+  role="unknown" + rawRole; cachedInputTokens =
   ТОЛЬКО cache read (cache creation — в raw события); claude-desktop
   дедуплицирует streaming-записи по message.id;
 - segmenter: packBlocks учитывает разделители "\n\n", splitOversized
@@ -219,15 +264,30 @@ legacy-таблицам; `migration run` — этап 10.
   loop, зомби-процесс удерживал sync lock. `handle()` в cli.ts теперь
   делает жёсткий `process.exit(1)` на путях ошибок, а connectDb закрывает
   сокет, если signin/use упали после connect;
-- restore drill большого export: тело /import буфером
-  (`readFile`) обрывало upload, сервер применял усечённый поток —
-  передаём `Bun.file(path)` (поток с диска). Побочные находки 3.2.3:
+- restore drill на боевом объёме: тело /import буфером (`readFile`), затем
+  `Bun.file`/Bun node:http не обеспечили надёжный multi-GiB transport;
+  текущий путь — native curl/libcurl upload-file с exact Content-Length,
+  backpressure и credentials через stdin config. Побочные находки 3.2.3:
   SELECT по неопределённой таблице — ошибка "The table ... does not
   exist", а не 0 строк; /import применяет поток по мере поступления
   (ns/db могут быть частично созданы даже при оборванном upload);
+- import-тело сверх server default отклоняется через HTTP 413; `SURREAL_HTTP_MAX_IMPORT_BODY_SIZE=34359738368`
+  снимает этот admission blocker, сохраняя конечный лимит;
 - повторный parse revision (после фикса parser'а) закрывает её прежние
   unresolved ingest_errors (`resolveStaleIngestErrors`, resolution
   `reparse:<status>`): иначе исправленные ошибки копились бы вечно.
+
+Фиксы производительности 2026-07-26 (с regression-тестами):
+
+- `--full-rescan` не читает head_hash и не запускает snapshot для
+  файлов с неизменными size/mtime — большой архив не перехэшируется
+  целиком на каждом прогоне; changed/new по-прежнему переснимаются;
+- restore drill вырезает FULLTEXT DDL из export'а, сначала импортирует
+  данные, затем строит BM25/HIGHLIGHTS один раз — без дорогого
+  инкрементального обновления индекса на каждом INSERT-батче.
+- schema 5 больше не строит FULLTEXT по всем physical `chunk` revisions:
+  production/restore требуют только `search_document_content`; canonical
+  chunks и historical revisions остаются сохранены без глобального индекса.
 
 ## Стек
 
@@ -235,7 +295,11 @@ legacy-таблицам; `migration run` — этап 10.
 - SurrealDB 3.2.3 (image pinned tag + digest), RocksDB, отдельный
   docker-compose, только `127.0.0.1:8901`.
 - Архив на внешнем диске: `BAKA_ARCHIVE_ROOT`
-  (по умолчанию `/Volumes/Archive/Conversations`).
+  (по умолчанию `/Volumes/Archive/Conversations`) содержит raw, manifests,
+  exports и backups. Mutable RocksDB задаётся `BAKA_DB_ROOT`; persistent
+  default — `<HOME>/Library/Application Support/ai-baka/rocksdb`
+  на внутреннем APFS/POSIX storage. ExFAT для live RocksDB и recovery temp/
+  staging/journal не поддерживается; старый archive/db не runtime fallback.
 - Схема БД — миграции в `schema/*.surql` (0001–0004, строго по
   `docs/plan.md` §7/§8/§12/§13/§15); migration runner —
   `src/db/migrations.ts` (`baka db migrate`, версия схемы видна в
@@ -249,6 +313,13 @@ legacy-таблицам; `migration run` — этап 10.
 - Никакого dual-write: новая ветка пишет только в SurrealDB.
 - External System и проект `other-project` не изменяются.
 - Raw snapshots неизменяемы; identity — полный SHA-256.
+- `BAKA_DB_ROOT` меняет только live RocksDB mount; raw/backups остаются под
+  `BAKA_ARCHIVE_ROOT`. Recovery — one-way logical backup rebuild на internal
+  APFS с cleanup крупных временных файлов в `finally`; corrupt archive volume DB не
+  копируется, не переименовывается и остаётся нетронутой до acceptance.
+  Rebuild не пересоздаёт Compose: coordinator recreation и acceptance идут
+  отдельно по `docs/rocksdb-recovery.md`, без dual-write, physical rollback,
+  reverse migration и in-place repair.
 - Embeddings не входят в критический путь sync; OpenAI key только в окружении.
 - `.env`, secrets, приватные диалоги и полные raw-файлы не коммитятся;
   в Git — только обезличенные golden fixtures.
