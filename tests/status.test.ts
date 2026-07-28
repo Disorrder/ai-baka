@@ -788,6 +788,8 @@ describe("status CLI formatter", () => {
           deleted_original_unrecoverable_no_messages: 0,
           canonical_child_of_excluded_active_thread: 1,
           source_less_record_of_excluded_active_thread: 1,
+          existing_dialogue_ownership_superseded: 0,
+          canonical_child_of_superseded_thread: 0,
         },
       },
     };

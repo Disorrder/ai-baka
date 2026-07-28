@@ -46,6 +46,8 @@ export const OPERATOR_EXCLUSION_CODES = [
   "deleted_original_unrecoverable_no_messages",
   "canonical_child_of_excluded_active_thread",
   "source_less_record_of_excluded_active_thread",
+  "existing_dialogue_ownership_superseded",
+  "canonical_child_of_superseded_thread",
 ] as const;
 
 export type OperatorExclusionCode = (typeof OPERATOR_EXCLUSION_CODES)[number];
@@ -274,6 +276,8 @@ function emptyCounts(): Record<OperatorExclusionCode, number> {
     deleted_original_unrecoverable_no_messages: 0,
     canonical_child_of_excluded_active_thread: 0,
     source_less_record_of_excluded_active_thread: 0,
+    existing_dialogue_ownership_superseded: 0,
+    canonical_child_of_superseded_thread: 0,
   };
 }
 
@@ -733,14 +737,35 @@ export async function deriveEligibleOperatorExclusions(
       const linkedSources = bundle.records
         .filter((row) => row.source_file_id !== null)
         .map((row) => sources.get(row.source_file_id!));
-      if (linkedSources.some((source) => source === undefined) || !hasExactRecordOwnership(bundle.records)) continue;
-      const activeSources = linkedSources
-        .filter((source): source is NonNullable<typeof source> => source !== undefined)
-        .filter((source) => !isLegacySourceDeleted(source));
+      if (linkedSources.some((source) => source === undefined)) continue;
       const exactDialogueExists = dialogueKeys.has(`${harness}:${thread.external_id}`) ||
         linkedSources.some((source) => source !== undefined &&
           revisionDialogueKeys.has(`${source.sha256}:${thread.external_id}`));
-      if (exactDialogueExists) continue;
+      if (exactDialogueExists) {
+        remember("threads", thread, "existing_dialogue_ownership_superseded");
+        for (const row of bundle.records) {
+          if (row.source_file_id === null) {
+            remember("thread_records", row, "source_less_record_of_excluded_active_thread");
+          }
+        }
+        for (const row of bundle.messages) {
+          remember("messages", row, "canonical_child_of_superseded_thread");
+        }
+        for (const row of bundle.chunks) {
+          remember("message_chunks", row, "canonical_child_of_superseded_thread");
+        }
+        continue;
+      }
+      if (!hasExactRecordOwnership(bundle.records)) {
+        if (bundle.messages.length === 0 && bundle.chunks.length === 0 &&
+            linkedSources.some((s) => s !== undefined && !isLegacySourceDeleted(s))) {
+          remember("threads", thread, "active_original_without_exact_dialogue");
+        }
+        continue;
+      }
+      const activeSources = linkedSources
+        .filter((source): source is NonNullable<typeof source> => source !== undefined)
+        .filter((source) => !isLegacySourceDeleted(source));
 
       if (linkedSources.length > 0 &&
           activeSources.length === 0 &&
