@@ -7,7 +7,9 @@ import path from "node:path";
 import { RecordId, type Surreal } from "surrealdb";
 import {
   deriveEligibleOperatorExclusions,
+  indexOperatorExclusionRows,
   parseOperatorExclusionArtifact,
+  requireOperatorExclusionRow,
   verifyOperatorExclusionAttestation,
   type OperatorExclusionArtifact,
   type OperatorExclusionAttestation,
@@ -110,6 +112,65 @@ describe("signed operator-exclusion artifacts", () => {
     const unknown = structuredClone(artifact) as unknown as Record<string, unknown>;
     (unknown.rows as Array<Record<string, unknown>>)[0]!.exclusionCode = "message_prefix_match";
     expect(() => parseOperatorExclusionArtifact(unknown)).toThrow(/reviewed operator exclusion code/);
+  });
+
+  test("preindexes large signed row sets once and keeps acceptance membership exact", () => {
+    const source = artifactFixture().rows[0]!;
+    const rows = Array.from({ length: 92_455 }, (_, index): OperatorExclusionRow => ({
+      ...source,
+      quarantineId: `migration_quarantine:mq_${index}`,
+      legacyId: String(index),
+      lineageKey: `threads:${index}`,
+    }));
+    let findReads = 0;
+    const guardedRows = new Proxy(rows, {
+      get(target, property, receiver) {
+        if (property === "find") {
+          findReads += 1;
+          throw new Error("linear artifact row lookup is forbidden");
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const firstAcceptance = indexOperatorExclusionRows(guardedRows);
+    const secondRow: OperatorExclusionRow = {
+      ...rows[0]!,
+      exclusionCode: "deleted_original_unrecoverable_no_messages",
+    };
+    const rowsByAcceptance = new Map([
+      ["migration_meta:acceptance_one", firstAcceptance],
+      ["migration_meta:acceptance_two", indexOperatorExclusionRows([secondRow])],
+    ]);
+
+    let exactMatches = 0;
+    for (const row of rows) {
+      if (requireOperatorExclusionRow(
+        rowsByAcceptance.get("migration_meta:acceptance_one"),
+        row.quarantineId,
+        row.exclusionCode,
+      ) === row) exactMatches += 1;
+    }
+    expect(firstAcceptance).toBeInstanceOf(Map);
+    expect(firstAcceptance.size).toBe(rows.length);
+    expect(exactMatches).toBe(rows.length);
+    expect(findReads).toBe(0);
+    expect(requireOperatorExclusionRow(
+      rowsByAcceptance.get("migration_meta:acceptance_two"),
+      secondRow.quarantineId,
+      secondRow.exclusionCode,
+    )).toBe(secondRow);
+    expect(() => requireOperatorExclusionRow(
+      firstAcceptance,
+      "migration_quarantine:missing",
+      source.exclusionCode,
+    )).toThrow(/absent from signed exclusion row set/);
+    expect(() => requireOperatorExclusionRow(
+      firstAcceptance,
+      rows[0]!.quarantineId,
+      secondRow.exclusionCode,
+    )).toThrow(/absent from signed exclusion row set/);
+    expect(() => indexOperatorExclusionRows([rows[0]!, rows[0]!]))
+      .toThrow(/duplicate operator exclusion quarantine id/);
   });
 
   test("fresh eligibility requires exact source ownership and handles active/deleted classes", async () => {

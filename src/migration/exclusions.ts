@@ -287,6 +287,31 @@ function normalizedCounts(rows: readonly OperatorExclusionRow[]): Record<Operato
   return counts;
 }
 
+export function indexOperatorExclusionRows(
+  rows: readonly OperatorExclusionRow[],
+): ReadonlyMap<string, OperatorExclusionRow> {
+  const rowsByQuarantineId = new Map<string, OperatorExclusionRow>();
+  for (const row of rows) {
+    if (rowsByQuarantineId.has(row.quarantineId)) {
+      throw new Error("duplicate operator exclusion quarantine id");
+    }
+    rowsByQuarantineId.set(row.quarantineId, row);
+  }
+  return rowsByQuarantineId;
+}
+
+export function requireOperatorExclusionRow(
+  rowsByQuarantineId: ReadonlyMap<string, OperatorExclusionRow> | undefined,
+  quarantineId: string,
+  exclusionCode: OperatorExclusionCode,
+): OperatorExclusionRow {
+  const row = rowsByQuarantineId?.get(quarantineId);
+  if (!row || row.exclusionCode !== exclusionCode) {
+    throw new Error("quarantine row is absent from signed exclusion row set");
+  }
+  return row;
+}
+
 function artifactBody(artifact: Omit<OperatorExclusionArtifact, "artifactSha256">): Omit<OperatorExclusionArtifact, "artifactSha256"> {
   return artifact;
 }
@@ -1554,8 +1579,22 @@ export async function inspectMigrationQuarantineLifecycle(
   const metas = new Map<string, MigrationMetaRow>();
   for (const row of [...metaRows, ...persistedAcceptances]) metas.set(String(row.id), row);
   const verified = new Map<string, Awaited<ReturnType<typeof verifyPersistedAcceptance>>>();
+  // Keep one exact membership index per acceptance so the row-driven pass
+  // remains O(n) regardless of the acceptance size.
+  const artifactRowsByAcceptance = new Map<
+    string,
+    ReadonlyMap<string, OperatorExclusionRow>
+  >();
   const verificationErrors = new Map<string, unknown>();
   const exclusionLineages = new Set<string>();
+  const cacheVerifiedAcceptance = (
+    metaId: string,
+    evidence: Awaited<ReturnType<typeof verifyPersistedAcceptance>>,
+  ): void => {
+    const rowsByQuarantineId = indexOperatorExclusionRows(evidence.artifact.rows);
+    verified.set(metaId, evidence);
+    artifactRowsByAcceptance.set(metaId, rowsByQuarantineId);
+  };
 
   // Acceptance metadata is durable evidence in its own right. Verify it even
   // when every signed quarantine row was deleted and no current resolution can
@@ -1563,12 +1602,13 @@ export async function inspectMigrationQuarantineLifecycle(
   for (const meta of persistedAcceptances) {
     const metaId = String(meta.id);
     try {
-      verified.set(metaId, await verifyPersistedAcceptance({
+      const evidence = await verifyPersistedAcceptance({
         db,
         archiveRoot: options.archiveRoot,
         meta,
         artifactSha256: meta.approval_artifact_sha256 ?? "",
-      }));
+      });
+      cacheVerifiedAcceptance(metaId, evidence);
     } catch (error) {
       verificationErrors.set(metaId, error);
       if (!metaIds.has(metaId)) {
@@ -1631,13 +1671,14 @@ export async function inspectMigrationQuarantineLifecycle(
           meta,
           artifactSha256: parsed.artifactSha256,
         });
-        verified.set(parsed.metaId, evidence);
+        cacheVerifiedAcceptance(parsed.metaId, evidence);
       }
       if (options.archiveRoot) {
-        const item = evidence.artifact.rows.find((candidate) => candidate.quarantineId === String(row.id));
-        if (!item || item.exclusionCode !== parsed.code) {
-          throw new Error("quarantine row is absent from signed exclusion row set");
-        }
+        const item = requireOperatorExclusionRow(
+          artifactRowsByAcceptance.get(parsed.metaId),
+          String(row.id),
+          parsed.code,
+        );
         assertArtifactRowCurrent(item, row);
       }
       if (mappingByLineage.has(row.lineage_key)) {
