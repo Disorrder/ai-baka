@@ -16,6 +16,7 @@ describe("normalizeUsageEvents", () => {
         scope: "request",
         inputTokens: 5200,
         cachedInputTokens: 3100,
+        cacheWriteInputTokens: 200,
         outputTokens: 140,
         reasoningOutputTokens: 60,
         totalTokensReported: 5340,
@@ -23,9 +24,10 @@ describe("normalizeUsageEvents", () => {
       },
     ];
     const usage = normalizeUsageEvents(events)!;
-    // 5200 + 140, БЕЗ повторного +3100 cached и +60 reasoning.
+    // 5200 + 140, БЕЗ повторного cache read/write и reasoning.
     expect(usage.totalTokensNormalized).toBe(5340);
     expect(usage.cachedInputTokens).toBe(3100);
+    expect(usage.cacheWriteInputTokens).toBe(200);
     expect(usage.reasoningOutputTokens).toBe(60);
     expect(usage.totalTokensReported).toBe(5340);
     expect(usage.normalizationVersion).toBe(USAGE_NORMALIZATION_VERSION);

@@ -58,14 +58,25 @@ export const basicDialogue: CursorFixtureSpec = {
       bubbles: [
         {
           bubbleId: "b-user-0001",
-          value: userBubble("b-user-0001", "Объясни работу кэша в src/cache.ts"),
+          value: userBubble("b-user-0001", "Объясни работу кэша в src/cache.ts", {
+            createdAt: new Date(T0).toISOString(),
+          }),
         },
         {
           bubbleId: "b-asst-0002",
           value: assistantBubble(
             "b-asst-0002",
             "Кэш в src/cache.ts устроен как in-memory Map с TTL и инвалидацией по тегам.",
-            { tokenCount: { inputTokens: 2350, outputTokens: 140 } },
+            {
+              createdAt: new Date(T0 + 60_000).toISOString(),
+              timingInfo: {
+                clientStartTime: 1234.5,
+                clientRpcSendTime: T0 + 1_000,
+                clientSettleTime: T0 + 60_000,
+                clientEndTime: T0 + 60_000,
+              },
+              tokenCount: { inputTokens: 2350, outputTokens: 140 },
+            },
           ),
         },
       ],

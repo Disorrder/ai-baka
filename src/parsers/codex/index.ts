@@ -19,11 +19,16 @@
  *   response_item и несёт phase ("commentary"/"final_answer") — это
  *   явный final marker (план §8.3);
  * - event_msg/token_count: info.last_token_usage (request scope) +
- *   info.total_token_usage (session cumulative);
+ *   info.total_token_usage (session cumulative); codex пишет событие по разу
+ *   на каждый rate-limit bucket с идентичным info — копии отбрасываются
+ *   (eventCounts["event_msg.token_count_bucket_duplicate"]);
  * - compacted, world_state, task_*, mcp_*, patch_apply_*, web_search_*,
  *   thread_rolled_back, sub_agent_activity, inter_agent_communication_metadata:
  *   операционные события — не сообщения; учитываются в metadata.eventCounts,
- *   raw остаётся в immutable snapshot.
+ *   raw остаётся в immutable snapshot. task_complete.duration_ms учитывается
+ *   только если payload.started_at не раньше старта ЭТОГО файла: у fork'ов
+ *   replay истории parent несёт исходные duration (иначе child получает чужие
+ *   часы — eventCounts["event_msg.task_complete.inherited_duration"]);
  *
  * Неизвестные типы событий НЕ роняют диалог: сохраняются как unknown
  * чанки + diagnostic (план §19.2 сценарий 11).
@@ -53,7 +58,9 @@ import { normalizeModelName } from "../shared/model-normalization.ts";
 import { isSqliteFile } from "../shared/sqlite.ts";
 
 export const CODEX_PARSER_NAME = "codex";
-export const CODEX_PARSER_VERSION = 2;
+export const CODEX_PARSER_VERSION = 9;
+
+type ResponseStatus = "completed" | "aborted" | "incomplete";
 
 /** Операционные event_msg/верхние типы: не сообщения, только счётчики. */
 const OPERATIONAL_EVENT_TYPES = new Set([
@@ -87,6 +94,18 @@ interface ModelState {
   model?: string;
   reasoningEffort?: string;
   provider?: string;
+}
+
+interface ActiveTurn {
+  id?: string;
+  startedAt?: Date;
+  lastTimestamp?: Date;
+  messageStartIndex: number;
+  userMessages: Array<{
+    message: ParsedMessage;
+    timestamp: Date;
+    sourceLocator: string;
+  }>;
 }
 
 export class CodexParser implements HarnessParser {
@@ -142,6 +161,7 @@ class DialogueBuilder {
   private externalId: string | undefined;
   private workspace: ParsedDialogue["workspace"];
   private metadata: Record<string, unknown> = {};
+  private sessionMetaCount = 0;
   private startedAt: Date | undefined;
   private updatedAt: Date | undefined;
   private modelState: ModelState = {};
@@ -149,6 +169,12 @@ class DialogueBuilder {
   private unknownTypes = new Set<string>();
   /** Текст последнего user message из event_msg/user_message (dedupe). */
   private lastUserEventText: string | undefined;
+  /** info предыдущего token_count — дедуп rate-limit bucket-копий. */
+  private lastTokenCountInfoKey: string | undefined;
+  private activeTurn: ActiveTurn | undefined;
+  private turnSequence = 0;
+  /** Время старта ЭТОГО файла из session_meta — граница replay-истории fork'а. */
+  private sessionStartedAt: Date | undefined;
 
   constructor(
     private readonly path: string,
@@ -159,8 +185,13 @@ class DialogueBuilder {
   event(record: Record<string, unknown>, line: number): void {
     const timestamp = parseTimestamp(record.timestamp);
     this.trackTime(timestamp);
+    this.trackTurnTime(timestamp);
     const type = asString(record.type);
     const payload = asObject(record.payload) ?? {};
+    const turnId = codexTurnId(payload);
+    if (turnId && this.activeTurn && this.activeTurn.id?.startsWith("synthetic:")) {
+      this.activeTurn.id = turnId;
+    }
     const locator = `${this.path}#L${line}`;
 
     switch (type) {
@@ -208,6 +239,9 @@ class DialogueBuilder {
   }
 
   finish(): ParsedDialogue | undefined {
+    if (this.activeTurn) {
+      this.finishActiveTurn("incomplete", {}, this.activeTurn.lastTimestamp ?? this.updatedAt, `${this.path}#EOF`);
+    }
     if (!this.externalId && this.messages.length === 0) {
       this.diagnostics.push({
         code: "empty_snapshot",
@@ -230,23 +264,60 @@ class DialogueBuilder {
   // --- top-level события ---
 
   private sessionMeta(payload: Record<string, unknown>): void {
-    this.externalId = asString(payload.id) ?? asString(payload.session_id);
+    const id = asString(payload.id) ?? asString(payload.session_id);
+    const isPrimary = this.sessionMetaCount === 0;
+    this.sessionMetaCount += 1;
+    if (isPrimary) {
+      this.externalId = id;
+      const source = asObject(payload.source);
+      const spawn = asObject(asObject(source?.subagent)?.thread_spawn);
+      const parentSourceDialogueId =
+        asString(payload.forked_from_id) ??
+        asString(payload.parent_thread_id) ??
+        asString(spawn?.parent_thread_id);
+      if (parentSourceDialogueId) {
+        this.metadata.lineage = {
+          parentSourceDialogueId,
+          ...(asNumber(spawn?.depth) !== undefined ? { depth: asNumber(spawn?.depth) } : {}),
+          ...(asString(spawn?.agent_nickname) !== undefined
+            ? { nickname: asString(spawn?.agent_nickname) }
+            : {}),
+          ...(asString(spawn?.agent_role) !== undefined
+            ? { role: asString(spawn?.agent_role) }
+            : {}),
+        };
+      }
+    } else {
+      const related = asArray(this.metadata.relatedSessionMetas);
+      related.push({
+        ...(id !== undefined ? { id } : {}),
+        ...(asString(payload.forked_from_id) !== undefined
+          ? { forkedFromId: asString(payload.forked_from_id) }
+          : {}),
+        ...(payload.source !== undefined ? { source: payload.source } : {}),
+      });
+      this.metadata.relatedSessionMetas = related;
+      this.count("top:session_meta.related");
+    }
     const cwd = asString(payload.cwd) ?? this.context?.workspaceHint;
     const git = asObject(payload.git);
     const repo = asString(git?.repository_url);
-    if (cwd || repo) {
+    if ((cwd || repo) && (!this.workspace || isPrimary)) {
       this.workspace = {
         ...(cwd !== undefined ? { path: cwd, name: basename(cwd) } : {}),
         ...(repo !== undefined ? { repositoryIdentity: repo } : {}),
       };
     }
-    this.metadata.originator = asString(payload.originator);
-    this.metadata.cliVersion = asString(payload.cli_version);
-    this.metadata.modelProvider = asString(payload.model_provider);
-    this.metadata.source = asString(payload.source);
+    this.metadata.originator ??= asString(payload.originator);
+    this.metadata.cliVersion ??= asString(payload.cli_version);
+    this.metadata.modelProvider ??= asString(payload.model_provider);
+    this.metadata.source ??= asString(payload.source);
     this.modelState.provider ??= asString(payload.model_provider);
     const ts = parseTimestamp(payload.timestamp);
-    this.trackTime(ts);
+    if (isPrimary) {
+      this.sessionStartedAt = ts ?? this.sessionStartedAt;
+      this.trackTime(ts);
+    }
   }
 
   private turnContext(payload: Record<string, unknown>): void {
@@ -471,6 +542,16 @@ class DialogueBuilder {
     timestamp: Date | undefined,
     locator: string,
   ): void {
+    const content = contentPartsText(payload.output) || asString(payload.output) || "";
+    const reportedDurationMs = parseWorkedForDurationMs(content);
+    const durationMetadata =
+      reportedDurationMs !== undefined
+        ? {
+            reportedDurationMs,
+            reportedDurationSource: "codex.tool_output.worked_for",
+            reportedDurationKind: "tool_execution",
+          }
+        : {};
     this.pushMessage({
       role: "tool",
       rawRole: rawType,
@@ -481,14 +562,14 @@ class DialogueBuilder {
         this.chunk({
           kind: "tool_result",
           rawKind: rawType,
-          content: contentPartsText(payload.output) || asString(payload.output) || "",
+          content,
           toolCallId: asString(payload.call_id),
           rawEventType: `response_item.${rawType}`,
           sourceLocator: locator,
-          metadata: {},
+          metadata: durationMetadata,
         }),
       ],
-      metadata: {},
+      metadata: durationMetadata,
     });
   }
 
@@ -499,6 +580,15 @@ class DialogueBuilder {
   ): void {
     const type = asString(payload.type);
     switch (type) {
+      case "task_started":
+        this.beginTurn(payload, timestamp);
+        return;
+      case "task_complete":
+        this.finishActiveTurn("completed", payload, timestamp, locator);
+        return;
+      case "turn_aborted":
+        this.finishActiveTurn("aborted", payload, timestamp, locator);
+        return;
       case "user_message":
         this.userMessageEvent(payload, timestamp, locator);
         return;
@@ -561,9 +651,15 @@ class DialogueBuilder {
         metadata: { userMessageText: text, confirmedBy: "event_msg.user_message" },
       });
     }
+    const target = matched ?? this.messages[this.messages.length - 1];
+    // Sub-agent rollout повторяет parent prompt как user_message, но его
+    // собственная работа начинается с межагентного NEW_TASK. Для дочерней
+    // сессии точным источником служит duration каждого task turn.
+    if (target && timestamp && this.metadata.lineage === undefined) {
+      this.addTurnUserMessage(target, timestamp, locator);
+    }
     const images = asArray(payload.images).length + asArray(payload.local_images).length;
     if (images > 0) {
-      const target = matched ?? this.messages[this.messages.length - 1];
       target?.chunks.push(
         this.chunk({
           kind: "attachment",
@@ -612,6 +708,18 @@ class DialogueBuilder {
   /** token_count: last = per-request, total = session cumulative. */
   private tokenCountEvent(payload: Record<string, unknown>): void {
     const info = asObject(payload.info);
+    // Codex пишет один и тот же вызов по разу на каждый rate-limit bucket
+    // (rate_limits.limit_id: "codex", "codex_bengalfox", ...): info при этом
+    // идентичен. Кумулятивный счётчик растёт только от новых вызовов, поэтому
+    // повтор предыдущего info — всегда bucket-копия, а не новый вызов.
+    const infoKey = tokenCountInfoKey(info);
+    if (infoKey !== undefined) {
+      if (infoKey === this.lastTokenCountInfoKey) {
+        this.count("event_msg.token_count_bucket_duplicate");
+        return;
+      }
+      this.lastTokenCountInfoKey = infoKey;
+    }
     const events: ParsedUsageEvent[] = [];
     const last = asObject(info?.last_token_usage);
     if (last) {
@@ -731,7 +839,7 @@ class DialogueBuilder {
       externalId?: string;
       model?: ParsedModelInvocation | undefined;
     },
-  ): void {
+  ): ParsedMessage {
     const message: ParsedMessage = {
       sequence: this.messages.length,
       usageEvents: [],
@@ -739,6 +847,7 @@ class DialogueBuilder {
       chunks: partial.chunks.map((chunk, index) => ({ ...chunk, sequence: index })),
     };
     this.messages.push(message);
+    return message;
   }
 
   private chunk(
@@ -761,6 +870,133 @@ class DialogueBuilder {
     if (!this.startedAt || timestamp < this.startedAt) this.startedAt = timestamp;
     if (!this.updatedAt || timestamp > this.updatedAt) this.updatedAt = timestamp;
   }
+
+  private trackTurnTime(timestamp: Date | undefined): void {
+    if (!timestamp || !this.activeTurn) return;
+    if (!this.activeTurn.lastTimestamp || timestamp > this.activeTurn.lastTimestamp) {
+      this.activeTurn.lastTimestamp = timestamp;
+    }
+  }
+
+  private beginTurn(payload: Record<string, unknown>, timestamp: Date | undefined): void {
+    if (this.activeTurn) {
+      this.finishActiveTurn("incomplete", {}, timestamp ?? this.activeTurn.lastTimestamp);
+    }
+    this.turnSequence += 1;
+    this.activeTurn = {
+      id: codexTurnId(payload) ?? `synthetic:${this.turnSequence}`,
+      startedAt: timestamp,
+      lastTimestamp: timestamp,
+      messageStartIndex: this.messages.length,
+      userMessages: [],
+    };
+    this.count("event_msg.task_started");
+  }
+
+  private addTurnUserMessage(
+    message: ParsedMessage,
+    timestamp: Date,
+    sourceLocator: string,
+  ): void {
+    if (!this.activeTurn) {
+      this.turnSequence += 1;
+      this.activeTurn = {
+        id: `synthetic:${this.turnSequence}`,
+        startedAt: timestamp,
+        lastTimestamp: timestamp,
+        messageStartIndex: this.messages.length,
+        userMessages: [],
+      };
+    }
+    if (this.activeTurn.userMessages.some((entry) => entry.message === message)) return;
+    this.activeTurn.userMessages.push({ message, timestamp, sourceLocator });
+  }
+
+  private finishActiveTurn(
+    status: ResponseStatus,
+    payload: Record<string, unknown>,
+    timestamp: Date | undefined,
+    locator?: string,
+  ): void {
+    const turn = this.activeTurn;
+    if (!turn) {
+      this.count(`event_msg.${status === "completed" ? "task_complete" : status === "aborted" ? "turn_aborted" : "task_incomplete"}`);
+      return;
+    }
+    const completedAt = timestamp ?? turn.lastTimestamp ?? turn.startedAt;
+    const explicitDurationMs = asNumber(payload.duration_ms);
+    // Forked/subagent rollout: replay истории parent содержит task_complete с
+    // ИСХОДНЫМИ payload.started_at/completed_at/duration_ms — turn ЗАВЕРШИЛСЯ
+    // до создания этого файла (envelope timestamp при этом spawn-time). Такой
+    // duration — работа parent, а не этой сессии; иначе child получает чужие
+    // длительности. Tolerance 5s: payload epoch округлён до секунд.
+    const payloadEndMs = epochMs(payload.completed_at) ?? epochMs(payload.started_at);
+    const inheritedCompletion =
+      explicitDurationMs !== undefined &&
+      payloadEndMs !== undefined &&
+      this.sessionStartedAt !== undefined &&
+      payloadEndMs < this.sessionStartedAt.getTime() - 5000;
+    if (inheritedCompletion) this.count("event_msg.task_complete.inherited_duration");
+    const eventDurationMs =
+      completedAt && turn.startedAt
+        ? completedAt.getTime() - turn.startedAt.getTime()
+        : undefined;
+    const useExplicitDuration =
+      explicitDurationMs !== undefined && explicitDurationMs >= 0 && !inheritedCompletion;
+    const durationMs = useExplicitDuration
+      ? explicitDurationMs
+      : status !== "incomplete" && eventDurationMs !== undefined && eventDurationMs >= 0
+        ? eventDurationMs
+        : undefined;
+    if (durationMs !== undefined) {
+      const turnMessages = this.messages.slice(turn.messageStartIndex);
+      const anchor = [...turnMessages].reverse().find((message) => message.role === "assistant") ??
+        turnMessages.at(-1);
+      if (anchor) {
+        anchor.metadata.durationMs = Math.round(durationMs);
+        anchor.metadata.durationSource =
+          useExplicitDuration
+            ? "codex.task_complete.duration_ms"
+            : `codex.task_events.${status}`;
+        anchor.metadata.durationKind = "turn_execution";
+        if (turn.id) anchor.metadata.durationTurnId = turn.id;
+      }
+    }
+    if (completedAt) {
+      for (const entry of turn.userMessages) {
+        const waitMs = completedAt.getTime() - entry.timestamp.getTime();
+        if (!Number.isFinite(waitMs) || waitMs < 0) continue;
+        entry.message.responseWaitMs = Math.round(waitMs);
+        entry.message.responseStatus = status;
+        entry.message.responseCompletedAt = completedAt;
+        if (turn.id) entry.message.responseTurnId = turn.id;
+        entry.message.metadata.responseWaitMs = Math.round(waitMs);
+        entry.message.metadata.responseStatus = status;
+        entry.message.metadata.responseCompletedAt = completedAt.toISOString();
+        if (turn.id) entry.message.metadata.responseTurnId = turn.id;
+        if (status === "aborted") {
+          const reason = asString(payload.reason);
+          if (reason) entry.message.metadata.responseAbortReason = reason;
+        }
+        if (locator) entry.message.metadata.responseEndLocator = locator;
+        entry.message.metadata.responseWaitSource = "codex.task_events";
+      }
+    }
+    this.count(`event_msg.${status === "completed" ? "task_complete" : status === "aborted" ? "turn_aborted" : "task_incomplete"}`);
+    this.activeTurn = undefined;
+  }
+}
+
+function codexTurnId(payload: Record<string, unknown>): string | undefined {
+  return asString(payload.turn_id) ??
+    asString(asObject(payload.internal_chat_message_metadata_passthrough)?.turn_id);
+}
+
+/** Epoch из payload codex: секунды (1.7e9) или миллисекунды — по величине. */
+function epochMs(value: unknown): number | undefined {
+  const numeric = asNumber(value);
+  if (numeric === undefined || numeric <= 0) return undefined;
+  return numeric < 1e12 ? numeric * 1000 : numeric;
 }
 
 /** Авто-вставленный контекст Codex (не human-authored). */
@@ -784,6 +1020,42 @@ function contentPartsText(content: unknown): string {
     })
     .filter((text) => text.length > 0)
     .join("\n");
+}
+
+function parseWorkedForDurationMs(content: string): number | undefined {
+  const match = /\bWorked for\s+((?:(?:\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)\s*)+)/iu.exec(content);
+  if (!match) return undefined;
+  let seconds = 0;
+  const parts = match[1]!.matchAll(/(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)\b/giu);
+  for (const part of parts) {
+    const value = Number(part[1]);
+    if (!Number.isFinite(value)) continue;
+    const unit = part[2]!.toLowerCase();
+    if (unit.startsWith("h")) seconds += value * 3600;
+    else if (unit === "m" || unit.startsWith("min")) seconds += value * 60;
+    else seconds += value;
+  }
+  return seconds > 0 ? Math.round(seconds * 1000) : undefined;
+}
+
+function usageVectorKey(usage: Record<string, unknown> | undefined): string {
+  if (!usage) return "-";
+  return [
+    asNumber(usage.input_tokens) ?? "",
+    asNumber(usage.cached_input_tokens) ?? "",
+    asNumber(usage.output_tokens) ?? "",
+    asNumber(usage.reasoning_output_tokens) ?? "",
+    asNumber(usage.total_tokens) ?? "",
+  ].join(":");
+}
+
+/** Ключ дедупликации token_count: last + cumulative, rate_limits игнорируются. */
+function tokenCountInfoKey(info: Record<string, unknown> | undefined): string | undefined {
+  if (!info) return undefined;
+  const last = asObject(info.last_token_usage);
+  const total = asObject(info.total_token_usage);
+  if (!last && !total) return undefined;
+  return `${usageVectorKey(last)}|${usageVectorKey(total)}`;
 }
 
 function usageFields(usage: Record<string, unknown>): Omit<ParsedUsageEvent, "scope" | "source" | "raw"> {

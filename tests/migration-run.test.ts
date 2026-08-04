@@ -1552,7 +1552,7 @@ describe("Stage 10 migration runner", () => {
     ).map((row) => row.id)).toEqual(["2", "3"]);
     expect(backend.quarantines.filter((row) =>
       row.reason.includes("canonical import denied")
-    ).every((row) => row.parserName === "claude-code" && row.parserVersion === 2)).toBe(true);
+    ).every((row) => row.parserName === "claude-code" && row.parserVersion === 3)).toBe(true);
   });
 
   test("null source_file_id запрещает raw recovery для всего thread", async () => {

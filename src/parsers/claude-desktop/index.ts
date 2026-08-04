@@ -66,7 +66,7 @@ import {
 import { normalizeModelName } from "../shared/model-normalization.ts";
 
 export const CLAUDE_DESKTOP_PARSER_NAME = "claude-desktop";
-export const CLAUDE_DESKTOP_PARSER_VERSION = 2;
+export const CLAUDE_DESKTOP_PARSER_VERSION = 4;
 
 /** Операционные subtype system/*: не сообщения, только счётчики. */
 const OPERATIONAL_SYSTEM_SUBTYPES = new Set([
@@ -582,12 +582,20 @@ class DialogueBuilder {
         anthropicUsageEvent(usage, "turn", "claude-desktop.result.usage", raw),
       );
     }
+    const durationMs = asNumber(record.duration_ms);
+    const durationApiMs = asNumber(record.duration_api_ms);
+    if (durationMs !== undefined) {
+      target.metadata.durationMs ??= durationMs;
+      target.metadata.durationSource ??= "claude-desktop.result.duration_ms";
+    }
+    if (durationApiMs !== undefined) target.metadata.durationApiMs ??= durationApiMs;
     // Явный marker конца turn'а для extractor'а (план §8.3 п.1).
     target.metadata.turnResult = {
       subtype,
       ...(record.stop_reason != null ? { stopReason: record.stop_reason } : {}),
       ...(asNumber(record.num_turns) !== undefined ? { numTurns: asNumber(record.num_turns) } : {}),
-      ...(asNumber(record.duration_ms) !== undefined ? { durationMs: asNumber(record.duration_ms) } : {}),
+      ...(durationMs !== undefined ? { durationMs } : {}),
+      ...(durationApiMs !== undefined ? { durationApiMs } : {}),
       ...(asNumber(record.total_cost_usd) !== undefined ? { totalCostUsd: asNumber(record.total_cost_usd) } : {}),
     };
   }
@@ -772,7 +780,7 @@ function toolResultText(block: Record<string, unknown>): string {
 /**
  * Anthropic usage → ParsedUsageEvent: input_tokens НЕ включает cache,
  * поэтому inputTokens = input + cache_creation + cache_read;
- * cachedInputTokens = cache_read (подмножество input, план §7.3).
+ * cachedInputTokens = cache_read, cacheWriteInputTokens = cache_creation.
  */
 function anthropicUsageEvent(
   usage: Record<string, unknown>,
@@ -787,6 +795,7 @@ function anthropicUsageEvent(
     scope,
     inputTokens: input + cacheCreation + cacheRead,
     cachedInputTokens: cacheRead,
+    cacheWriteInputTokens: cacheCreation,
     source,
     raw: raw ?? usage,
   };

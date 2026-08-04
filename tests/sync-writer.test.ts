@@ -12,7 +12,7 @@ import {
   searchDocumentRecordId,
 } from "../src/sync/canonical-hash.ts";
 import { kimiSessionDir } from "../src/sync/harness-tools.ts";
-import { writeDialogueRevision } from "../src/db/repositories/corpus.ts";
+import { contentChars, writeDialogueRevision } from "../src/db/repositories/corpus.ts";
 import { kimiCodeExtractors } from "../src/search/extractors/kimi-code.ts";
 import { deterministicId } from "../src/db/transactions.ts";
 import type { ParsedDialogue } from "../src/domain/canonical-types.ts";
@@ -77,6 +77,36 @@ describe("canonical hash", () => {
       { scope: "request", inputTokens: 1, source: "s", raw: { a: 1 } },
     ];
     expect(canonicalDialogueHash(d1)).toBe(canonicalDialogueHash(d3));
+  });
+
+  test("cache write usage входит в hash", () => {
+    const d1 = dialogue("x");
+    d1.messages[0]!.usageEvents = [
+      { scope: "request", inputTokens: 10, cacheWriteInputTokens: 2, source: "s" },
+    ];
+    const d2 = dialogue("x");
+    d2.messages[0]!.usageEvents = [
+      { scope: "request", inputTokens: 10, cacheWriteInputTokens: 3, source: "s" },
+    ];
+    expect(canonicalDialogueHash(d1)).not.toBe(canonicalDialogueHash(d2));
+  });
+
+  test("response timing не входит в hash как производный кеш", () => {
+    const d1 = dialogue("x");
+    const d2 = dialogue("x");
+    d2.messages[0]!.responseWaitMs = 1234;
+    d2.messages[0]!.responseStatus = "completed";
+    d2.messages[0]!.responseCompletedAt = new Date("2026-01-01T00:00:02.000Z");
+    d2.messages[0]!.responseTurnId = "turn-1";
+    expect(canonicalDialogueHash(d1)).toBe(canonicalDialogueHash(d2));
+  });
+});
+
+describe("derived content stats", () => {
+  test("contentChars считает Unicode code points, а не UTF-8 bytes", () => {
+    expect(contentChars("abc")).toBe(3);
+    expect(Buffer.byteLength("привет", "utf8")).toBeGreaterThan(contentChars("привет"));
+    expect(contentChars("привет")).toBe(6);
   });
 });
 

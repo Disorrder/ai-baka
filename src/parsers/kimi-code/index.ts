@@ -36,9 +36,8 @@
  *
  * Usage mapping kimi → ParsedUsageEvent:
  *   inputTokens        = inputOther + inputCacheRead + inputCacheCreation
- *   cachedInputTokens  = inputCacheRead  (подмножество input, §7.3)
+ *   cachedInputTokens  = inputCacheRead; cacheWriteInputTokens = inputCacheCreation
  *   outputTokens       = output
- *   inputCacheCreation сохраняется только в raw (это cache write).
  * step.end.usage → scope request; usage.record(scope "turn") → scope turn.
  */
 
@@ -67,7 +66,7 @@ import {
 import { normalizeModelName } from "../shared/model-normalization.ts";
 
 export const KIMI_CODE_PARSER_NAME = "kimi-code";
-export const KIMI_CODE_PARSER_VERSION = 2;
+export const KIMI_CODE_PARSER_VERSION = 3;
 
 const OPERATIONAL_TYPES = new Set([
   "metadata",
@@ -724,6 +723,7 @@ function kimiUsageEvent(
     scope,
     inputTokens: inputOther + cacheRead + cacheCreation,
     cachedInputTokens: cacheRead,
+    cacheWriteInputTokens: cacheCreation,
     source,
     raw: usage,
   };

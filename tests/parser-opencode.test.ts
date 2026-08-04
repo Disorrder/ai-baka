@@ -37,7 +37,7 @@ async function parseFixture(
 describe("opencode parser: basic", () => {
   test("метаданные диалога и parser version", async () => {
     expect(openCodeParser.parserName).toBe("opencode");
-    expect(OPENCODE_PARSER_VERSION).toBe(2);
+    expect(OPENCODE_PARSER_VERSION).toBe(3);
     const { dialogues, diagnostics } = await parseFixture("basic");
     expect(diagnostics).toHaveLength(0);
     expect(dialogues).toHaveLength(1);
@@ -93,6 +93,7 @@ describe("opencode parser: basic", () => {
     // input 2000 + cache.read 3000 + cache.write 500 (opencode input без cached).
     expect(request.inputTokens).toBe(5500);
     expect(request.cachedInputTokens).toBe(3000);
+    expect(request.cacheWriteInputTokens).toBe(500);
     expect(request.outputTokens).toBe(150);
     expect(request.reasoningOutputTokens).toBe(40);
     expect(request.totalTokensReported).toBe(5690);
@@ -103,6 +104,7 @@ describe("opencode parser: basic", () => {
     expect(usage.inputTokens).toBe(5500);
     // Сценарий 19: cached/reasoning не double-counted.
     expect(usage.cachedInputTokens).toBe(3000);
+    expect(usage.cacheWriteInputTokens).toBe(500);
     expect(usage.reasoningOutputTokens).toBe(40);
     expect(usage.totalTokensNormalized).toBe(5650);
   });

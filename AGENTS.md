@@ -289,6 +289,31 @@ legacy-таблицам; `migration run` — этап 10.
   production/restore требуют только `search_document_content`; canonical
   chunks и historical revisions остаются сохранены без глобального индекса.
 
+Фиксы token usage 2026-08-03 (parser + lineage, с тестом и live-проверкой):
+
+- codex пишет `token_count` по разу на каждый rate-limit bucket
+  (`rate_limits.limit_id`: "codex", "codex_bengalfox", ...) с ИДЕНТИЧНЫМ
+  `info` — parser складывал каждую копию как отдельный вызов, завышая usage. CODEX_PARSER_VERSION = 8: копия с info, идентичным предыдущему
+  token_count, отбрасывается (eventCounts
+  `event_msg.token_count_bucket_duplicate`); кумулятивный счётчик растёт
+  только от новых вызовов, поэтому повтор info — всегда копия. Сумма request-событий должна совпадать с session cumulative;
+- subagent lineage: при позднем spawn codex пишет в child rollout не всю
+  историю parent, а текущий хвост контекста после compaction'ов — strict
+  prefix matching пропускал такой replay, создавая двойной счёт. `replayMatch` в scripts/analyze-codex-lineage.ts ищет
+  максимальный префикс child в непрерывном участке parent с любого offset
+  (минимум 3 события; `replayParentOffset` в details), raw-потоки перед
+  матчингом дедуплицируются по info так же, как parser; mapper
+  canonical-событий дополнительно вычитает bucket-копии уже заматченных
+  replay-событий (актуально до репарса с v8);
+- forked/subagent rollout: replay истории parent несёт task_complete с
+  ИСХОДНЫМИ payload.started_at/completed_at/duration_ms (до момента fork'а,
+  envelope timestamp при этом spawn-time) — parser засчитывал часы parent
+  как свои.
+  CODEX_PARSER_VERSION = 9: explicit duration_ms отбрасывается, если turn
+  завершился до старта файла (tolerance 5s на округление payload epoch до
+  секунд; иначе собственный turn fork'а ловит false positive),
+  eventCounts `event_msg.task_complete.inherited_duration`.
+
 ## Стек
 
 - Bun + TypeScript, CLI `baka`.

@@ -62,7 +62,7 @@ import {
 import { normalizeModelName } from "../shared/model-normalization.ts";
 
 export const QWEN_CODE_PARSER_NAME = "qwen-code";
-export const QWEN_CODE_PARSER_VERSION = 2;
+export const QWEN_CODE_PARSER_VERSION = 3;
 
 /** Операционные system-subtypes: не сообщения, только счётчики. */
 const OPERATIONAL_SYSTEM_SUBTYPES = new Set([
@@ -137,6 +137,15 @@ class DialogueBuilder {
   private updatedAt: Date | undefined;
   private eventCounts: Record<string, number> = {};
   private unknownTypes = new Set<string>();
+  private pendingApiResponses: Array<{
+    durationMs: number;
+    responseId?: string;
+    statusCode?: number;
+    model?: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+  }> = [];
 
   constructor(
     private readonly path: string,
@@ -173,6 +182,7 @@ class DialogueBuilder {
       case "system":
         if (subtype && OPERATIONAL_SYSTEM_SUBTYPES.has(subtype)) {
           this.count(`system.${subtype}`);
+          if (subtype === "ui_telemetry") this.uiTelemetry(record);
           return;
         }
         this.unknown(`system.${subtype ?? "<missing>"}`, record, timestamp, locator);
@@ -257,6 +267,7 @@ class DialogueBuilder {
     timestamp: Date | undefined,
     locator: string,
   ): void {
+    const telemetry = this.takePendingApiResponse(record);
     const message = this.pushMessage({
       externalId: asString(record.uuid),
       role: "assistant",
@@ -270,12 +281,55 @@ class DialogueBuilder {
         ...(asNumber(record.contextWindowSize) !== undefined
           ? { contextWindowSize: asNumber(record.contextWindowSize) }
           : {}),
+        ...(telemetry !== undefined
+          ? {
+              durationMs: telemetry.durationMs,
+              durationSource: "qwen-code.ui_telemetry.api_response",
+              ...(telemetry.responseId !== undefined ? { responseId: telemetry.responseId } : {}),
+              ...(telemetry.statusCode !== undefined ? { statusCode: telemetry.statusCode } : {}),
+            }
+          : {}),
       },
     });
     const usage = asObject(record.usageMetadata);
     if (usage) {
       message.usageEvents.push(qwenUsageEvent(usage, "qwen-code.usageMetadata"));
     }
+  }
+
+  private uiTelemetry(record: Record<string, unknown>): void {
+    const uiEvent = asObject(asObject(record.systemPayload)?.uiEvent);
+    if (!uiEvent) return;
+    if (asString(uiEvent?.["event.name"]) !== "qwen-code.api_response") return;
+    const durationMs = asNumber(uiEvent.duration_ms);
+    if (durationMs === undefined || durationMs <= 0) return;
+    this.pendingApiResponses.push({
+      durationMs,
+      responseId: asString(uiEvent.response_id),
+      statusCode: asNumber(uiEvent.status_code),
+      model: asString(uiEvent.model),
+      inputTokens: asNumber(uiEvent.input_token_count),
+      outputTokens: asNumber(uiEvent.output_token_count),
+      totalTokens: asNumber(uiEvent.total_token_count),
+    });
+  }
+
+  private takePendingApiResponse(record: Record<string, unknown>) {
+    if (this.pendingApiResponses.length === 0) return undefined;
+    const usage = asObject(record.usageMetadata);
+    const model = asString(record.model);
+    const inputTokens = asNumber(usage?.promptTokenCount);
+    const outputTokens = asNumber(usage?.candidatesTokenCount);
+    const totalTokens = asNumber(usage?.totalTokenCount);
+    const index = this.pendingApiResponses.findIndex(
+      (item) =>
+        (item.model === undefined || model === undefined || item.model === model) &&
+        (item.inputTokens === undefined || inputTokens === undefined || item.inputTokens === inputTokens) &&
+        (item.outputTokens === undefined || outputTokens === undefined || item.outputTokens === outputTokens) &&
+        (item.totalTokens === undefined || totalTokens === undefined || item.totalTokens === totalTokens),
+    );
+    const selectedIndex = index >= 0 ? index : 0;
+    return this.pendingApiResponses.splice(selectedIndex, 1)[0];
   }
 
   private toolResultRecord(

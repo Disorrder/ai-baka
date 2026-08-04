@@ -29,7 +29,7 @@ async function parseSession(
 describe("claude-desktop parser: basic", () => {
   test("метаданные диалога из local_*.json и parser version", async () => {
     expect(claudeDesktopParser.parserName).toBe("claude-desktop");
-    expect(CLAUDE_DESKTOP_PARSER_VERSION).toBe(2);
+    expect(CLAUDE_DESKTOP_PARSER_VERSION).toBe(4);
     const { dialogue } = await parseSession(BASIC);
     expect(dialogue.externalId).toBe("local_11111111-1111-4111-8111-111111111111");
     expect(dialogue.title).toBe("VACUUM INTO и копирование SQLite");
@@ -73,6 +73,7 @@ describe("claude-desktop parser: basic", () => {
     // 12 + 3000 + 15000 (input_tokens НЕ включает cache в формате Anthropic).
     expect(usage.inputTokens).toBe(18012);
     expect(usage.cachedInputTokens).toBe(15000);
+    expect(usage.cacheWriteInputTokens).toBe(3000);
     expect(usage.outputTokens).toBe(240);
     expect(usage.totalTokensNormalized).toBe(18252);
     // marker конца turn'а от result-события (для extractor'а).
@@ -80,7 +81,12 @@ describe("claude-desktop parser: basic", () => {
       subtype: "success",
       stopReason: "end_turn",
       numTurns: 1,
+      durationMs: 4200,
+      durationApiMs: 4000,
     });
+    expect(assistant.metadata.durationMs).toBe(4200);
+    expect(assistant.metadata.durationSource).toBe("claude-desktop.result.duration_ms");
+    expect(assistant.metadata.durationApiMs).toBe(4000);
   });
 
   test("операционные события — только eventCounts", async () => {
@@ -118,6 +124,7 @@ describe("claude-desktop parser: streaming", () => {
     const usage = normalizeUsageEvents(assistant.usageEvents)!;
     expect(usage.inputTokens).toBe(2520); // 20 + 500 + 2000, один раз
     expect(usage.cachedInputTokens).toBe(2000);
+    expect(usage.cacheWriteInputTokens).toBe(500);
     // result-событие привязалось к склеенному сообщению.
     expect(assistant.metadata.turnResult).toMatchObject({ subtype: "success" });
   });
@@ -180,6 +187,7 @@ describe("claude-desktop parser: tools-sidechain", () => {
     // Cumulative за весь запуск: 20 + 4200 + 57000.
     expect(turnEvent.inputTokens).toBe(61220);
     expect(turnEvent.cachedInputTokens).toBe(57000);
+    expect(turnEvent.cacheWriteInputTokens).toBe(4200);
     const usage = normalizeUsageEvents(last.usageEvents)!;
     expect(usage.scope).toBe("request");
     // Только request-событие сообщения, turn не прибавился.

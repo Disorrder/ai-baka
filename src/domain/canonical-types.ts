@@ -57,6 +57,15 @@ export interface ParsedMessage {
   timestamp?: Date;
   /** Модель, которой сгенерировано сообщение (для assistant). */
   model?: ParsedModelInvocation;
+  /**
+   * Для human-authored user message: сколько пользователь ждал ответа в
+   * рамках turn'а. Хранится на user message, потому что cancelled/aborted turn
+   * может не иметь assistant message.
+   */
+  responseWaitMs?: number;
+  responseStatus?: "completed" | "aborted" | "incomplete";
+  responseCompletedAt?: Date;
+  responseTurnId?: string;
   /** Исходные usage events; нормализованный usage выводится из них. */
   usageEvents: ParsedUsageEvent[];
   chunks: ParsedChunk[];
@@ -101,8 +110,10 @@ export interface ParsedModelInvocation {
 export interface ParsedUsageEvent {
   scope: UsageScope;
   inputTokens?: number;
-  /** Подмножество input: НЕ прибавляется повторно к input. */
+  /** Cache read/hit, подмножество input: НЕ прибавляется повторно. */
   cachedInputTokens?: number;
+  /** Cache creation/write, подмножество input: НЕ прибавляется повторно. */
+  cacheWriteInputTokens?: number;
   outputTokens?: number;
   /** Подмножество output: НЕ прибавляется повторно к output. */
   reasoningOutputTokens?: number;
@@ -120,6 +131,7 @@ export interface NormalizedUsage {
   scope: UsageScope;
   inputTokens?: number;
   cachedInputTokens?: number;
+  cacheWriteInputTokens?: number;
   outputTokens?: number;
   reasoningOutputTokens?: number;
   totalTokensReported?: number;

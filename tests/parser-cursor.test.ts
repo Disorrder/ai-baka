@@ -47,7 +47,7 @@ async function parseFixture(
 describe("cursor parser: basic-dialogue", () => {
   test("метаданные диалога, workspace из composerHeaders, parser version", async () => {
     expect(cursorParser.parserName).toBe("cursor");
-    expect(CURSOR_PARSER_VERSION).toBe(2);
+    expect(CURSOR_PARSER_VERSION).toBe(3);
     const { snapshot, dialogues } = await parseFixture(basicDialogue);
     expect(snapshot.sourceKind).toBe("sqlite");
     expect(dialogues).toHaveLength(1);
@@ -77,6 +77,19 @@ describe("cursor parser: basic-dialogue", () => {
     expect(assistant!.humanAuthored).toBe(false);
     expect(assistant!.visibleToUser).toBe(true);
     expect(assistant!.chunks[0]!.content).toContain("in-memory Map с TTL");
+  });
+
+  test("createdAt и timingInfo дают message timestamp и точное ожидание turn", async () => {
+    const { dialogues } = await parseFixture(basicDialogue);
+    const [user, assistant] = dialogues[0]!.messages;
+    expect(user!.timestamp?.toISOString()).toBe("2026-07-10T12:00:00.000Z");
+    expect(assistant!.timestamp?.toISOString()).toBe("2026-07-10T12:01:00.000Z");
+    expect(assistant!.metadata.durationMs).toBe(59_000);
+    expect(assistant!.metadata.cursorTimingSource).toBe("cursor.timingInfo");
+    expect(user!.responseWaitMs).toBe(59_000);
+    expect(user!.responseStatus).toBe("completed");
+    expect(user!.responseCompletedAt?.toISOString()).toBe("2026-07-10T12:01:00.000Z");
+    expect(user!.metadata.responseWaitSource).toBe("cursor.timingInfo");
   });
 
   test("модель из usageData (одна модель) нормализуется на assistant message", async () => {

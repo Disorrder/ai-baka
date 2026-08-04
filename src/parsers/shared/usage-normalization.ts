@@ -2,7 +2,7 @@
  * Нормализация usage events (docs/plan.md §7.3 `message.usage`).
  *
  * Правила плана:
- * - cached input НЕ прибавляется повторно к input (это подмножество input);
+ * - cache read и cache write НЕ прибавляются повторно к input;
  * - reasoning output НЕ прибавляется повторно к output (подмножество output);
  * - cumulative events НЕ суммируются как независимые turn'ы;
  * - total_tokens_reported сохраняется отдельно;
@@ -25,7 +25,7 @@ import type {
 } from "../../domain/canonical-types.ts";
 import type { UsageScope } from "../../domain/enums.ts";
 
-export const USAGE_NORMALIZATION_VERSION = 1;
+export const USAGE_NORMALIZATION_VERSION = 2;
 
 const SCOPE_PRIORITY: Record<UsageScope, number> = {
   request: 0,
@@ -71,6 +71,7 @@ export function normalizeUsageEvents(
 
   let inputTokens: number | undefined;
   let cachedInputTokens: number | undefined;
+  let cacheWriteInputTokens: number | undefined;
   let outputTokens: number | undefined;
   let reasoningOutputTokens: number | undefined;
   let totalTokensReported: number | undefined;
@@ -79,6 +80,7 @@ export function normalizeUsageEvents(
     // Независимые вызовы API: суммируем.
     inputTokens = sum(selected.map((e) => e.inputTokens));
     cachedInputTokens = sum(selected.map((e) => e.cachedInputTokens));
+    cacheWriteInputTokens = sum(selected.map((e) => e.cacheWriteInputTokens));
     outputTokens = sum(selected.map((e) => e.outputTokens));
     reasoningOutputTokens = sum(selected.map((e) => e.reasoningOutputTokens));
     totalTokensReported = sum(selected.map((e) => e.totalTokensReported));
@@ -88,13 +90,14 @@ export function normalizeUsageEvents(
     const last = selected[selected.length - 1]!;
     inputTokens = last.inputTokens;
     cachedInputTokens = last.cachedInputTokens;
+    cacheWriteInputTokens = last.cacheWriteInputTokens;
     outputTokens = last.outputTokens;
     reasoningOutputTokens = last.reasoningOutputTokens;
     totalTokensReported = last.totalTokensReported;
   }
 
   // Нормализованный total: input + output БЕЗ повторного учёта
-  // cached (внутри input) и reasoning (внутри output) — сценарий 19.
+  // cache read/write (внутри input) и reasoning (внутри output).
   let totalTokensNormalized: number | undefined;
   if (inputTokens !== undefined || outputTokens !== undefined) {
     totalTokensNormalized = (inputTokens ?? 0) + (outputTokens ?? 0);
@@ -104,6 +107,7 @@ export function normalizeUsageEvents(
     scope,
     ...(inputTokens !== undefined ? { inputTokens } : {}),
     ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(cacheWriteInputTokens !== undefined ? { cacheWriteInputTokens } : {}),
     ...(outputTokens !== undefined ? { outputTokens } : {}),
     ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
     ...(totalTokensReported !== undefined ? { totalTokensReported } : {}),

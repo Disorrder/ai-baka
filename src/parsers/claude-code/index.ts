@@ -22,9 +22,8 @@
  * - usage Anthropic: input_tokens НЕ включает кэш; cache_read_input_tokens
  *   и cache_creation_input_tokens — отдельные корзины. Нормализация:
  *   inputTokens = input + cache_read + cache_creation (полный вход),
- *   cachedInputTokens = ТОЛЬКО cache_read (подмножество, не прибавляется
- *   повторно — сценарий 19); cache creation — это запись в кэш, она
- *   сохраняется в raw события (§7.3). total Anthropic не сообщает.
+ *   cachedInputTokens = cache_read, cacheWriteInputTokens = cache_creation.
+ *   Обе корзины — подмножества input и повторно не прибавляются.
  * - isSidechain: true — транскрипт субагента (Task tool) внутри того же
  *   файла: остаётся в корпусе с metadata.sidechain, но не виден
  *   пользователю и не входит в финальный ответ основной цепочки.
@@ -63,7 +62,7 @@ import {
 import { normalizeModelName } from "../shared/model-normalization.ts";
 
 export const CLAUDE_CODE_PARSER_NAME = "claude-code";
-export const CLAUDE_CODE_PARSER_VERSION = 2;
+export const CLAUDE_CODE_PARSER_VERSION = 3;
 
 /** Служебные верхнеуровневые типы: не сообщения, только счётчики. */
 const OPERATIONAL_TOP_LEVEL = new Set([
@@ -444,10 +443,10 @@ class DialogueBuilder {
     const event: ParsedUsageEvent = {
       scope: "request",
       // Anthropic: input_tokens не включает кэш — полный вход собираем
-      // из трёх корзин; cachedInputTokens — только cache read (cache
-      // creation — запись в кэш, остаётся в raw), сценарий 19.
+      // из трёх корзин; cache read и creation сохраняются отдельно.
       inputTokens: input + cacheRead + cacheCreation,
       ...(cacheRead > 0 ? { cachedInputTokens: cacheRead } : {}),
+      ...(cacheCreation > 0 ? { cacheWriteInputTokens: cacheCreation } : {}),
       ...(output !== undefined ? { outputTokens: output } : {}),
       source: "claude-code.message.usage",
       raw: usage,

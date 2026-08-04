@@ -29,7 +29,7 @@
  * `input` НЕ включает cached tokens; reasoning у части провайдеров входит
  * в output, у части нет — поэтому total хранится только как reported):
  *   inputTokens        = input + cache.read + cache.write
- *   cachedInputTokens  = cache.read (подмножество input, §7.3)
+ *   cachedInputTokens  = cache.read; cacheWriteInputTokens = cache.write
  *   outputTokens       = output
  *   reasoningOutputTokens = reasoning (НЕ прибавляется повторно к output)
  *   totalTokensReported   = total (как сообщил источник)
@@ -69,7 +69,7 @@ import { normalizeModelName } from "../shared/model-normalization.ts";
 import { isSqliteFile } from "../shared/sqlite.ts";
 
 export const OPENCODE_PARSER_NAME = "opencode";
-export const OPENCODE_PARSER_VERSION = 2;
+export const OPENCODE_PARSER_VERSION = 3;
 
 /** Part types, которые не становятся чанками (операционные маркеры шага). */
 const OPERATIONAL_PART_TYPES = new Set(["step-start", "step-finish"]);
@@ -601,6 +601,7 @@ function opencodeUsageEvent(
     // opencode `input` НЕ включает cached tokens (проверено по total).
     inputTokens: input + cacheRead + cacheWrite,
     cachedInputTokens: cacheRead,
+    cacheWriteInputTokens: cacheWrite,
     source,
     raw: tokens,
   };
@@ -625,6 +626,7 @@ function sessionUsageEvent(session: SessionRow): ParsedUsageEvent | undefined {
     scope: "session_cumulative",
     inputTokens: input + cacheRead + cacheWrite,
     cachedInputTokens: cacheRead,
+    cacheWriteInputTokens: cacheWrite,
     outputTokens: output,
     reasoningOutputTokens: reasoning,
     source: "opencode.session.tokens",

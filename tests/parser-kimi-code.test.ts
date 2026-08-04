@@ -26,7 +26,7 @@ async function parseSession(
 describe("kimi-code parser: basic", () => {
   test("метаданные диалога из state.json и parser version", async () => {
     expect(kimiCodeParser.parserName).toBe("kimi-code");
-    expect(KIMI_CODE_PARSER_VERSION).toBe(2);
+    expect(KIMI_CODE_PARSER_VERSION).toBe(3);
     const { dialogue } = await parseSession(BASIC);
     expect(dialogue.externalId).toBe("session_11111111-aaaa-4bbb-8ccc-111111111111");
     expect(dialogue.title).toContain("кэша");
@@ -144,6 +144,7 @@ describe("kimi-code parser: tools-and-subagent", () => {
     // Накопительные значения turn'а из usage.record.
     expect(turnEvent.inputTokens).toBe(3800 + 17600 + 500);
     expect(turnEvent.cachedInputTokens).toBe(17600);
+    expect(turnEvent.cacheWriteInputTokens).toBe(500);
   });
 });
 

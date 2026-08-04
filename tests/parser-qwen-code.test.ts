@@ -21,7 +21,7 @@ async function parseChat(
 describe("qwen-code parser: basic-dialogue", () => {
   test("метаданные диалога и parser version", async () => {
     expect(qwenCodeParser.parserName).toBe("qwen-code");
-    expect(QWEN_CODE_PARSER_VERSION).toBe(2);
+    expect(QWEN_CODE_PARSER_VERSION).toBe(3);
     const { dialogue } = await parseChat("basic-dialogue.jsonl");
     expect(dialogue.externalId).toBe("11111111-1111-4111-8111-111111111111");
     expect(dialogue.title).toBeUndefined();
@@ -66,6 +66,9 @@ describe("qwen-code parser: basic-dialogue", () => {
     expect(assistant.model?.canonicalName).toBe("qwen3.8-max-preview");
     expect(assistant.model?.vendor).toBe("alibaba");
     expect(assistant.metadata.contextWindowSize).toBe(1000000);
+    expect(assistant.metadata.durationMs).toBe(4300);
+    expect(assistant.metadata.durationSource).toBe("qwen-code.ui_telemetry.api_response");
+    expect(assistant.metadata.responseId).toBe("chatcmpl-demo1");
   });
 
   test("сценарий 19: cached/reasoning не double-counted", async () => {

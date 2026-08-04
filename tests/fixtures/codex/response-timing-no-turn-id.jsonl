@@ -1,0 +1,11 @@
+{"timestamp":"2026-01-01T10:00:00.000Z","type":"session_meta","payload":{"id":"old-timing-session","timestamp":"2026-01-01T10:00:00.000Z","cwd":"/Users/example/projects/demo-app","originator":"codex_cli_rs","cli_version":"0.20.0","source":"cli","model_provider":"openai"}}
+{"timestamp":"2026-01-01T10:00:00.100Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-01-01T10:00:01.000Z","type":"response_item","payload":{"type":"message","id":"msg_user_1","role":"user","content":[{"type":"input_text","text":"Первый запрос."}]}}
+{"timestamp":"2026-01-01T10:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"Первый запрос."}}
+{"timestamp":"2026-01-01T10:00:06.000Z","type":"response_item","payload":{"type":"message","id":"msg_user_2","role":"user","content":[{"type":"input_text","text":"Сообщение в очереди."}]}}
+{"timestamp":"2026-01-01T10:00:06.000Z","type":"event_msg","payload":{"type":"user_message","message":"Сообщение в очереди."}}
+{"timestamp":"2026-01-01T10:00:09.000Z","type":"response_item","payload":{"type":"message","id":"msg_assistant_1","role":"assistant","content":[{"type":"output_text","text":"Готово."}]}}
+{"timestamp":"2026-01-01T10:00:10.000Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Готово."}}
+{"timestamp":"2026-01-01T10:01:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"background-turn"}}
+{"timestamp":"2026-01-01T10:01:01.000Z","type":"response_item","payload":{"type":"message","id":"msg_user_3","role":"user","content":[{"type":"input_text","text":"Автоматическое продолжение."}]}}
+{"timestamp":"2026-01-01T10:01:04.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"background-turn","last_agent_message":"Продолжение завершено."}}

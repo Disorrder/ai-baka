@@ -19,7 +19,9 @@
  *     (часто 0; ненулевое — оценка Cursor, isEstimated), isThought,
  *     allThinkingBlocks[], toolFormerData {name, toolCallId, rawArgs, params,
  *     result, status} — вызов инструмента И его результат в одном bubble,
- *     capabilityType, usageUuid. Per-message timestamps в формате нет;
+ *     capabilityType, usageUuid; часть bubbles содержит createdAt, а часть
+ *     assistant bubbles — timingInfo {clientRpcSendTime, clientEndTime},
+ *     из которого восстанавливается точное ожидание turn'а;
  *   - `checkpointId:<composerId>:*`, `codeBlockDiff:<composerId>:*`,
  *     `messageRequestContext:<composerId>:*`, `agentKv:*` — операционные
  *     ключи; чанками не становятся, учитываются в metadata.eventCounts,
@@ -66,7 +68,7 @@ import { normalizeModelName } from "../shared/model-normalization.ts";
 import { isSqliteFile } from "../shared/sqlite.ts";
 
 export const CURSOR_PARSER_NAME = "cursor";
-export const CURSOR_PARSER_VERSION = 2;
+export const CURSOR_PARSER_VERSION = 3;
 
 /** Операционные префиксы cursorDiskKV: не сообщения, только счётчики. */
 const OPERATIONAL_KEY_PREFIXES = [
@@ -444,6 +446,7 @@ function buildDialogue(
       messages.push(messageOf(messages.length, message));
     }
   }
+  applyCursorTurnTiming(messages, composerId);
 
   // usageData — session cumulative стоимость (не токены): на последнее
   // assistant message, scope сохраняется, в суммы не попадает (§7.3).
@@ -542,6 +545,13 @@ function bubbleToMessages(
       : {}),
     ...(asString(bubble.usageUuid) !== undefined ? { usageUuid: asString(bubble.usageUuid) } : {}),
   };
+  const timing = cursorBubbleTiming(bubble);
+  if (timing.durationMs !== undefined) baseMetadata.durationMs = timing.durationMs;
+  if (timing.startMs !== undefined) baseMetadata.cursorResponseStartMs = timing.startMs;
+  if (timing.endMs !== undefined) baseMetadata.cursorResponseEndMs = timing.endMs;
+  if (timing.source !== undefined) baseMetadata.cursorTimingSource = timing.source;
+  const timestamp = parseTimestamp(bubble.createdAt) ??
+    (timing.endMs !== undefined ? new Date(timing.endMs) : undefined);
 
   if (type === 1) {
     // User bubble: text — набранный человеком промпт; приложенный контекст
@@ -564,6 +574,7 @@ function bubbleToMessages(
         rawRole: "user",
         humanAuthored: true,
         visibleToUser: true,
+        ...(timestamp !== undefined ? { timestamp } : {}),
         chunks,
         metadata: baseMetadata,
         ...(usageEvents.length > 0 ? { usageEvents } : {}),
@@ -621,6 +632,7 @@ function bubbleToMessages(
         rawRole: "assistant",
         humanAuthored: false,
         visibleToUser: text !== undefined && text.length > 0 && !isThought,
+        ...(timestamp !== undefined ? { timestamp } : {}),
         chunks,
         model,
         metadata: baseMetadata,
@@ -633,6 +645,7 @@ function bubbleToMessages(
           rawRole: "toolFormerData.result",
           humanAuthored: false,
           visibleToUser: false,
+          ...(timestamp !== undefined ? { timestamp } : {}),
           chunks: [
             chunkOf({
               kind: "tool_result",
@@ -658,6 +671,7 @@ function bubbleToMessages(
       // Thinking blocks не отменяют видимость: text-чанк того же bubble
       // показывается пользователю (иначе финальный ответ теряется, §8.3).
       visibleToUser: !isThought,
+      ...(timestamp !== undefined ? { timestamp } : {}),
       chunks,
       model,
       metadata: baseMetadata,
@@ -693,6 +707,80 @@ function bubbleToMessages(
       metadata: {},
     },
   ];
+}
+
+interface CursorBubbleTiming {
+  startMs?: number;
+  endMs?: number;
+  durationMs?: number;
+  source?: "cursor.timingInfo" | "cursor.turnDurationMs";
+}
+
+function epochMs(value: unknown): number | undefined {
+  const number = asNumber(value);
+  if (number === undefined) return undefined;
+  // clientStartTime may be performance.now(), while the RPC/end fields are
+  // epoch milliseconds. Reject monotonic-clock values and implausible dates.
+  const year = new Date(number).getUTCFullYear();
+  return year >= 2000 && year <= 2100 ? number : undefined;
+}
+
+function cursorBubbleTiming(bubble: Record<string, unknown>): CursorBubbleTiming {
+  const timingInfo = asObject(bubble.timingInfo);
+  const startMs = epochMs(timingInfo?.clientRpcSendTime) ?? epochMs(timingInfo?.clientStartTime);
+  const endMs = epochMs(timingInfo?.clientEndTime) ?? epochMs(timingInfo?.clientSettleTime);
+  if (startMs !== undefined && endMs !== undefined && endMs >= startMs) {
+    return {
+      startMs,
+      endMs,
+      durationMs: Math.round(endMs - startMs),
+      source: "cursor.timingInfo",
+    };
+  }
+  const turnDurationMs = asNumber(bubble.turnDurationMs);
+  if (turnDurationMs !== undefined && turnDurationMs >= 0) {
+    return { durationMs: Math.round(turnDurationMs), source: "cursor.turnDurationMs" };
+  }
+  return {};
+}
+
+function applyCursorTurnTiming(messages: ParsedMessage[], composerId: string): void {
+  let userMessage: ParsedMessage | undefined;
+  let startMs: number | undefined;
+  let endMs: number | undefined;
+
+  const finish = (): void => {
+    if (!userMessage || startMs === undefined || endMs === undefined || endMs < startMs) return;
+    const waitMs = Math.round(endMs - startMs);
+    const completedAt = new Date(endMs);
+    const turnId = `cursor:${composerId}:${userMessage.externalId ?? userMessage.sequence}`;
+    userMessage.timestamp ??= new Date(startMs);
+    userMessage.responseWaitMs = waitMs;
+    userMessage.responseStatus = "completed";
+    userMessage.responseCompletedAt = completedAt;
+    userMessage.responseTurnId = turnId;
+    userMessage.metadata.responseWaitMs = waitMs;
+    userMessage.metadata.responseStatus = "completed";
+    userMessage.metadata.responseCompletedAt = completedAt.toISOString();
+    userMessage.metadata.responseTurnId = turnId;
+    userMessage.metadata.responseWaitSource = "cursor.timingInfo";
+  };
+
+  for (const message of messages) {
+    if (message.role === "user" && message.humanAuthored === true) {
+      finish();
+      userMessage = message;
+      startMs = undefined;
+      endMs = undefined;
+      continue;
+    }
+    if (!userMessage || message.role !== "assistant") continue;
+    const candidateStart = asNumber(message.metadata.cursorResponseStartMs);
+    const candidateEnd = asNumber(message.metadata.cursorResponseEndMs);
+    if (candidateStart !== undefined) startMs = Math.min(startMs ?? candidateStart, candidateStart);
+    if (candidateEnd !== undefined) endMs = Math.max(endMs ?? candidateEnd, candidateEnd);
+  }
+  finish();
 }
 
 // --- helpers ---

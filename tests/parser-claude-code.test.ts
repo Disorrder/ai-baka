@@ -21,7 +21,7 @@ async function parseFixture(
 describe("claude-code parser: basic-dialogue", () => {
   test("метаданные диалога и parser version", async () => {
     expect(claudeCodeParser.parserName).toBe("claude-code");
-    expect(CLAUDE_CODE_PARSER_VERSION).toBe(2);
+    expect(CLAUDE_CODE_PARSER_VERSION).toBe(3);
     const { dialogue } = await parseFixture("basic-dialogue.jsonl");
     expect(dialogue.externalId).toBe("aaaa1111-2222-4333-8444-555555555555");
     expect(dialogue.title).toBe("Разбор renderReport");
@@ -78,15 +78,16 @@ describe("claude-code parser: basic-dialogue", () => {
     expect(event.scope).toBe("request");
     expect(event.source).toBe("claude-code.message.usage");
     expect(event.inputTokens).toBe(6000); // 1200 + 300 + 4500
-    // Единая семантика §7.3: cachedInputTokens = ТОЛЬКО cache read;
-    // cache creation (300) — запись в кэш, остаётся в raw события.
+    // Единая семантика §7.3: read и creation — отдельные подмножества input.
     expect(event.cachedInputTokens).toBe(4500);
+    expect(event.cacheWriteInputTokens).toBe(300);
     expect((event.raw as Record<string, unknown>).cache_creation_input_tokens).toBe(300);
     expect(event.outputTokens).toBe(80);
     const usage = normalizeUsageEvents(assistant.usageEvents)!;
     expect(usage.scope).toBe("request");
     expect(usage.inputTokens).toBe(6000);
     expect(usage.cachedInputTokens).toBe(4500);
+    expect(usage.cacheWriteInputTokens).toBe(300);
     // Сценарий 19: cached не прибавляется повторно.
     expect(usage.totalTokensNormalized).toBe(6080);
   });

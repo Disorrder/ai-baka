@@ -1,0 +1,13 @@
+{"timestamp":"2026-07-07T10:00:00.000Z","type":"session_meta","payload":{"id":"timing-session","timestamp":"2026-07-07T10:00:00.000Z","cwd":"/Users/example/projects/demo-app","originator":"codex_cli_rs","cli_version":"0.60.0","source":"cli","model_provider":"openai"}}
+{"timestamp":"2026-07-07T10:00:00.100Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-completed"}}
+{"timestamp":"2026-07-07T10:00:01.000Z","type":"response_item","payload":{"type":"message","id":"msg_user_1","role":"user","content":[{"type":"input_text","text":"Сделай короткую проверку."}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-completed"}}}
+{"timestamp":"2026-07-07T10:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"Сделай короткую проверку.","images":[],"local_images":[]}}
+{"timestamp":"2026-07-07T10:00:03.000Z","type":"response_item","payload":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Проверяю."}]}}
+{"timestamp":"2026-07-07T10:00:05.500Z","type":"response_item","payload":{"type":"message","id":"msg_assistant_1","role":"assistant","content":[{"type":"output_text","text":"Готово."}]}}
+{"timestamp":"2026-07-07T10:00:05.600Z","type":"event_msg","payload":{"type":"agent_message","message":"Готово.","phase":"final_answer"}}
+{"timestamp":"2026-07-07T10:00:06.250Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-completed","last_agent_message":"Готово."}}
+{"timestamp":"2026-07-07T10:01:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-aborted"}}
+{"timestamp":"2026-07-07T10:01:01.000Z","type":"response_item","payload":{"type":"message","id":"msg_user_2","role":"user","content":[{"type":"input_text","text":"Начни долгую проверку."}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-aborted"}}}
+{"timestamp":"2026-07-07T10:01:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"Начни долгую проверку.","images":[],"local_images":[]}}
+{"timestamp":"2026-07-07T10:01:02.000Z","type":"response_item","payload":{"type":"reasoning","id":"rs_2","summary":[{"type":"summary_text","text":"Начинаю."}]}}
+{"timestamp":"2026-07-07T10:01:04.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-aborted","reason":"interrupted"}}

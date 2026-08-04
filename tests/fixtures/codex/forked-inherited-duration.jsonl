@@ -1,0 +1,11 @@
+{"timestamp":"2026-01-01T12:00:00.000Z","type":"session_meta","payload":{"id":"99999999-aaaa-4bbb-8ccc-dddddddddddd","forked_from_id":"11111111-2222-4333-8444-555555555555","timestamp":"2026-01-01T12:00:00.000Z","cwd":"/Users/example/projects/forked","originator":"codex_cli","cli_version":"0.60.0","source":{"subagent":{"thread_spawn":{"parent_thread_id":"11111111-2222-4333-8444-555555555555","depth":1,"agent_nickname":"Test","agent_role":"explorer"}}}}}
+{"timestamp":"2026-01-01T12:00:00.010Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Унаследованный вопрос parent."}]}}
+{"timestamp":"2026-01-01T12:00:00.020Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Унаследованный ответ parent."}]}}
+{"timestamp":"2026-01-01T12:00:00.030Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-parent-1"}}
+{"timestamp":"2026-01-01T12:00:00.031Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-parent-1","last_agent_message":"Унаследованный ответ parent.","started_at":1767258000,"completed_at":1767265200,"duration_ms":7200000}}
+{"timestamp":"2026-01-01T12:00:00.100Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-own-1"}}
+{"timestamp":"2026-01-01T12:00:00.200Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Собственный вопрос субагента."}]}}
+{"timestamp":"2026-01-01T12:00:00.300Z","type":"event_msg","payload":{"type":"user_message","message":"Собственный вопрос субагента.","images":[],"local_images":[]}}
+{"timestamp":"2026-01-01T12:05:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Собственный ответ субагента."}]}}
+{"timestamp":"2026-01-01T12:05:00.050Z","type":"event_msg","payload":{"type":"agent_message","message":"Собственный ответ субагента.","phase":"final_answer"}}
+{"timestamp":"2026-01-01T12:05:00.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-own-1","last_agent_message":"Собственный ответ субагента.","started_at":1767268800,"completed_at":1767269100,"duration_ms":300000}}

@@ -24,7 +24,7 @@ async function parseFixture(
 describe("codex parser: basic-dialogue", () => {
   test("метаданные диалога и parser version", async () => {
     expect(codexParser.parserName).toBe("codex");
-    expect(CODEX_PARSER_VERSION).toBe(2);
+    expect(CODEX_PARSER_VERSION).toBe(9);
     const { dialogue } = await parseFixture("basic-dialogue.jsonl");
     expect(dialogue.externalId).toBe("11111111-2222-4333-8444-555555555555");
     expect(dialogue.workspace?.path).toBe("/Users/example/projects/demo-app");
@@ -104,6 +104,11 @@ describe("codex parser: tool-calls", () => {
     expect(rgCall.content).toContain("rg -n fetchOrder");
     const rgResult = results.find((c) => c.toolCallId === "call_aaa001")!;
     expect(rgResult.content).toContain("src/api/orders.ts:12");
+    const workedResult = dialogue.messages.find((m) =>
+      m.chunks.some((c) => c.toolCallId === "call_bbb002" && c.kind === "tool_result"),
+    )!;
+    expect(workedResult.metadata.reportedDurationMs).toBe(370000);
+    expect(workedResult.metadata.reportedDurationSource).toBe("codex.tool_output.worked_for");
   });
 
   test("модель из turn_context на assistant messages", async () => {
@@ -115,6 +120,71 @@ describe("codex parser: tool-calls", () => {
     expect(assistant.model?.canonicalName).toBe("gpt-5.6-sol");
     expect(assistant.model?.vendor).toBe("openai");
     expect(assistant.model?.serviceProvider).toBe("openai");
+  });
+});
+
+describe("codex parser: response timing", () => {
+  test("task_complete/turn_aborted сохраняют ожидание на user message", async () => {
+    const { dialogue } = await parseFixture("response-timing.jsonl");
+    const users = dialogue.messages.filter((message) => message.role === "user");
+    expect(users).toHaveLength(2);
+
+    expect(users[0]!.responseWaitMs).toBe(5250);
+    expect(users[0]!.responseStatus).toBe("completed");
+    expect(users[0]!.responseCompletedAt?.toISOString()).toBe("2026-07-07T10:00:06.250Z");
+    expect(users[0]!.responseTurnId).toBe("turn-completed");
+    expect(users[0]!.metadata.responseWaitSource).toBe("codex.task_events");
+
+    expect(users[1]!.responseWaitMs).toBe(3000);
+    expect(users[1]!.responseStatus).toBe("aborted");
+    expect(users[1]!.responseCompletedAt?.toISOString()).toBe("2026-07-07T10:01:04.000Z");
+    expect(users[1]!.responseTurnId).toBe("turn-aborted");
+    expect(users[1]!.metadata.responseAbortReason).toBe("interrupted");
+
+    const completedAnchor = dialogue.messages.find(
+      (message) => message.metadata.durationTurnId === "turn-completed",
+    );
+    expect(completedAnchor?.metadata.durationMs).toBe(6150);
+    expect(completedAnchor?.metadata.durationSource).toBe("codex.task_events.completed");
+    const abortedAnchor = dialogue.messages.find(
+      (message) => message.metadata.durationTurnId === "turn-aborted",
+    );
+    expect(abortedAnchor?.metadata.durationMs).toBe(4000);
+  });
+
+  test("старый turn без turn_id получает общий synthetic id для queued messages", async () => {
+    const { dialogue } = await parseFixture("response-timing-no-turn-id.jsonl");
+    const users = dialogue.messages.filter((message) => message.role === "user");
+    expect(users).toHaveLength(3);
+    expect(users.map((message) => message.responseWaitMs)).toEqual([9000, 4000, undefined]);
+    expect(users[0]!.responseTurnId).toBe("synthetic:1");
+    expect(users[1]!.responseTurnId).toBe("synthetic:1");
+    expect(users[2]!.responseTurnId).toBeUndefined();
+    expect(users[2]!.humanAuthored).toBe("unknown");
+    expect(users[2]!.metadata.durationMs).toBe(4000);
+  });
+});
+
+describe("codex parser: related session metadata", () => {
+  test("дополнительный parent session_meta не перезаписывает subagent identity/time", async () => {
+    const { dialogue } = await parseFixture("related-session-meta.jsonl");
+    expect(dialogue.externalId).toBe("child-session");
+    expect(dialogue.workspace?.path).toBe("/Users/example/projects/child");
+    expect(dialogue.startedAt?.toISOString()).toBe("2026-07-06T10:00:00.000Z");
+    expect(dialogue.updatedAt?.toISOString()).toBe("2026-07-06T10:00:05.100Z");
+    expect(dialogue.metadata.lineage).toEqual({
+      parentSourceDialogueId: "parent-session",
+      depth: 1,
+    });
+    expect(dialogue.metadata.relatedSessionMetas).toEqual([
+      {
+        id: "parent-session",
+        source: "vscode",
+      },
+    ]);
+    expect(dialogue.metadata.eventCounts).toMatchObject({
+      "top:session_meta.related": 1,
+    });
   });
 });
 
@@ -146,6 +216,41 @@ describe("codex parser: model-switch", () => {
     expect(usage.inputTokens).toBe(6400);
     // Суммы сообщений (3000+6400=9400) получаются из request-событий,
     // а не из cumulative-события напрямую.
+  });
+
+  test("token_count bucket-копии с идентичным info отбрасываются", async () => {
+    const { dialogue } = await parseFixture("token-count-buckets.jsonl");
+    const assistants = dialogue.messages.filter(
+      (m) => m.role === "assistant" && m.usageEvents.length > 0,
+    );
+    expect(assistants).toHaveLength(1);
+    // 5 token_count строк (3 + 2 копии rate-limit bucket'ов) → 2 вызова.
+    const requests = assistants[0]!.usageEvents.filter((e) => e.scope === "request");
+    expect(requests).toHaveLength(2);
+    expect(requests[0]!.inputTokens).toBe(1200);
+    expect(requests[1]!.inputTokens).toBe(2400);
+    const usage = normalizeUsageEvents(assistants[0]!.usageEvents)!;
+    expect(usage.inputTokens).toBe(1200 + 2400);
+    expect(usage.totalTokensNormalized).toBe(1200 + 300 + 2400 + 500);
+    expect(dialogue.metadata.eventCounts).toMatchObject({
+      "event_msg.token_count_bucket_duplicate": 3,
+    });
+  });
+
+  test("forked session: duration_ms replay-истории parent не засчитывается", async () => {
+    const { dialogue } = await parseFixture("forked-inherited-duration.jsonl");
+    const withDuration = dialogue.messages.filter((m) => m.metadata.durationMs !== undefined);
+    // Двухчасовой inherited duration (7200000 ms, started_at до fork'а)
+    // отброшен; остаются envelope-delta ~1ms у inherited turn и свои 300000 ms.
+    expect(withDuration.map((m) => m.metadata.durationMs)).not.toContain(7200000);
+    const own = dialogue.messages.find((m) => m.metadata.durationMs === 300000);
+    expect(own).toBeDefined();
+    expect(own!.metadata.durationSource).toBe("codex.task_complete.duration_ms");
+    expect(dialogue.metadata.eventCounts).toMatchObject({
+      "event_msg.task_complete.inherited_duration": 1,
+    });
+    const sum = withDuration.reduce((s, m) => s + (m.metadata.durationMs as number), 0);
+    expect(sum).toBeLessThan(400000);
   });
 });
 

@@ -3,11 +3,14 @@
  *
  * Hash стабильной проекции ParsedDialogue: содержимое сообщений/чанков,
  * модели, usage (включая raw payload), metadata сообщений/чанков,
- * временные метки. Всё, что writer сохраняет в БД, покрыто hash'ем:
+ * временные метки. Всё canonical-содержимое, которое writer сохраняет в БД,
+ * покрыто hash'ем:
  * иначе два snapshot'а, различающиеся только metadata/raw usage,
  * получали бы одинаковый revision id — запись пропускалась, а в БД
  * оставались устаревшие данные. metadata ДИАЛОГА в hash не входит —
- * writer её не сохраняет.
+ * writer её не сохраняет. Производные кеш-поля (например response timing)
+ * в hash не входят: их можно backfill'ить из raw event stream без
+ * пересоздания immutable dialogue_revision.
  *
  * canonical_hash вместе с identity_key и parser name@version образует
  * детерминированный id dialogue_revision — одинаковое содержимое даёт
@@ -68,6 +71,7 @@ export function canonicalDialogueHash(dialogue: ParsedDialogue): string {
         scope: e.scope,
         inputTokens: e.inputTokens ?? null,
         cachedInputTokens: e.cachedInputTokens ?? null,
+        cacheWriteInputTokens: e.cacheWriteInputTokens ?? null,
         outputTokens: e.outputTokens ?? null,
         reasoningOutputTokens: e.reasoningOutputTokens ?? null,
         totalTokensReported: e.totalTokensReported ?? null,
