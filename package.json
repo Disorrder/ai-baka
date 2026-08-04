@@ -28,6 +28,7 @@
   },
   "dependencies": {
     "commander": "15.0.0",
+    "echarts": "6.1.0",
     "surrealdb": "2.0.8"
   },
   "devDependencies": {
