@@ -21,6 +21,7 @@ import { openCodeParser } from "../parsers/opencode/index.ts";
 import { cursorParser } from "../parsers/cursor/index.ts";
 import { qwenCodeParser } from "../parsers/qwen-code/index.ts";
 import { kimiCodeParser } from "../parsers/kimi-code/index.ts";
+import { ompParser } from "../parsers/omp/index.ts";
 import { codexExtractors } from "../search/extractors/codex.ts";
 import { claudeCodeExtractors } from "../search/extractors/claude-code.ts";
 import { claudeDesktopExtractors } from "../search/extractors/claude-desktop.ts";
@@ -28,6 +29,7 @@ import { openCodeExtractors } from "../search/extractors/opencode.ts";
 import { cursorExtractors } from "../search/extractors/cursor.ts";
 import { qwenCodeExtractors } from "../search/extractors/qwen-code.ts";
 import { kimiCodeExtractors } from "../search/extractors/kimi-code.ts";
+import { ompExtractors } from "../search/extractors/omp.ts";
 
 export type ParseUnit = "file" | "kimi-session";
 
@@ -49,6 +51,7 @@ export const HARNESS_TOOLS: Record<HarnessSlug, HarnessTools> = {
   cursor: { parser: cursorParser, extractors: cursorExtractors, parseUnit: "file" },
   "qwen-code": { parser: qwenCodeParser, extractors: qwenCodeExtractors, parseUnit: "file" },
   "kimi-code": { parser: kimiCodeParser, extractors: kimiCodeExtractors, parseUnit: "kimi-session" },
+  omp: { parser: ompParser, extractors: ompExtractors, parseUnit: "file" },
 };
 
 /**

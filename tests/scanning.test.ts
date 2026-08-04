@@ -20,7 +20,7 @@ describe("scanning", () => {
       await writeFile(path.join(root, "._one.jsonl"), "appledouble");
       await writeFile(path.join(root, "a/._two.jsonl"), "appledouble");
 
-      const result = await scanSourceRoot(root, HARNESS_FILE_MATCHERS["kimi-code"]);
+      const result = await scanSourceRoot(root, HARNESS_FILE_MATCHERS["qwen-code"]);
       expect(result.status).toBe("complete");
       expect(result.errors).toEqual([]);
       expect(result.files.map((f) => f.relativePath)).toEqual([
@@ -31,6 +31,28 @@ describe("scanning", () => {
       const two = result.files.find((f) => f.relativePath === "a/two.jsonl");
       expect(two?.sizeBytes).toBe(2);
       expect(typeof two?.mtimeMs).toBe("number");
+    });
+  });
+
+  test("kimi-code matcher берёт только session topology, не task artifacts", async () => {
+    await withTempDir(async (dir) => {
+      const root = path.join(dir, "root");
+      await mkdir(path.join(root, "wd/session/agents/main/tasks"), { recursive: true });
+      await mkdir(path.join(root, "wd/session/agents/agent-0"), { recursive: true });
+      await writeFile(path.join(root, "session_index.jsonl"), "{}\n");
+      await writeFile(path.join(root, "wd/session/state.json"), "{}");
+      await writeFile(path.join(root, "wd/session/agents/main/wire.jsonl"), "{}\n");
+      await writeFile(path.join(root, "wd/session/agents/agent-0/wire.jsonl"), "{}\n");
+      await writeFile(path.join(root, "wd/session/agents/main/tasks/bash-1.json"), "{}");
+
+      const result = await scanSourceRoot(root, HARNESS_FILE_MATCHERS["kimi-code"]);
+      expect(result.status).toBe("complete");
+      expect(result.files.map((f) => f.relativePath)).toEqual([
+        "session_index.jsonl",
+        "wd/session/agents/agent-0/wire.jsonl",
+        "wd/session/agents/main/wire.jsonl",
+        "wd/session/state.json",
+      ]);
     });
   });
 
@@ -103,13 +125,20 @@ describe("scanning", () => {
     });
   });
 
-  test("matchAll принимает любые файлы (claude-desktop)", async () => {
+  test("claude-desktop matcher принимает LevelDB fallback, но не plugin assets", async () => {
     await withTempDir(async (dir) => {
+      await mkdir(path.join(dir, "skills-plugin/plugin/skills/docx"), { recursive: true });
+      await mkdir(path.join(dir, "session/rpm"), { recursive: true });
       await writeFile(path.join(dir, "MANIFEST-000001"), "x");
       await writeFile(path.join(dir, "000003.log"), "y");
+      await writeFile(path.join(dir, "skills-plugin/plugin/skills/docx/SKILL.md"), "no");
+      await writeFile(path.join(dir, "session/rpm/manifest.json"), "no");
       const result = await scanSourceRoot(dir, HARNESS_FILE_MATCHERS["claude-desktop"]);
       expect(result.status).toBe("complete");
-      expect(result.files).toHaveLength(2);
+      expect(result.files.map((f) => f.relativePath)).toEqual([
+        "000003.log",
+        "MANIFEST-000001",
+      ]);
     });
   });
 });

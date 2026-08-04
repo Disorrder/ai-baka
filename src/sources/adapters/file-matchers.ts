@@ -17,20 +17,39 @@ function extensions(...exts: string[]): FileMatcher {
     exts.some((ext) => basename.toLowerCase().endsWith(ext));
 }
 
+function kimiCodeSessionFiles(relativePath: string, basename: string): boolean {
+  return basename === "state.json" ||
+    basename === "session_index.jsonl" ||
+    basename === "wire.jsonl" ||
+    relativePath.endsWith("/wire.jsonl");
+}
+
+function claudeDesktopFiles(relativePath: string): boolean {
+  // local-agent-mode-sessions may contain installed plugin/skill assets next to
+  // transcripts; those are not conversation sources and make live sync huge.
+  if (relativePath.startsWith("skills-plugin/") || relativePath.includes("/skills-plugin/")) {
+    return false;
+  }
+  if (relativePath.includes("/rpm/")) return false;
+  return true;
+}
+
 export const HARNESS_FILE_MATCHERS: Record<HarnessSlug, FileMatcher> = {
   // JSONL transcripts (archived_sessions/sessions); ~/.codex/sqlite — см. ниже.
   codex: extensions(".jsonl", ".sqlite", ".sqlite3", ".db"),
   "claude-code": extensions(".jsonl"),
   // IndexedDB/Session Storage: leveldb-файлы (.log/.ldb/.sst/MANIFEST-*) без
   // единого расширения — берём всё.
-  "claude-desktop": matchAll,
+  "claude-desktop": claudeDesktopFiles,
   // opencode.db + storage/session_diff (JSON-дампы).
   opencode: extensions(".db", ".json"),
   // state.vscdb / workspaceStorage (*.vscdb + JSON-метаданные).
   cursor: extensions(".vscdb", ".db", ".json"),
   "qwen-code": extensions(".jsonl"),
   // wire.jsonl, state.json, session_index.jsonl.
-  "kimi-code": extensions(".jsonl", ".json"),
+  "kimi-code": kimiCodeSessionFiles,
+  // Session transcripts under ~/.omp/agent/sessions.
+  omp: extensions(".jsonl"),
 };
 
 /** SQLite-файлы snapshot'ятся только через VACUUM INTO, никогда filesystem copy. */

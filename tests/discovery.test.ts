@@ -9,7 +9,7 @@ import {
 import { withTempDir } from "./config.test.ts";
 
 describe("discovery", () => {
-  test("охватывает все 7 harness'ов; несуществующие пути не enabled", async () => {
+  test("охватывает все 8 harness'ов; несуществующие пути не enabled", async () => {
     await withTempDir(async (home) => {
       const report = await discoverSourceRoots({ home, env: {} });
       const harnesses = new Set(report.roots.map((r) => r.harness));

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { readdir, readFile, stat, writeFile, appendFile, mkdir } from "node:fs/promises";
+import { readdir, readFile, stat, writeFile, appendFile, chmod, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { hashFile, headHashOf, HEAD_HASH_BYTES } from "../src/sources/snapshot/hashing.ts";
 import {
@@ -263,6 +263,30 @@ describe("SQLite snapshot (§9.2, сценарий §19.2 №13)", () => {
       const rows = snap.query("SELECT x FROM t").all();
       snap.close();
       expect(rows).toEqual([{ x: "1" }]);
+    });
+  });
+
+  test("закрытая WAL-база без sidecar snapshot'ится из read-only каталога", async () => {
+    await withTempDir(async (dir) => {
+      const sourceDir = path.join(dir, "closed-workspace");
+      await mkdir(sourceDir);
+      const dbPath = path.join(sourceDir, "state.vscdb");
+      const live = new Database(dbPath);
+      live.run("PRAGMA journal_mode = WAL");
+      live.run("CREATE TABLE t (x TEXT)");
+      live.run("INSERT INTO t VALUES ('cursor-message')");
+      live.close();
+
+      await chmod(sourceDir, 0o555);
+      try {
+        const result = await snapshotSqlite(dbPath, optsFor(path.join(dir, "archive")));
+        const snap = new Database(result.rawArchivePath, { readonly: true });
+        const rows = snap.query("SELECT x FROM t").all();
+        snap.close();
+        expect(rows).toEqual([{ x: "cursor-message" }]);
+      } finally {
+        await chmod(sourceDir, 0o755);
+      }
     });
   });
 

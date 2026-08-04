@@ -1,0 +1,6 @@
+{"type":"session","version":3,"id":"019fb900-2222-7000-8222-222222222222","timestamp":"2026-07-31T13:00:00.000Z","cwd":"/Users/example/projects/demo-app"}
+{"type":"message","id":"user-1","timestamp":"2026-07-31T13:00:01.000Z","message":{"role":"user","content":[],"attribution":"user"}}
+{"type":"message","id":"assistant-1","timestamp":"2026-07-31T13:00:02.000Z","message":{"role":"assistant","content":[{"type":"hologram","projection":"beta"},{"type":"text","text":"Отвечу коротко."}],"model":"gpt-5.5","provider":"openai-codex","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15}}}
+{"type":"quantum_checkpoint","id":"mystery","payload":{"state":"unknown"}}
+{"type":"message","id":"tool-1","timestamp":"2026-07-31T13:00:03.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"tool output"}],"toolCallId":"call_x","toolName":"bash"}}
+{"type":"message","id":"broken"

@@ -18,6 +18,7 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { mkdir, open, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { isSqlitePath } from "../adapters/file-matchers.ts";
 import { hashFile, type FileHashes } from "./hashing.ts";
 import { rawFileName } from "./naming.ts";
@@ -182,13 +183,28 @@ export async function snapshotSqlite(
   const stagingPath = path.join(dir, `${crypto.randomUUID()}.db`);
 
   const srcStat = await stat(sourcePath);
-  // create:false — readonly+create (дефолт bun:sqlite) не может открыть
-  // WAL-базу без существующего -shm ("unable to open database file"),
-  // например Cursor state.vscdb в неактивных workspace (live acceptance, этап 8).
-  const db = new Database(sourcePath, { readonly: true, create: false });
-  try {
+  const vacuumInto = (db: Database): void => {
     const escaped = stagingPath.replaceAll("'", "''");
     db.run(`VACUUM INTO '${escaped}'`);
+  };
+  // create:false запрещает неявное создание source-базы.
+  let db = new Database(sourcePath, { readonly: true, create: false });
+  try {
+    vacuumInto(db);
+  } catch (error) {
+    db.close();
+    const cantOpen = error instanceof Error && "code" in error && error.code === "SQLITE_CANTOPEN";
+    const hasSidecar = existsSync(`${sourcePath}-wal`) || existsSync(`${sourcePath}-shm`);
+    if (!cantOpen || hasSidecar) throw error;
+
+    // Некоторые закрытые Cursor state.vscdb сохраняют WAL-флаг в
+    // header, хотя WAL/SHM уже нет. SQLite пытается открыть отсутствующий
+    // SHM даже в readonly-режиме. immutable безопасен только при отсутствии
+    // обоих sidecar-файлов; snapshot по-прежнему создаётся через VACUUM INTO.
+    const immutableUrl = pathToFileURL(sourcePath);
+    immutableUrl.searchParams.set("immutable", "1");
+    db = new Database(immutableUrl.href, { readonly: true, create: false });
+    vacuumInto(db);
   } finally {
     db.close();
   }

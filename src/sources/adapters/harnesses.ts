@@ -13,7 +13,8 @@ export type HarnessSlug =
   | "opencode"
   | "cursor"
   | "qwen-code"
-  | "kimi-code";
+  | "kimi-code"
+  | "omp";
 
 export type SourceKind =
   | "file_tree"
@@ -46,6 +47,7 @@ export const HARNESS_ORDER: HarnessSlug[] = [
   "cursor",
   "qwen-code",
   "kimi-code",
+  "omp",
 ];
 
 export const HARNESSES: Record<HarnessSlug, HarnessDefinition> = {
@@ -59,6 +61,7 @@ export const HARNESSES: Record<HarnessSlug, HarnessDefinition> = {
       joinHome(home, ".codex/archived_sessions"),
       joinHome(home, ".codex/sessions"),
       joinHome(home, ".codex/sqlite"),
+      joinHome(home, "Library/Application Support/orca/codex-runtime-home/home/sessions"),
     ],
   },
   "claude-code": {
@@ -132,5 +135,13 @@ export const HARNESSES: Record<HarnessSlug, HarnessDefinition> = {
         joinHome(kimiHome, "session_index.jsonl"),
       ];
     },
+  },
+  omp: {
+    slug: "omp",
+    displayName: "OMP",
+    sourceKind: "file_tree",
+    snapshotStrategy: "copy",
+    envOverride: "BAKA_SOURCES__OMP",
+    defaultRoots: ({ home }) => [joinHome(home, ".omp/agent/sessions")],
   },
 };

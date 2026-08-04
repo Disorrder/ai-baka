@@ -31,7 +31,9 @@ import {
 import { HARNESS_FILE_MATCHERS } from "../sources/adapters/file-matchers.ts";
 import { discoverSourceRoots, type DiscoveredSourceRoot } from "../sources/discovery/discovery.ts";
 import { scanSourceRoot } from "../sources/scanning/scanner.ts";
+import type { ScanResult } from "../sources/scanning/scanner.ts";
 import { snapshotSource, SnapshotError } from "../sources/snapshot/raw-snapshot.ts";
+import { hashFile } from "../sources/snapshot/hashing.ts";
 import {
   detectRenames,
   reconcileLocations,
@@ -116,6 +118,7 @@ interface RootOutcome {
   filesNew: number;
   filesChanged: number;
   filesMissing: number;
+  filesDuplicateSkipped: number;
   errors: number;
   revisionsCreated: number;
   dialoguesWritten: number;
@@ -131,6 +134,7 @@ function emptyOutcome(): RootOutcome {
     filesNew: 0,
     filesChanged: 0,
     filesMissing: 0,
+    filesDuplicateSkipped: 0,
     errors: 0,
     revisionsCreated: 0,
     dialoguesWritten: 0,
@@ -139,6 +143,115 @@ function emptyOutcome(): RootOutcome {
     searchDocuments: 0,
     embeddingJobs: 0,
   };
+}
+
+function isOrcaCodexRuntimeRoot(root: DiscoveredSourceRoot): boolean {
+  if (root.harness !== "codex") return false;
+  const normalized = root.path.split(path.sep).join("/");
+  return normalized.endsWith("/Library/Application Support/orca/codex-runtime-home/home/sessions");
+}
+
+function isJsonlSource(relativePath: string): boolean {
+  return relativePath.toLowerCase().endsWith(".jsonl");
+}
+
+async function sourcePathForScannedFile(rootPath: string, relativePath: string): Promise<string> {
+  const rootIsFile = (await stat(rootPath).catch(() => undefined))?.isFile() ?? false;
+  return rootIsFile ? rootPath : path.join(rootPath, relativePath);
+}
+
+async function buildCodexNativeDuplicateSha256Index(
+  roots: DiscoveredSourceRoot[],
+  log: Logger,
+): Promise<Set<string> | undefined> {
+  const hasOrcaCodexRuntime = roots.some((root) => root.enabled && isOrcaCodexRuntimeRoot(root));
+  if (!hasOrcaCodexRuntime) return undefined;
+
+  const nativeRoots = roots.filter(
+    (root) => root.enabled && root.harness === "codex" && !isOrcaCodexRuntimeRoot(root),
+  );
+  if (nativeRoots.length === 0) return undefined;
+
+  const hashes = new Set<string>();
+  let filesIndexed = 0;
+  let errors = 0;
+  for (const root of nativeRoots) {
+    const scan = await scanSourceRoot(root.path, HARNESS_FILE_MATCHERS.codex);
+    errors += scan.errors.length;
+    for (const file of scan.files) {
+      if (!isJsonlSource(file.relativePath)) continue;
+      try {
+        const sourcePath = await sourcePathForScannedFile(root.path, file.relativePath);
+        hashes.add((await hashFile(sourcePath)).sha256);
+        filesIndexed += 1;
+      } catch (error) {
+        errors += 1;
+        log({
+          event: "source_duplicate_index_error",
+          root: root.path,
+          path: file.relativePath,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+  log({
+    event: "source_duplicate_index",
+    harness: "codex",
+    roots: nativeRoots.length,
+    filesIndexed,
+    uniqueSha256: hashes.size,
+    errors,
+  });
+  return hashes;
+}
+
+async function filterOrcaCodexDuplicateFiles(
+  root: DiscoveredSourceRoot,
+  scan: ScanResult,
+  nativeDuplicateSha256Index: Set<string> | undefined,
+  log: Logger,
+): Promise<ScanResult> {
+  if (!isOrcaCodexRuntimeRoot(root) || !nativeDuplicateSha256Index?.size) return scan;
+
+  const files: ScanResult["files"] = [];
+  let skipped = 0;
+  let errors = 0;
+  for (const file of scan.files) {
+    if (!isJsonlSource(file.relativePath)) {
+      files.push(file);
+      continue;
+    }
+    try {
+      const sourcePath = await sourcePathForScannedFile(root.path, file.relativePath);
+      const sha256 = (await hashFile(sourcePath)).sha256;
+      if (nativeDuplicateSha256Index.has(sha256)) {
+        skipped += 1;
+        continue;
+      }
+      files.push(file);
+    } catch (error) {
+      errors += 1;
+      files.push(file);
+      log({
+        event: "source_duplicate_filter_error",
+        root: root.path,
+        path: file.relativePath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  if (skipped > 0 || errors > 0) {
+    log({
+      event: "source_duplicate_filter",
+      root: root.path,
+      rawFiles: scan.files.length,
+      files: files.length,
+      duplicateFilesSkipped: skipped,
+      errors,
+    });
+  }
+  return { ...scan, files };
 }
 
 export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promise<SyncSummary> {
@@ -152,6 +265,7 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
     filesNew: 0,
     filesChanged: 0,
     filesMissing: 0,
+    filesDuplicateSkipped: 0,
     revisionsCreated: 0,
     dialoguesWritten: 0,
     messagesWritten: 0,
@@ -234,6 +348,7 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
         reason: "нет active embedding_space — jobs не создаются (space и backfill — этап 7)",
       });
     }
+    const codexNativeDuplicateSha256Index = await buildCodexNativeDuplicateSha256Index(roots, log);
 
     for (const root of roots) {
       counters.roots += 1;
@@ -247,6 +362,7 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
           enqueueEmbeddings,
           activeSpaces,
           embeddingTables,
+          codexNativeDuplicateSha256Index,
           fullRescan: options.fullRescan ?? false,
           dryRun,
           log,
@@ -256,6 +372,7 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
         counters.filesNew += outcome.filesNew;
         counters.filesChanged += outcome.filesChanged;
         counters.filesMissing += outcome.filesMissing;
+        counters.filesDuplicateSkipped += outcome.filesDuplicateSkipped;
         counters.ingestErrors += outcome.errors;
         counters.revisionsCreated += outcome.revisionsCreated;
         counters.dialoguesWritten += outcome.dialoguesWritten;
@@ -380,6 +497,7 @@ interface ProcessRootArgs {
   enqueueEmbeddings: boolean;
   activeSpaces: RecordId[];
   embeddingTables: string[];
+  codexNativeDuplicateSha256Index?: Set<string>;
   fullRescan: boolean;
   dryRun: boolean;
   log: Logger;
@@ -431,14 +549,23 @@ async function processSourceRoot(
 
   // §10.2: обход root'а с явным статусом полноты.
   const scanStarted = new Date();
-  const scan = await scanSourceRoot(root.path, HARNESS_FILE_MATCHERS[slug]);
+  const rawScan = await scanSourceRoot(root.path, HARNESS_FILE_MATCHERS[slug]);
+  const scan = await filterOrcaCodexDuplicateFiles(
+    root,
+    rawScan,
+    args.codexNativeDuplicateSha256Index,
+    log,
+  );
   outcome.filesSeen = scan.files.length;
+  outcome.filesDuplicateSkipped = rawScan.files.length - scan.files.length;
   outcome.errors += scan.errors.length;
   log({
     event: "root_scan",
     root: root.path,
     status: scan.status,
     files: scan.files.length,
+    rawFiles: rawScan.files.length,
+    duplicateFilesSkipped: outcome.filesDuplicateSkipped,
     scanErrors: scan.errors.length,
   });
 

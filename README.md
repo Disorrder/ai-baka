@@ -182,7 +182,7 @@ raw-архива, а не местом, куда напрямую перекла
 
 ## Что архивируется
 
-Семь harness'ов:
+Восемь harness'ов:
 
 - Codex
 - Claude Code
@@ -191,6 +191,7 @@ raw-архива, а не местом, куда напрямую перекла
 - Cursor
 - Qwen Code
 - Kimi Code (Kimi CLI)
+- OMP
 
 Ключевые свойства:
 
@@ -299,7 +300,7 @@ Import-тело сверх лимита отклоняется через HTTP 4
 - [`docs/rocksdb-recovery.md`](docs/rocksdb-recovery.md) — production-runbook
   для one-way rebuild fresh internal RocksDB, cleanup и отдельного
   Compose recreation без in-place repair и reverse migration.
-- [`docs/sources.md`](docs/sources.md) — источники данных семи harness'ов:
+- [`docs/sources.md`](docs/sources.md) — источники данных восьми harness'ов:
   пути, форматы, стратегии snapshot.
 
 ## Границы проекта

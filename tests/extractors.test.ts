@@ -3,8 +3,10 @@ import { join } from "node:path";
 import { collectDialogues } from "../src/parsers/shared/parser.ts";
 import { codexParser } from "../src/parsers/codex/index.ts";
 import { kimiCodeParser } from "../src/parsers/kimi-code/index.ts";
+import { ompParser } from "../src/parsers/omp/index.ts";
 import { codexExtractors } from "../src/search/extractors/codex.ts";
 import { kimiCodeExtractors } from "../src/search/extractors/kimi-code.ts";
+import { ompExtractors } from "../src/search/extractors/omp.ts";
 import { prepareSearchDocuments } from "../src/db/repositories/corpus.ts";
 import { searchDocumentRecordId } from "../src/sync/canonical-hash.ts";
 import type { ParsedDialogue } from "../src/domain/canonical-types.ts";
@@ -16,6 +18,11 @@ async function parseCodex(name: string): Promise<ParsedDialogue> {
 
 async function parseKimi(sessionDir: string): Promise<ParsedDialogue> {
   const snapshot = await kimiCodeParser.parse(join("tests/fixtures/kimi-code", sessionDir));
+  return (await collectDialogues(snapshot))[0]!;
+}
+
+async function parseOmp(name: string): Promise<ParsedDialogue> {
+  const snapshot = await ompParser.parse(`tests/fixtures/omp/${name}`);
   return (await collectDialogues(snapshot))[0]!;
 }
 
@@ -164,5 +171,23 @@ describe("kimi-code extractors", () => {
       "Ответ на первый вопрос: parseConfig читает TOML.",
       "Ответ на второй вопрос.",
     ]);
+  });
+});
+
+describe("omp extractors", () => {
+  test("user_prompt и assistant_final строятся без reasoning/tool activity", async () => {
+    const dialogue = await parseOmp("basic-dialogue.jsonl");
+    const prompt = ompExtractors.extractUserPrompt(dialogue.messages[0]!)!;
+    expect(prompt.extractionMethod).toBe("omp_user_prompt");
+    expect(prompt.content).toBe("Объясни, как работает cache invalidation.");
+
+    const final = ompExtractors.extractAssistantFinal(dialogue.messages)!;
+    expect(final.extractionMethod).toBe("fallback_visible_assistant_text");
+    expect(final.content).toBe(
+      "Кэш инвалидируется по TTL и явному тегу.\n" +
+        "Функция invalidateTag удаляет все entries с указанным тегом.",
+    );
+    expect(final.content).not.toContain("Нужно проверить");
+    expect(final.content).not.toContain("rg -n invalidate");
   });
 });

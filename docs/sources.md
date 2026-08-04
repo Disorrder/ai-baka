@@ -1,17 +1,18 @@
 # Источники данных (harness'ы)
 
-Семь поддерживаемых harness'ов. Пути по умолчанию относятся к macOS;
+Восемь поддерживаемых harness'ов. Пути по умолчанию относятся к macOS;
 фактические корни задаются конфигурацией и фиксируются в `source_root`.
 
 | Harness | Slug | Источник по умолчанию | source_kind | snapshot_strategy |
 | --- | --- | --- | --- | --- |
-| Codex | `codex` | `~/.codex/archived_sessions`, `~/.codex/sessions`, `~/.codex/sqlite` | JSONL file tree | `copy` |
+| Codex | `codex` | `~/.codex/archived_sessions`, `~/.codex/sessions`, `~/.codex/sqlite`, `~/Library/Application Support/orca/codex-runtime-home/home/sessions` | JSONL file tree | `copy` |
 | Claude Code | `claude-code` | `~/.claude/projects`, `~/.claude/history.jsonl` | JSONL file tree | `copy` |
 | Claude Desktop | `claude-desktop` | `~/Library/Application Support/Claude/local-agent-mode-sessions`, `IndexedDB`, `Session Storage` | JSON/JSONL file tree (+ LevelDB fallback) | `copy` |
 | OpenCode | `opencode` | `~/.local/share/opencode/opencode.db`, `storage/session_diff` | SQLite | `sqlite_backup` / `vacuum_into` |
 | Cursor | `cursor` | `~/Library/Application Support/Cursor/User/workspaceStorage`, `globalStorage/state.vscdb` | SQLite + files | `sqlite_backup` / `vacuum_into` |
 | Qwen Code | `qwen-code` | `~/.qwen/projects` | JSONL file tree | `copy` |
 | Kimi Code | `kimi-code` | `~/.kimi-code/sessions`, `~/.kimi-code/session_index.jsonl` | JSONL file tree + JSON metadata | `copy` |
+| OMP | `omp` | `~/.omp/agent/sessions` | JSONL file tree | `copy` |
 
 ## Важные правила
 
@@ -23,6 +24,14 @@
   транзакции записи является отдельный dialogue revision.
 - `session_index.jsonl` Kimi Code — индекс (sessionId, sessionDir, workDir),
   а не сам диалог; контент — в `wire.jsonl` каждой сессии.
+- OMP хранит один JSONL transcript на сессию в `~/.omp/agent/sessions`;
+  дочерние agent transcripts тоже импортируются как самостоятельные диалоги.
+- Orca Codex pane хранит те же Codex rollout JSONL в собственном runtime home:
+  `~/Library/Application Support/orca/codex-runtime-home/home/sessions`.
+  Это импортируется как harness `codex`; Orca здесь только оболочка, не
+  отдельный vendor/harness для аналитики. При sync exact SHA-256 дубли из
+  Orca runtime пропускаются, если такой же transcript уже найден в нативных
+  Codex roots (`~/.codex/sessions` или `~/.codex/archived_sessions`).
 
 ## Kimi Code (Kimi CLI)
 
@@ -59,3 +68,10 @@ Kimi Code CLI хранит все данные в `$KIMI_CODE_HOME` (по умо
 
 Источники: [Data locations](https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/data-locations.html),
 [Sessions and context](https://www.kimi.com/code/docs/en/kimi-code-cli/guides/sessions.html).
+
+## OMP
+
+OMP session JSONL содержит события `session`, `model_change`,
+`thinking_level_change`, `message`, `custom`, `custom_message` и `compaction`.
+Parser сохраняет user/assistant/tool messages, reasoning chunks, tool calls,
+tool results, `usage`, `duration`, `ttft` и cost payload в raw usage/metadata.
