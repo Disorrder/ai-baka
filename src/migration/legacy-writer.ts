@@ -20,6 +20,7 @@ import {
 import { sha256hex } from "../db/transactions.ts";
 import { clean, selectOne } from "../db/repositories/helpers.ts";
 import {
+  contentChars,
   modelKeyOf,
   writeDialogueRevision,
   type DialogueWriteResult,
@@ -66,10 +67,15 @@ function messageFields(
     ["raw_model_name", message.model?.rawModelName],
     ["reasoning_effort", message.model?.reasoningEffort],
     ["service_provider", message.model?.serviceProvider],
+    ["content_chars", messageContentChars(message)],
     ["usage", usage ? clean(usage) : undefined],
     ["raw_usage_events", message.usageEvents.length > 0 ? clean(message.usageEvents) : undefined],
     ["metadata", Object.keys(message.metadata).length > 0 ? clean(message.metadata) : undefined],
   ];
+}
+
+function messageContentChars(message: ParsedMessage): number {
+  return message.chunks.reduce((total, chunk) => total + contentChars(chunk.content ?? ""), 0);
 }
 
 class Tx {
@@ -217,6 +223,7 @@ export async function writeLegacyDialogueRevision(
               ["content", content],
               ["content_sha256", sha256hex(content)],
               ["content_bytes", Buffer.byteLength(content, "utf8")],
+              ["content_chars", contentChars(content)],
               ["source_locator", chunk.sourceLocator],
               ["tool_call_id", chunk.toolCallId],
               ["tool_name", chunk.toolName],

@@ -4,7 +4,7 @@
  * This module deliberately does not change migration reconciliation.  The
  * historical row remains `quarantined` and continues to point at its durable
  * migration_quarantine record.  A signed exclusion only adjudicates the
- * current unresolved state through resolved_at/resolution and schema-5
+ * current unresolved state through resolved_at/resolution and schema-5+
  * migration_meta evidence.
  */
 
@@ -49,6 +49,12 @@ export const OPERATOR_EXCLUSION_CODES = [
   "existing_dialogue_ownership_superseded",
   "canonical_child_of_superseded_thread",
 ] as const;
+
+function assertOperatorExclusionSchemaVersion(schemaVersion: number): void {
+  if (schemaVersion < 5 || schemaVersion > 9) {
+    throw new Error(`operator exclusions require schema 5–9; current ${schemaVersion}`);
+  }
+}
 
 export type OperatorExclusionCode = (typeof OPERATOR_EXCLUSION_CODES)[number];
 
@@ -865,7 +871,7 @@ export async function buildOperatorExclusionArtifact(input: {
   createdAt?: string;
 }): Promise<OperatorExclusionArtifact> {
   const schemaVersion = await checkSchemaVersion(input.db);
-  if (schemaVersion !== 5) throw new Error(`operator exclusions require exact schema 5; current ${schemaVersion}`);
+  assertOperatorExclusionSchemaVersion(schemaVersion);
   const source = await authenticateSourceMigration(input);
   const eligibility = await deriveEligibleOperatorExclusions(input.db, input.snapshotPath);
   const unresolved = await unresolvedForSnapshot(input.db, source.snapshotSha256);
@@ -1130,7 +1136,7 @@ export async function applyOperatorExclusions(input: {
   trustAnchor: MigrationApprovalTrustAnchor;
 }): Promise<OperatorExclusionReport> {
   const schemaVersion = await checkSchemaVersion(input.db);
-  if (schemaVersion !== 5) throw new Error(`operator exclusions require exact schema 5; current ${schemaVersion}`);
+  assertOperatorExclusionSchemaVersion(schemaVersion);
   const loaded = await readOperatorExclusionArtifacts(input);
   const source = await authenticateSourceMigration({
     db: input.db,

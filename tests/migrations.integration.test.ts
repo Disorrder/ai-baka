@@ -20,6 +20,8 @@ import {
 
 // Явный skip в отчёте, если SurrealDB не поднят (вместо молчаливого return).
 const testDb = await dbTest();
+const LATEST_SCHEMA_VERSION = 9;
+const LATEST_MIGRATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 afterAll(async () => {
   await finishLiveTestFile();
@@ -44,14 +46,14 @@ describe("migrations (integration, живой SurrealDB)", () => {
         bakaCommit: "test-commit",
         surrealdbVersion: "test-server",
       });
-      expect(result.applied).toEqual([1, 2, 3, 4, 5]);
-      expect(result.version).toBe(5);
-      expect(await checkSchemaVersion(t.db)).toBe(5);
+      expect(result.applied).toEqual(LATEST_MIGRATIONS);
+      expect(result.version).toBe(LATEST_SCHEMA_VERSION);
+      expect(await checkSchemaVersion(t.db)).toBe(LATEST_SCHEMA_VERSION);
 
       const [rows] = await t.db.query<
         [Array<{ version: number; checksum: string; baka_commit: string }>]
       >("SELECT version, checksum, baka_commit FROM schema_migration ORDER BY version");
-      expect(rows!.map((r) => r.version)).toEqual([1, 2, 3, 4, 5]);
+      expect(rows!.map((r) => r.version)).toEqual(LATEST_MIGRATIONS);
       const firstContent = await readFile(path.join(SCHEMA_DIR, "0001_initial.surql"), "utf8");
       expect(rows![0]!.checksum).toBe(checksum(firstContent));
       expect(rows![0]!.baka_commit).toBe("test-commit");
@@ -61,7 +63,7 @@ describe("migrations (integration, живой SurrealDB)", () => {
       >("SELECT archive_uuid, schema_version, created_by_baka_commit FROM archive_meta:main");
       expect(meta).toHaveLength(1);
       expect(meta![0]!.archive_uuid).toBe("test-archive-uuid");
-      expect(meta![0]!.schema_version).toBe(5);
+      expect(meta![0]!.schema_version).toBe(LATEST_SCHEMA_VERSION);
       expect(meta![0]!.created_by_baka_commit).toBe("test-commit");
 
       const [info] = await t.db.query<
@@ -76,6 +78,11 @@ describe("migrations (integration, живой SurrealDB)", () => {
         "INFO FOR TABLE search_document",
       );
       expect(sdInfo!.indexes).toHaveProperty("search_document_content");
+      expect(sdInfo!.indexes).toHaveProperty("search_document_dialogue_revision");
+      const [jobInfo] = await t.db.query<[{ indexes: Record<string, string> }]>(
+        "INFO FOR TABLE embedding_job",
+      );
+      expect(jobInfo!.indexes).toHaveProperty("embedding_job_search_document");
       const [chunkInfo] = await t.db.query<[{ indexes: Record<string, string> }]>(
         "INFO FOR TABLE chunk",
       );
@@ -158,11 +165,11 @@ describe("migrations (integration, живой SurrealDB)", () => {
         surrealdbVersion: "v",
       });
       expect(second.applied).toEqual([]);
-      expect(second.version).toBe(5);
+      expect(second.version).toBe(LATEST_SCHEMA_VERSION);
       const [rows] = await t.db.query<[Array<{ version: number }>]>(
         "SELECT version FROM schema_migration",
       );
-      expect(rows).toHaveLength(5);
+      expect(rows).toHaveLength(LATEST_MIGRATIONS.length);
     } finally {
       await dropTestDb(t);
     }

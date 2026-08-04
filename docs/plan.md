@@ -421,14 +421,17 @@ schema/
 ├── 0002_search_documents.surql
 ├── 0003_embedding_spaces.surql
 ├── 0004_legacy_migration_metadata.surql
-└── 0005_legacy_migration_run.surql
+├── 0005_legacy_migration_run.surql
+└── 0006_content_character_counts.surql
 ```
 
-Текущая schema version — 5. Миграция 0005 добавляет durable migration run,
+Текущая schema version — 6. Миграция 0005 добавляет durable migration run,
 quarantine/identity metadata, удаляет глобальный производный FULLTEXT-индекс
 `chunk_content` (canonical `chunk` records не удаляются) и допускает
 `source_revision.raw_archive_path = NONE` только для намеренного
-`snapshot_kind = legacy_missing_raw`.
+`snapshot_kind = legacy_missing_raw`. Миграция 0006 добавляет cached
+`content_chars` на `message` и `chunk` для аналитики длины сообщений; значения
+производны от сохранённого `chunk.content` и не меняют canonical hash.
 
 В базе хранится:
 
@@ -882,9 +885,18 @@ Fallback:
 | `started_at`         | начало диалога в этой версии      |
 | `updated_at`         | обновление                        |
 | `created_at`         | время импорта                     |
+| `parent_source_dialogue_id` | parent thread ID для Codex subagent |
+| `agent_depth`        | глубина Codex subagent            |
+| `agent_nickname`     | nickname Codex subagent           |
+| `agent_role`         | роль Codex subagent               |
 
 Старая ревизия остаётся в базе. `dialogue.current_revision` переключается
 только после полного успешного сохранения новой ревизии.
+
+Codex lineage-поля — производный backfillable cache из первичного
+`session_meta` immutable raw snapshot. Они нужны для точной дедупликации
+унаследованного `last_token_usage` prefix: собственный suffix subagent
+остаётся отдельной работой и не вычитается.
 
 ### `message`
 
@@ -903,6 +915,7 @@ Fallback:
 | `raw_model_name`    | исходное имя                                  |
 | `reasoning_effort`  | low/medium/high/xhigh/...                     |
 | `service_provider`  | OpenAI/OpenRouter/Cursor/...                  |
+| `content_chars`     | cached число символов всех chunks сообщения   |
 | `usage`             | нормализованный usage object                  |
 | `raw_usage_events`  | исходные usage events                         |
 | `metadata`          | harness-specific metadata                     |
@@ -918,6 +931,7 @@ scope:
 
 input_tokens
 cached_input_tokens
+cache_write_input_tokens
 output_tokens
 reasoning_output_tokens
 total_tokens_reported
@@ -929,7 +943,7 @@ normalization_version
 
 Правила:
 
-* cached input не прибавляется повторно к input;
+* cache read и cache write не прибавляются повторно к input;
 * reasoning output не прибавляется повторно к output;
 * cumulative events не суммируются как независимые turns;
 * `total_tokens_reported` сохраняется отдельно;
@@ -950,6 +964,7 @@ normalization_version
 | `content`              | полный текст                             |
 | `content_sha256`       | hash текста                              |
 | `content_bytes`        | UTF-8 bytes                              |
+| `content_chars`        | число символов                           |
 | `token_count_reported` | только если источник дал per-chunk usage |
 | `source_locator`       | line/index/JSON pointer                  |
 | `tool_call_id`         | связь tool call/result                   |
@@ -1372,7 +1387,8 @@ source_format_versions[]
 
 Изменение логики нормализации повышает `parser_version`.
 
-Текущие зарегистрированные версии всех семи parser — 2;
+Текущие зарегистрированные версии parser: 2 для исходных семи harness'ов,
+1 для OMP;
 `EXTRACTOR_VERSION = 3`: каждый извлечённый реальный user message задаёт
 отдельный turn-window и получает собственный `assistant_final`, если в этом
 turn есть видимый ответ ассистента.
@@ -2181,7 +2197,7 @@ backups/surreal/
 {
   "createdAt": "...",
   "surrealdbVersion": "3.2.3",
-  "schemaVersion": 5,
+  "schemaVersion": 7,
   "bakaCommit": "...",
   "namespace": "baka",
   "database": "archive",
@@ -2870,7 +2886,7 @@ surreal start memory
 
 Критерий:
 
-* все семь harness’ов проходят fixtures;
+* все восемь harness’ов проходят fixtures;
 * неизвестные события не теряются;
 * usage не double-counted.
 
@@ -3316,7 +3332,7 @@ cause/path/content остаётся внутри локальной ошибки
 
 * SurrealDB 3.2.3 и JS SDK pinned; sentinel, loopback,
   `db:up/down/status/preflight` и `disk:eject` реализованы.
-* Все семь harness’ов, immutable/hash-addressed raw, consistent SQLite
+* Все восемь harness’ов, immutable/hash-addressed raw, consistent SQLite
   snapshots, revision history, deletion state machine и host identity
   реализованы; live sync идемпотентен.
 * Full-text/vector/hybrid по curated search projection, fail-closed legacy

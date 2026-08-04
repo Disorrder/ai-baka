@@ -432,6 +432,48 @@ describe("dialogue transaction (integration)", () => {
     }
   }, 120_000);
 
+  testDb("очень большой chunk-count пишется staged и публикуется только как ready current", async () => {
+    const t = await createTestDb();
+    try {
+      const ctx = await makeCtx(t, "host-uuid-1");
+      const dialogue = makeDialogue("session_staged");
+      dialogue.messages[1]!.chunks = Array.from({ length: 2_100 }, (_, sequence) => ({
+        sequence,
+        kind: "text" as const,
+        content: `Synthetic staged chunk ${sequence}`,
+        metadata: {},
+      }));
+      const key = dialogueIdentityKey(ctx.installation.toString(), "session_staged", "fb");
+      const result = await writeDialogueRevision(t.db, txInput(ctx, dialogue, key));
+
+      expect(result.created).toBe(true);
+      expect(result.chunkCount).toBe(2_101);
+      const revision = await selectOne<{ status: string }>(
+        t.db,
+        "SELECT status FROM ONLY $rev",
+        { rev: result.revisionId },
+      );
+      expect(revision?.status).toBe("ready");
+      const current = await selectOne<{ current_revision: RecordId }>(
+        t.db,
+        "SELECT current_revision FROM dialogue WHERE identity_key = $key",
+        { key },
+      );
+      expect(String(current?.current_revision)).toBe(String(result.revisionId));
+      expect(await tableCount(t, "message")).toBe(2);
+      expect(await tableCount(t, "chunk")).toBe(2_101);
+      expect(await tableCount(t, "search_document")).toBeGreaterThan(0);
+
+      const second = await writeDialogueRevision(t.db, txInput(ctx, dialogue, key));
+      expect(second.created).toBe(false);
+      expect(second.switched).toBe(false);
+      expect(await tableCount(t, "dialogue_revision")).toBe(1);
+      expect(await tableCount(t, "chunk")).toBe(2_101);
+    } finally {
+      await dropTestDb(t);
+    }
+  }, 120_000);
+
   testDb("сценарий 9: укоротившийся диалог — новая revision без stale tail, projection переключена", async () => {
     const t = await createTestDb();
     try {

@@ -49,6 +49,7 @@ const testDb = await dbTest();
 // RocksDB под нагрузкой suite может пересечь общий 30s; конечный локальный
 // предел всё ещё ловит настоящее зависание.
 const RESTORE_DRILL_TEST_TIMEOUT_MS = 60_000;
+const LATEST_SCHEMA_VERSION = 9;
 
 let t: TestDb;
 let archiveRoot: string;
@@ -82,7 +83,7 @@ beforeAll(async () => {
       basename = "session.jsonl", presence_status = "active", missing_complete_scans = 0,
       first_seen_at = $now, last_seen_at = $now;
     CREATE sync_run:test SET kind = "live_sync", status = "completed",
-      started_at = $now, host = host:test, baka_commit = "test", schema_version = 5;
+      started_at = $now, host = host:test, baka_commit = "test", schema_version = ${LATEST_SCHEMA_VERSION};
     CREATE source_revision:test SET source_location = source_location:test,
       sha256 = $sha, size_bytes = $size, mtime_ms = 0, head_hash = NONE,
       raw_archive_path = $rawPath, snapshot_kind = "regular_copy", captured_at = $now,
@@ -201,7 +202,7 @@ describe("backup → restore:test → raw:verify", () => {
       () => runLogicalBackup(cfg),
     );
     const manifest: BackupManifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
-    expect(manifest.schemaVersion).toBe(5);
+    expect(manifest.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
     expect(manifest.namespace).toBe(TEST_NAMESPACE);
     expect(manifest.database).toBe(t.name);
     expect(manifest.recordCounts.source_revision).toBe(2);
@@ -235,7 +236,7 @@ describe("backup → restore:test → raw:verify", () => {
       expect(check.ok, `${check.name}: ${check.detail}`).toBe(true);
     }
     expect(report.ok).toBe(true);
-    expect(report.schemaVersion).toBe(5);
+    expect(report.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
     expect(report.checks.map((check) => check.name)).toContain(
       "invariant: migration_row_commit migration/target",
     );
@@ -275,7 +276,7 @@ describe("backup → restore:test → raw:verify", () => {
     expect(first.namespace).not.toBe(second.namespace);
     expect(isRestoreNamespace(first.namespace)).toBe(true);
     expect(isRestoreNamespace(second.namespace)).toBe(true);
-  });
+  }, RESTORE_DRILL_TEST_TIMEOUT_MS);
 
   testDb("restore drill читает raw из standalone off-device bundle root", async () => {
     const backup = await withLiveServerOperationGuard(
@@ -325,7 +326,7 @@ describe("backup → restore:test → raw:verify", () => {
     } finally {
       await rm(bundleRoot, { recursive: true, force: true });
     }
-  });
+  }, RESTORE_DRILL_TEST_TIMEOUT_MS);
 
   testDb("restore drill отклоняет битый export ДО импорта", async () => {
     const backup = await withLiveServerOperationGuard(
@@ -351,7 +352,7 @@ describe("backup → restore:test → raw:verify", () => {
       stage: "export_integrity",
       code: "export_sha256_mismatch",
     });
-  });
+  }, RESTORE_DRILL_TEST_TIMEOUT_MS);
 
   testDb("raw manifest по БД сходится с файловой системой", async () => {
     const manifest = await buildRawManifest(t.db);

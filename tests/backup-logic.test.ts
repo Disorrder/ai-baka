@@ -75,8 +75,12 @@ describe("backup naming", () => {
       )),
     );
     expect(schema5).toEqual(CORE_TABLES);
+    expect(coreTablesForSchemaVersion(6)).toEqual(CORE_TABLES);
+    expect(coreTablesForSchemaVersion(7)).toEqual(CORE_TABLES);
+    expect(coreTablesForSchemaVersion(8)).toEqual(CORE_TABLES);
+    expect(coreTablesForSchemaVersion(9)).toEqual(CORE_TABLES);
     expect(() => coreTablesForSchemaVersion(3)).toThrow(/неподдерживаемая версия схемы/);
-    expect(() => coreTablesForSchemaVersion(6)).toThrow(/неподдерживаемая версия схемы/);
+    expect(() => coreTablesForSchemaVersion(10)).toThrow(/неподдерживаемая версия схемы/);
   });
 
   test("timestamp по формату §16.1", () => {
@@ -237,7 +241,7 @@ describe("backup identifier and publication safety", () => {
     expect(() => validateRecordCountTables(incompleteSchema5, new Set(), 5))
       .toThrow(/migration_row_commit/);
     expect(() => validateRecordCountTables(schema4, new Set(), 6))
-      .toThrow(/неподдерживаемая версия схемы/);
+      .toThrow(/migration_quarantine/);
   });
 
   test("manifest recordCounts injection is rejected during parsing", () => {
@@ -260,7 +264,7 @@ describe("backup identifier and publication safety", () => {
     expect(() => parseBackupManifest({
       createdAt: "2026-07-26T00:00:00.000Z",
       surrealdbVersion: "3.2.3",
-      schemaVersion: 6,
+      schemaVersion: 10,
       bakaCommit: "test",
       namespace: "baka_test",
       database: "archive_test",

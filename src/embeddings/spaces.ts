@@ -116,6 +116,7 @@ export async function createSpace(
       `DEFINE FIELD vector ON TABLE ${table} TYPE array<float>;\n` +
       `DEFINE FIELD prompt_tokens ON TABLE ${table} TYPE int;\n` +
       `DEFINE FIELD created_at ON TABLE ${table} TYPE datetime;\n` +
+      `DEFINE INDEX search_document_idx ON TABLE ${table} FIELDS search_document;\n` +
       `DEFINE INDEX vector_hnsw ON TABLE ${table} FIELDS vector ` +
       `HNSW DIMENSION ${options.dimensions} TYPE ${vectorType} DIST ${distance};`,
   );

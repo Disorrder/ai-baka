@@ -24,9 +24,13 @@ async function durableSchemaTables(maxVersion: number): Promise<string[]> {
 }
 
 describe("backup core table coverage", () => {
-  test("schema 4 and 5 exactly cover their durable numbered-schema and bootstrap tables", async () => {
+  test("schemas 4–9 exactly cover their durable numbered-schema and bootstrap tables", async () => {
     expect(new Set(CORE_TABLES).size).toBe(CORE_TABLES.length);
     expect([...coreTablesForSchemaVersion(4)].sort()).toEqual(await durableSchemaTables(4));
     expect([...coreTablesForSchemaVersion(5)].sort()).toEqual(await durableSchemaTables(5));
+    expect([...coreTablesForSchemaVersion(6)].sort()).toEqual(await durableSchemaTables(6));
+    expect([...coreTablesForSchemaVersion(7)].sort()).toEqual(await durableSchemaTables(7));
+    expect([...coreTablesForSchemaVersion(8)].sort()).toEqual(await durableSchemaTables(8));
+    expect([...coreTablesForSchemaVersion(9)].sort()).toEqual(await durableSchemaTables(9));
   });
 });

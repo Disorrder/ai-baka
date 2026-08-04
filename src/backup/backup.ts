@@ -84,17 +84,23 @@ export const SCHEMA_5_CORE_TABLES = [
 /** Все core-таблицы текущей схемы; динамические search_embedding_* добавляются из БД. */
 export const CORE_TABLES = [...SCHEMA_4_CORE_TABLES, ...SCHEMA_5_CORE_TABLES] as const;
 
-export type SupportedBackupSchemaVersion = 4 | 5;
+export type SupportedBackupSchemaVersion = 4 | 5 | 6 | 7 | 8 | 9;
+export function isSupportedBackupSchemaVersion(
+  schemaVersion: number,
+): schemaVersion is SupportedBackupSchemaVersion {
+  return Number.isSafeInteger(schemaVersion) && schemaVersion >= 4 && schemaVersion <= 9;
+}
+
 
 /**
- * Backup/restore intentionally support only the two on-disk schemas that can
- * occur around migration 0005. Guessing a table set for any other version
+ * Backup/restore intentionally support only known on-disk schemas. Guessing a
+ * table set for any other version
  * could publish a manifest that silently omits durable data.
  */
 export function coreTablesForSchemaVersion(schemaVersion: number): readonly string[] {
   if (schemaVersion === 4) return SCHEMA_4_CORE_TABLES;
-  if (schemaVersion === 5) return CORE_TABLES;
-  throw new Error(`backup: неподдерживаемая версия схемы ${schemaVersion}; ожидается 4 или 5`);
+  if (isSupportedBackupSchemaVersion(schemaVersion)) return CORE_TABLES;
+  throw new Error(`backup: неподдерживаемая версия схемы ${schemaVersion}; ожидается 4–9`);
 }
 
 export interface BackupManifest {

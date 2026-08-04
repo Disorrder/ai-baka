@@ -41,7 +41,7 @@ import {
   messageRecordId,
   searchDocumentRecordId,
 } from "../../sync/canonical-hash.ts";
-import { sha256hex } from "../transactions.ts";
+import { deterministicId, sha256hex } from "../transactions.ts";
 import { clean, selectOne } from "./helpers.ts";
 
 export interface DialogueTxInput {
@@ -80,6 +80,9 @@ export interface DialogueWriteResult {
   embeddingJobCount: number;
 }
 
+const STAGED_WRITE_CHUNK_THRESHOLD = 250;
+const STAGED_WRITE_CONTENT_CHARS_THRESHOLD = 500_000;
+
 /** primary_model (план §7.3): самая частая модель assistant messages; при равенстве — последняя. */
 export function primaryModelKey(parsed: ParsedDialogue): string | undefined {
   const counts = new Map<string, { count: number; lastSeq: number }>();
@@ -108,6 +111,15 @@ export function modelKeyOf(message: ParsedMessage): string | undefined {
   return message.model
     ? `${message.model.vendor}/${message.model.canonicalName}`
     : undefined;
+}
+
+/** JS code point count; matches SurrealDB string::len character semantics for backfill. */
+export function contentChars(content: string): number {
+  return Array.from(content).length;
+}
+
+function messageContentChars(message: ParsedMessage): number {
+  return message.chunks.reduce((total, chunk) => total + contentChars(chunk.content ?? ""), 0);
 }
 
 export interface PreparedSearchDoc {
@@ -236,10 +248,124 @@ function messageFields(
     ["raw_model_name", message.model?.rawModelName],
     ["reasoning_effort", message.model?.reasoningEffort],
     ["service_provider", message.model?.serviceProvider],
+    ["response_wait_ms", message.responseWaitMs],
+    ["response_status", message.responseStatus],
+    ["response_completed_at", message.responseCompletedAt],
+    ["response_turn_id", message.responseTurnId],
+    ["content_chars", messageContentChars(message)],
     ["usage", usage ? clean(usage) : undefined],
     ["raw_usage_events", message.usageEvents.length > 0 ? clean(message.usageEvents) : undefined],
     ["metadata", Object.keys(message.metadata).length > 0 ? clean(message.metadata) : undefined],
   ];
+}
+
+function fieldObject(fields: Array<[string, unknown]>): Record<string, unknown> {
+  return Object.fromEntries(fields.filter(([, value]) => value !== undefined));
+}
+
+function addBulkInsert(
+  tx: TxBuilder,
+  table: "message" | "chunk" | "search_document" | "embedding_job",
+  rows: Array<Record<string, unknown>>,
+): void {
+  if (rows.length === 0) return;
+  const batchSize =
+    table === "message" || table === "chunk" ? 25 : table === "search_document" ? 250 : 1000;
+  for (let i = 0; i < rows.length; i += batchSize) {
+    tx.add(`INSERT INTO ${table} ${tx.param(rows.slice(i, i + batchSize))} RETURN NONE;`);
+  }
+}
+
+async function insertRowsInBatches(
+  db: Surreal,
+  table: "message" | "chunk",
+  rows: Array<Record<string, unknown>>,
+): Promise<void> {
+  if (rows.length === 0) return;
+  const batchSize = 25;
+  for (let i = 0; i < rows.length; i += batchSize) {
+    await db.query(`INSERT INTO ${table} $rows RETURN NONE`, {
+      rows: rows.slice(i, i + batchSize),
+    });
+  }
+}
+
+async function deleteRecordIds(db: Surreal, ids: RecordId[], batchSize = 1000): Promise<void> {
+  for (let i = 0; i < ids.length; i += batchSize) {
+    await db.query("DELETE $ids RETURN NONE", { ids: ids.slice(i, i + batchSize) });
+  }
+}
+
+function messageRows(
+  parsed: ParsedDialogue,
+  input: DialogueTxInput,
+  revisionKey: string,
+  dialogueId: RecordId,
+  revisionId: RecordId,
+): Array<Record<string, unknown>> {
+  return parsed.messages.map((message) => ({
+    id: new RecordId("message", messageRecordId(revisionKey, message.sequence)),
+    dialogue: dialogueId,
+    dialogue_revision: revisionId,
+    ...fieldObject(messageFields(message, input.modelIds)),
+  }));
+}
+
+function chunkRows(
+  parsed: ParsedDialogue,
+  revisionKey: string,
+  dialogueId: RecordId,
+  revisionId: RecordId,
+): Array<Record<string, unknown>> {
+  const rows: Array<Record<string, unknown>> = [];
+  for (const message of parsed.messages) {
+    const messageId = new RecordId("message", messageRecordId(revisionKey, message.sequence));
+    for (const chunk of message.chunks) {
+      const content = chunk.content ?? "";
+      rows.push({
+        id: new RecordId("chunk", chunkRecordId(revisionKey, message.sequence, chunk.sequence)),
+        dialogue: dialogueId,
+        dialogue_revision: revisionId,
+        message: messageId,
+        ...fieldObject([
+          ["sequence", chunk.sequence],
+          ["kind", chunk.kind],
+          ["raw_kind", chunk.rawKind],
+          ["role", message.role],
+          ["content", content],
+          ["content_sha256", sha256hex(content)],
+          ["content_bytes", Buffer.byteLength(content, "utf8")],
+          ["content_chars", contentChars(content)],
+          ["source_locator", chunk.sourceLocator],
+          ["tool_call_id", chunk.toolCallId],
+          ["tool_name", chunk.toolName],
+          ["raw_event_type", chunk.rawEventType],
+          ["metadata", Object.keys(chunk.metadata).length > 0 ? clean(chunk.metadata) : undefined],
+        ]),
+      });
+    }
+  }
+  return rows;
+}
+
+function messageIds(parsed: ParsedDialogue, revisionKey: string): RecordId[] {
+  return parsed.messages.map(
+    (message) => new RecordId("message", messageRecordId(revisionKey, message.sequence)),
+  );
+}
+
+function chunkIds(parsed: ParsedDialogue, revisionKey: string): RecordId[] {
+  const ids: RecordId[] = [];
+  for (const message of parsed.messages) {
+    for (const chunk of message.chunks) {
+      ids.push(new RecordId("chunk", chunkRecordId(revisionKey, message.sequence, chunk.sequence)));
+    }
+  }
+  return ids;
+}
+
+function searchDocumentIds(docs: PreparedSearchDoc[]): RecordId[] {
+  return docs.map((doc) => new RecordId("search_document", doc.recordKey));
 }
 
 /** statements создания search_documents + embedding_jobs (общие для обоих путей). */
@@ -252,49 +378,50 @@ function addSearchProjection(
     enqueueEmbeddings: boolean;
   },
   revisionKey: string,
-  messageRef: (sequence: number) => string,
+  dialogueId: RecordId,
+  revisionId: RecordId,
+  messageRef: (sequence: number) => RecordId,
 ): number {
   let jobCount = 0;
-  let k = 0;
+  const searchRows: Array<Record<string, unknown>> = [];
+  const jobRows: Array<Record<string, unknown>> = [];
   for (const doc of docs) {
-    const docVar = `$sd${k++}`;
-    const messageLink =
-      doc.messageSequence !== undefined ? `message = ${messageRef(doc.messageSequence)}` : undefined;
-    tx.add(
-      `LET ${docVar} = (CREATE ONLY type::record("search_document", ${tx.param(doc.recordKey)}) SET ` +
-        [
-          "dialogue = $dlgId",
-          "dialogue_revision = $revId",
-          messageLink,
-          ...[
-            ["document_type", doc.documentType],
-            ["segment_no", doc.segmentNo],
-            ["content", doc.content],
-            ["content_sha256", doc.contentSha256],
-            ["token_count", doc.tokenCount],
-            ["source_chunks", doc.chunkIds],
-            ["extraction_method", doc.method],
-            ["extraction_version", String(input.extractors.extractorVersion)],
-            ["segmentation_version", SEGMENTATION_VERSION],
-            ["created_at", new Date()],
-          ].map(([field, value]) => `${field} = ${tx.param(value)}`),
-        ]
-          .filter(Boolean)
-          .join(", ") +
-        `).id;`,
-    );
+    const searchDocumentId = new RecordId("search_document", doc.recordKey);
+    searchRows.push({
+      id: searchDocumentId,
+      dialogue: dialogueId,
+      dialogue_revision: revisionId,
+      ...fieldObject([
+        ["message", doc.messageSequence !== undefined ? messageRef(doc.messageSequence) : undefined],
+        ["document_type", doc.documentType],
+        ["segment_no", doc.segmentNo],
+        ["content", doc.content],
+        ["content_sha256", doc.contentSha256],
+        ["token_count", doc.tokenCount],
+        ["source_chunks", doc.chunkIds],
+        ["extraction_method", doc.method],
+        ["extraction_version", String(input.extractors.extractorVersion)],
+        ["segmentation_version", SEGMENTATION_VERSION],
+        ["created_at", new Date()],
+      ]),
+    });
     if (!input.enqueueEmbeddings) continue;
     for (const space of input.activeEmbeddingSpaces) {
       const jobKey = embeddingJobRecordId(doc.recordKey, String(space));
-      tx.add(
-        `CREATE ONLY type::record("embedding_job", ${tx.param(jobKey)}) SET ` +
-          `search_document = ${docVar}, embedding_space = ${tx.param(space)}, ` +
-          `input_sha256 = ${tx.param(doc.contentSha256)}, status = "pending", attempts = 0, ` +
-          `created_at = ${tx.param(new Date())};`,
-      );
+      jobRows.push({
+        id: new RecordId("embedding_job", jobKey),
+        search_document: searchDocumentId,
+        embedding_space: space,
+        input_sha256: doc.contentSha256,
+        status: "pending",
+        attempts: 0,
+        created_at: new Date(),
+      });
       jobCount += 1;
     }
   }
+  addBulkInsert(tx, "search_document", searchRows);
+  addBulkInsert(tx, "embedding_job", jobRows);
   return jobCount;
 }
 
@@ -327,6 +454,29 @@ function dialogueUpsertStatement(tx: TxBuilder, input: DialogueTxInput): string 
   );
 }
 
+function dialogueUpsertByIdStatement(
+  tx: TxBuilder,
+  input: DialogueTxInput,
+  dialogueId: RecordId,
+  firstSeenAt: unknown,
+): string {
+  const parsed = input.parsed;
+  const now = new Date();
+  const base = tx.assignments([
+    ["identity_key", input.identityKey],
+    ["harness_installation", input.harnessInstallation],
+    ["os_account", input.osAccount],
+    ["workspace", input.workspace],
+    ["external_id", parsed.externalId],
+    ["title", parsed.title],
+    ["started_at", parsed.startedAt],
+    ["updated_at", parsed.updatedAt],
+    ["first_seen_at", firstSeenAt ?? now],
+    ["last_seen_at", now],
+  ]);
+  return `LET $dlgId = (UPSERT ONLY ${tx.param(dialogueId)} SET ${base}).id;`;
+}
+
 /** Удаление search projection (vectors + jobs + docs) указанных revisions. */
 function addProjectionDelete(tx: TxBuilder, revisionExpr: string, embeddingTables: string[] = []): void {
   // §8.1: при смене current revision удаляются и vectors физических таблиц
@@ -348,6 +498,155 @@ function addProjectionDelete(tx: TxBuilder, revisionExpr: string, embeddingTable
   tx.add(`DELETE search_document WHERE dialogue_revision = ${revisionExpr};`);
 }
 
+async function cleanupStagedRevision(
+  db: Surreal,
+  input: DialogueTxInput,
+  prepared: {
+    parsed: ParsedDialogue;
+    revisionKey: string;
+    revisionRid: RecordId;
+    docs: PreparedSearchDoc[];
+  },
+): Promise<void> {
+  const docIds = searchDocumentIds(prepared.docs);
+  for (const table of input.embeddingTables ?? []) {
+    if (!/^[a-zA-Z0-9_]+$/.test(table)) {
+      throw new Error(`небезопасное имя vector-таблицы: ${table}`);
+    }
+    if (docIds.length > 0) {
+      await db.query(`DELETE ${table} WHERE search_document INSIDE $docs RETURN NONE`, {
+        docs: docIds,
+      });
+    }
+  }
+  if (docIds.length > 0) {
+    await db.query("DELETE embedding_job WHERE search_document INSIDE $docs RETURN NONE", {
+      docs: docIds,
+    });
+    await deleteRecordIds(db, docIds, 500);
+  }
+  await deleteRecordIds(db, chunkIds(prepared.parsed, prepared.revisionKey), 500);
+  await deleteRecordIds(db, messageIds(prepared.parsed, prepared.revisionKey), 1000);
+  await db.query("DELETE $rid RETURN NONE", { rid: prepared.revisionRid });
+}
+
+async function writeDialogueRevisionStaged(
+  db: Surreal,
+  input: DialogueTxInput,
+  prepared: {
+    canonicalHash: string;
+    revisionKey: string;
+    revisionRid: RecordId;
+    docs: PreparedSearchDoc[];
+    primaryModel?: RecordId;
+    messageCount: number;
+    chunkCount: number;
+    dialogueRid: RecordId;
+    firstSeenAt?: unknown;
+  },
+): Promise<DialogueWriteResult> {
+  const parsed = input.parsed;
+  const lineage = parsed.metadata.lineage as Record<string, unknown> | undefined;
+  const createTx = new TxBuilder();
+  createTx.add("BEGIN;");
+  createTx.add(
+    dialogueUpsertByIdStatement(createTx, input, prepared.dialogueRid, prepared.firstSeenAt),
+  );
+  createTx.add(
+    `LET $revId = (CREATE ONLY type::record("dialogue_revision", ${createTx.param(prepared.revisionKey)}) SET ` +
+      [
+        "dialogue = $dlgId",
+        ...createTx
+          .assignments([
+            ["source_revision", input.sourceRevision],
+            ["source_dialogue_id", input.sourceDialogueId],
+            ["parser_name", input.parserName],
+            ["parser_version", String(input.parserVersion)],
+            ["canonical_hash", prepared.canonicalHash],
+            ["status", "writing"],
+            ["message_count", prepared.messageCount],
+            ["chunk_count", prepared.chunkCount],
+            ["started_at", parsed.startedAt],
+            ["updated_at", parsed.updatedAt],
+            ["parent_source_dialogue_id", lineage?.parentSourceDialogueId],
+            ["agent_depth", lineage?.depth],
+            ["agent_nickname", lineage?.nickname],
+            ["agent_role", lineage?.role],
+            ["created_at", new Date()],
+          ])
+          .split(", "),
+      ].join(", ") +
+      `).id;`,
+  );
+  createTx.add("COMMIT;");
+  createTx.add(`RETURN { dialogue: $dlgId, revision: $revId };`);
+  const createResult = await db.query<unknown[]>(createTx.statements.join("\n"), createTx.vars);
+  const created = createResult.at(-1) as { dialogue?: RecordId; revision?: RecordId } | undefined;
+  if (!created?.dialogue || !created.revision) {
+    throw new Error(
+      `staged dialogue create transaction оборвалась: RETURN не выполнен (получено ${createResult.length} результатов из ${createTx.statements.length} statements)`,
+    );
+  }
+
+  await insertRowsInBatches(
+    db,
+    "message",
+    messageRows(parsed, input, prepared.revisionKey, prepared.dialogueRid, prepared.revisionRid),
+  );
+  await insertRowsInBatches(
+    db,
+    "chunk",
+    chunkRows(parsed, prepared.revisionKey, prepared.dialogueRid, prepared.revisionRid),
+  );
+
+  const finalTx = new TxBuilder();
+  finalTx.add("BEGIN;");
+  finalTx.add(`LET $dlgId = ${finalTx.param(prepared.dialogueRid)};`);
+  finalTx.add(`LET $revId = ${finalTx.param(prepared.revisionRid)};`);
+  finalTx.add("LET $oldRev = (SELECT VALUE current_revision FROM ONLY $dlgId);");
+  finalTx.add("IF $oldRev != NONE AND $oldRev != $revId {");
+  addProjectionDelete(finalTx, "$oldRev", input.embeddingTables);
+  finalTx.add("};");
+  const jobCount = addSearchProjection(
+    finalTx,
+    prepared.docs,
+    input,
+    prepared.revisionKey,
+    prepared.dialogueRid,
+    prepared.revisionRid,
+    (seq) => new RecordId("message", messageRecordId(prepared.revisionKey, seq)),
+  );
+  finalTx.add(`UPDATE ONLY $revId SET status = "ready";`);
+  finalTx.add(
+    `UPDATE ONLY $dlgId SET ` +
+      finalTx.assignments([
+        ["current_revision", prepared.revisionRid],
+        ["updated_at", parsed.updatedAt],
+        ["last_seen_at", new Date()],
+      ]) +
+      `, primary_model = ${prepared.primaryModel ? finalTx.param(prepared.primaryModel) : "NONE"};`,
+  );
+  finalTx.add("COMMIT;");
+  finalTx.add(`RETURN { dialogue: $dlgId, revision: $revId };`);
+  const finalResult = await db.query<unknown[]>(finalTx.statements.join("\n"), finalTx.vars);
+  const returned = finalResult.at(-1) as { dialogue?: RecordId; revision?: RecordId } | undefined;
+  if (!returned?.dialogue || !returned.revision) {
+    throw new Error(
+      `staged dialogue final transaction оборвалась: RETURN не выполнен (получено ${finalResult.length} результатов из ${finalTx.statements.length} statements)`,
+    );
+  }
+  return {
+    dialogueId: returned.dialogue,
+    revisionId: returned.revision,
+    created: true,
+    switched: false,
+    messageCount: prepared.messageCount,
+    chunkCount: prepared.chunkCount,
+    searchDocumentCount: prepared.docs.length,
+    embeddingJobCount: jobCount,
+  };
+}
+
 /**
  * Записать один ParsedDialogue в БД атомарно (§10.4).
  * Определение «уже записано» — до транзакции; оба пути идемпотентны.
@@ -357,6 +656,7 @@ export async function writeDialogueRevision(
   input: DialogueTxInput,
 ): Promise<DialogueWriteResult> {
   const parsed = input.parsed;
+  const lineage = parsed.metadata.lineage as Record<string, unknown> | undefined;
   const canonicalHash = canonicalDialogueHash(parsed);
   const revisionKey = dialogueRevisionId(
     input.identityKey,
@@ -370,12 +670,33 @@ export async function writeDialogueRevision(
   const primaryModel = primaryKey ? input.modelIds.get(primaryKey) : undefined;
   const messageCount = parsed.messages.length;
   const chunkCount = parsed.messages.reduce((n, m) => n + m.chunks.length, 0);
-
-  const existing = await selectOne<{ dialogue: RecordId; current?: RecordId }>(
+  const contentCharCount = parsed.messages.reduce((n, m) => n + messageContentChars(m), 0);
+  const existingDialogue = await selectOne<{ id: RecordId; first_seen_at?: unknown }>(
     db,
-    "SELECT dialogue, dialogue.current_revision AS current FROM ONLY $rid",
+    "SELECT id, first_seen_at FROM dialogue WHERE identity_key = $key LIMIT 1",
+    { key: input.identityKey },
+  );
+  const dialogueRid =
+    existingDialogue?.id ?? new RecordId("dialogue", deterministicId("dlg", input.identityKey));
+
+  let existing = await selectOne<{ dialogue: RecordId; current?: RecordId; status?: string }>(
+    db,
+    "SELECT dialogue, dialogue.current_revision AS current, status FROM ONLY $rid",
     { rid: revisionRid },
   );
+
+  if (existing && existing.status !== "ready") {
+    if (existing.current && String(existing.current) === String(revisionRid)) {
+      throw new Error(`dialogue revision ${revisionRid} имеет status=${existing.status} и уже current`);
+    }
+    await cleanupStagedRevision(db, input, {
+      parsed,
+      revisionKey,
+      revisionRid,
+      docs,
+    });
+    existing = undefined;
+  }
 
   if (existing) {
     const dialogueId = existing.dialogue;
@@ -406,8 +727,14 @@ export async function writeDialogueRevision(
     tx.add("};");
     // Leftovers этой revision (на случай прошлого сбоя) — тоже пересоздаём.
     addProjectionDelete(tx, "$revId", input.embeddingTables);
-    const jobCount = addSearchProjection(tx, docs, input, revisionKey, (seq) =>
-      tx.param(new RecordId("message", messageRecordId(revisionKey, seq))),
+    const jobCount = addSearchProjection(
+      tx,
+      docs,
+      input,
+      revisionKey,
+      dialogueId,
+      revisionRid,
+      (seq) => new RecordId("message", messageRecordId(revisionKey, seq)),
     );
     tx.add(
       `UPDATE ONLY $dlgId SET ` +
@@ -445,10 +772,34 @@ export async function writeDialogueRevision(
     };
   }
 
+  if (
+    chunkCount > STAGED_WRITE_CHUNK_THRESHOLD ||
+    contentCharCount > STAGED_WRITE_CONTENT_CHARS_THRESHOLD
+  ) {
+    return await writeDialogueRevisionStaged(db, input, {
+      canonicalHash,
+      revisionKey,
+      revisionRid,
+      docs,
+      primaryModel,
+      messageCount,
+      chunkCount,
+      dialogueRid,
+      firstSeenAt: existingDialogue?.first_seen_at,
+    });
+  }
+
   // Полная транзакция создания (§10.4).
   const tx = new TxBuilder();
   tx.add("BEGIN;");
-  tx.add(dialogueUpsertStatement(tx, input));
+  tx.add(
+    dialogueUpsertByIdStatement(
+      tx,
+      input,
+      dialogueRid,
+      existingDialogue?.first_seen_at,
+    ),
+  );
   tx.add(
     `LET $revId = (CREATE ONLY type::record("dialogue_revision", ${tx.param(revisionKey)}) SET ` +
       [
@@ -465,52 +816,27 @@ export async function writeDialogueRevision(
             ["chunk_count", chunkCount],
             ["started_at", parsed.startedAt],
             ["updated_at", parsed.updatedAt],
+            ["parent_source_dialogue_id", lineage?.parentSourceDialogueId],
+            ["agent_depth", lineage?.depth],
+            ["agent_nickname", lineage?.nickname],
+            ["agent_role", lineage?.role],
             ["created_at", new Date()],
           ])
           .split(", "),
       ].join(", ") +
       `).id;`,
   );
-  for (const message of parsed.messages) {
-    const mKey = messageRecordId(revisionKey, message.sequence);
-    tx.add(
-      `LET $m${message.sequence} = (CREATE ONLY type::record("message", ${tx.param(mKey)}) SET ` +
-        ["dialogue = $dlgId", "dialogue_revision = $revId", ...tx.assignments(messageFields(message, input.modelIds)).split(", ")].join(", ") +
-        `).id;`,
-    );
-    for (const chunk of message.chunks) {
-      const content = chunk.content ?? "";
-      // Parser v2 preserves unknown events without truncation. Returning
-      // every created chunk would mirror all of that content in the RPC
-      // response even though the writer never consumes it; RETURN NONE
-      // keeps the one-query transaction while bounding response memory.
-      tx.add(
-        `CREATE ONLY type::record("chunk", ${tx.param(chunkRecordId(revisionKey, message.sequence, chunk.sequence))}) SET ` +
-          [
-            "dialogue = $dlgId",
-            "dialogue_revision = $revId",
-            `message = $m${message.sequence}`,
-            ...tx
-              .assignments([
-                ["sequence", chunk.sequence],
-                ["kind", chunk.kind],
-                ["raw_kind", chunk.rawKind],
-                ["role", message.role],
-                ["content", content],
-                ["content_sha256", sha256hex(content)],
-                ["content_bytes", Buffer.byteLength(content, "utf8")],
-                ["source_locator", chunk.sourceLocator],
-                ["tool_call_id", chunk.toolCallId],
-                ["tool_name", chunk.toolName],
-                ["raw_event_type", chunk.rawEventType],
-                ["metadata", Object.keys(chunk.metadata).length > 0 ? clean(chunk.metadata) : undefined],
-              ])
-              .split(", "),
-          ].join(", ") + ` RETURN NONE;`,
-      );
-    }
-  }
-  const jobCount = addSearchProjection(tx, docs, input, revisionKey, (seq) => `$m${seq}`);
+  addBulkInsert(tx, "message", messageRows(parsed, input, revisionKey, dialogueRid, revisionRid));
+  addBulkInsert(tx, "chunk", chunkRows(parsed, revisionKey, dialogueRid, revisionRid));
+  const jobCount = addSearchProjection(
+    tx,
+    docs,
+    input,
+    revisionKey,
+    dialogueRid,
+    revisionRid,
+    (seq) => new RecordId("message", messageRecordId(revisionKey, seq)),
+  );
   tx.add("LET $oldRev = (SELECT VALUE current_revision FROM ONLY $dlgId);");
   tx.add("IF $oldRev != NONE AND $oldRev != $revId {");
   addProjectionDelete(tx, "$oldRev", input.embeddingTables);
@@ -576,8 +902,14 @@ export async function replaceSearchProjection(
   tx.add(`LET $dlgId = ${tx.param(input.dialogueId)};`);
   tx.add(`LET $revId = ${tx.param(input.revisionId)};`);
   addProjectionDelete(tx, "$revId", input.embeddingTables);
-  const jobCount = addSearchProjection(tx, input.docs, input, input.revisionKey, (seq) =>
-    tx.param(new RecordId("message", messageRecordId(input.revisionKey, seq))),
+  const jobCount = addSearchProjection(
+    tx,
+    input.docs,
+    input,
+    input.revisionKey,
+    input.dialogueId,
+    input.revisionId,
+    (seq) => new RecordId("message", messageRecordId(input.revisionKey, seq)),
   );
   tx.add("COMMIT;");
   tx.add("RETURN { revision: $revId };");

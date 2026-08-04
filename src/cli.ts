@@ -5090,8 +5090,8 @@ async function applyMigrationOperatorExclusions(
     const snapshot = await ensureLegacySnapshot(options.legacyDb, cfg.archiveRoot);
     db = await connectDb(cfg);
     const schemaVersion = await checkSchemaVersion(db);
-    if (schemaVersion !== 5) {
-      throw new Error(`operator exclusions require exact schema 5; current ${schemaVersion}`);
+    if (schemaVersion < 5 || schemaVersion > 9) {
+      throw new Error(`operator exclusions require schema 5–9; current ${schemaVersion}`);
     }
     const report = await applyOperatorExclusions({
       db,

@@ -28,6 +28,7 @@ import { validateEmbeddingState } from "../validate.ts";
 import { hashFile } from "../sources/snapshot/hashing.ts";
 import {
   latestExportPath,
+  isSupportedBackupSchemaVersion,
   manifestPathForExport,
   ownedEmbeddingTables,
   parseBackupManifest,
@@ -556,8 +557,8 @@ export function restoreRelationalChecksForSchemaVersion(
   schemaVersion: number,
 ): ReadonlyArray<readonly [string, string]> {
   if (schemaVersion === 4) return SCHEMA_4_RESTORE_RELATIONAL_CHECKS;
-  if (schemaVersion === 5) return RESTORE_RELATIONAL_CHECKS;
-  throw new Error(`restore:test: unsupported schema ${schemaVersion}; expected 4 or 5`);
+  if (schemaVersion >= 5 && schemaVersion <= 9) return RESTORE_RELATIONAL_CHECKS;
+  throw new Error(`restore:test: unsupported schema ${schemaVersion}; expected 4–9`);
 }
 
 async function invalidSearchSourceChunks(db: Surreal): Promise<number> {
@@ -707,8 +708,8 @@ export function requiredRestoreCheckNamesForSchemaVersion(
   schemaVersion: number,
 ): readonly string[] {
   if (schemaVersion === 4) return COMMON_REQUIRED_RESTORE_CHECK_NAMES;
-  if (schemaVersion === 5) return REQUIRED_RESTORE_CHECK_NAMES;
-  throw new Error(`restore report: unsupported schema ${schemaVersion}; expected 4 or 5`);
+  if (schemaVersion >= 5 && schemaVersion <= 9) return REQUIRED_RESTORE_CHECK_NAMES;
+  throw new Error(`restore report: unsupported schema ${schemaVersion}; expected 4–9`);
 }
 
 const RESTORE_FINAL_CHECK_NAMES = [
@@ -1113,7 +1114,7 @@ export function parsePersistedRestoreTestReport(value: unknown): PersistedRestor
   const schemaVersion = raw.schemaVersion;
   if (
     !Number.isSafeInteger(raw.exportBytes) || (raw.exportBytes as number) < 1 ||
-    (schemaVersion !== 4 && schemaVersion !== 5) ||
+    (typeof schemaVersion !== "number" || !isSupportedBackupSchemaVersion(schemaVersion)) ||
     !Number.isSafeInteger(raw.searchDocuments) || (raw.searchDocuments as number) < 0 ||
     !Number.isSafeInteger(raw.chunks) || (raw.chunks as number) < 0
   ) {
@@ -1680,7 +1681,8 @@ export async function runRestoreTest(
         ...(exportSha256 ? { exportSha256 } : {}),
         ...(manifestPath ? { manifestFile: path.basename(manifestPath) } : {}),
         ...(manifestSha256 ? { manifestSha256 } : {}),
-        ...(manifest?.schemaVersion === 4 || manifest?.schemaVersion === 5
+        ...(manifest?.schemaVersion !== undefined &&
+            isSupportedBackupSchemaVersion(manifest.schemaVersion)
           ? { schemaVersion: manifest.schemaVersion }
           : {}),
         checks,

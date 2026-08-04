@@ -35,6 +35,7 @@ import { hashFile } from "../sources/snapshot/hashing.ts";
 import { HARNESS_TOOLS } from "../sync/harness-tools.ts";
 import type { HarnessSlug } from "../sources/adapters/harnesses.ts";
 import {
+  contentChars,
   modelKeyOf,
   prepareSearchDocuments,
   primaryModelKey,
@@ -1084,6 +1085,10 @@ function optionalInt(row: LegacySqlRow, name: string): number | undefined {
 
 function recordKey(id: RecordId): string {
   return typeof id.id === "string" ? id.id : String(id.id);
+}
+
+function messageContentChars(message: ParsedMessage): number {
+  return message.chunks.reduce((total, chunk) => total + contentChars(chunk.content ?? ""), 0);
 }
 
 class MigrationTxBuilder {
@@ -4015,6 +4020,11 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
             ["raw_model_name", message.model?.rawModelName],
             ["reasoning_effort", message.model?.reasoningEffort],
             ["service_provider", message.model?.serviceProvider],
+            ["response_wait_ms", message.responseWaitMs],
+            ["response_status", message.responseStatus],
+            ["response_completed_at", message.responseCompletedAt],
+            ["response_turn_id", message.responseTurnId],
+            ["content_chars", messageContentChars(message)],
             ["usage", usage ? clean(usage) : undefined],
             ["raw_usage_events", message.usageEvents.length > 0 ? clean(message.usageEvents) : undefined],
             ["metadata", Object.keys(message.metadata).length > 0 ? clean(message.metadata) : undefined],
@@ -4038,6 +4048,7 @@ export class SurrealLegacyMigrationBackend implements LegacyMigrationBackend {
               ["content", content],
               ["content_sha256", sha256hex(content)],
               ["content_bytes", Buffer.byteLength(content, "utf8")],
+              ["content_chars", contentChars(content)],
               ["source_locator", chunk.sourceLocator],
               ["tool_call_id", chunk.toolCallId],
               ["tool_name", chunk.toolName],
