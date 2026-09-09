@@ -30,22 +30,12 @@ export function formatSyncSummary(
     lines.push(rest);
   }
 
+  const sections: { title: string; rows: [string, string][] }[] = [];
   function section(title: string, metrics: [string, string][]) {
-    lines.push("");
-    append(title);
-    const cells = metrics.map(([key, label]) => `${label}: ${number.format(summary.counters[key] ?? 0)}`);
-    let count = Math.min(3, cells.length);
-    let widths: number[] = [];
-    for (; count >= 1; count--) {
-      widths = Array.from({ length: count }, (_, column) =>
-        Math.max(...cells.filter((_, index) => index % count === column).map((cell) => Bun.stringWidth(cell))));
-      if (2 + widths.reduce((sum, value) => sum + value, 0) + (count - 1) * 3 <= width || count === 1) break;
-    }
-    for (let start = 0; start < cells.length; start += count) {
-      const row = cells.slice(start, start + count);
-      append(`  ${row.map((cell, index) => index === row.length - 1 ? cell
-        : cell + " ".repeat(widths[index]! - Bun.stringWidth(cell))).join("   ")}`);
-    }
+    sections.push({
+      title,
+      rows: metrics.map(([key, label]) => [label, number.format(summary.counters[key] ?? 0)]),
+    });
   }
 
   const status: Record<string, string> = {
@@ -59,15 +49,6 @@ export function formatSyncSummary(
   append(`Ошибки обработки: ${number.format(summary.counters.ingestErrors ?? 0)}`);
   for (const error of summary.errors) append(`Ошибка: ${error}`);
 
-  section("Диалоги и содержимое", [
-    ["dialoguesWritten", "Обработано диалогов"],
-    ["messagesWritten", "Записано сообщений"],
-    ["chunksWritten", "Фрагментов сообщений"],
-  ]);
-  section("Поиск", [
-    ["searchDocuments", "Текстов для поиска"],
-    ["embeddingJobs", "Заданий на векторизацию"],
-  ]);
   section("Исходные файлы", [
     ["filesNew", "Новых файлов"],
     ["filesChanged", "Изменённых файлов"],
@@ -75,10 +56,40 @@ export function formatSyncSummary(
   ]);
   section("Детали сканирования и архива", [
     ["roots", "Источников проверено"],
-    ["filesSeen", "Файлов найдено"],
+    ["filesSeen", "Всего файлов"],
     ["filesDuplicateSkipped", "Дубликатов пропущено"],
-    ["revisionsCreated", "Новых снимков файлов"],
   ]);
+  section("Диалоги и содержимое", [
+    ["dialoguesWritten", "Обработано диалогов"],
+    ["messagesWritten", "Новых сообщений"],
+    ["chunksWritten", "Фрагментов сообщений"],
+  ]);
+  section("Поиск", [
+    ["searchDocuments", "Текстов для поиска"],
+    ["embeddingJobs", "Заданий на векторизацию"],
+  ]);
+  const rows = sections.flatMap((section) => section.rows);
+  const labelWidth = Math.max(...rows.map(([label]) => Bun.stringWidth(label)));
+  const valueWidth = Math.max(...rows.map(([, value]) => Bun.stringWidth(value)));
+  const bold = process.stdout.isTTY && !process.env.NO_COLOR && process.env.TERM !== "dumb";
+  for (const { title, rows } of sections) {
+    lines.push("");
+    const headingStart = lines.length;
+    append(`${title}:`);
+    if (bold) {
+      for (let index = headingStart; index < lines.length; index++) {
+        lines[index] = `\x1b[1m${lines[index]}\x1b[22m`;
+      }
+    }
+    for (const [label, value] of rows) {
+      if (2 + labelWidth + 3 + valueWidth <= width) {
+        lines.push(`  ${label}${" ".repeat(labelWidth - Bun.stringWidth(label))}   ${
+          " ".repeat(valueWidth - Bun.stringWidth(value))}${value}`);
+      } else {
+        append(`  ${label}: ${value}`);
+      }
+    }
+  }
   return lines.join("\n");
 }
 
