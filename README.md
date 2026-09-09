@@ -30,8 +30,17 @@ raw-архива, а не местом, куда напрямую перекла
   [--deletion-confirmations <n>] [--no-enqueue-embeddings] [--dry-run] [--json]` —
   structured sync: discovery → scan → immutable raw snapshot → parse →
   транзакции диалогов → search_documents → embedding jobs (только при
-  active embedding space; сам OpenAI не вызывается). Лог событий — JSON
-  lines в stderr;
+  active embedding space; сам OpenAI не вызывается). `bun sync` запускает
+  ту же команду. В интерактивном терминале stderr показывает живой индикатор:
+  1/5 — preflight, блокировка и БД; 2/5 — discovery; 3/5 — дедупликация;
+  4/5 — обработка источников; 5/5 — финализация. Для каждого источника видны
+  текущая операция и счётчики файлов (для kimi parse — сессий). Пока дерево
+  обходится, показано только «найдено N»: точный total известен после обхода,
+  дополнительного прохода ради подсчёта нет. Полоса относится к текущей
+  операции, а не к оценке оставшегося времени всего sync.
+  `--json`, перенаправленный stderr и `TERM=dumb` сохраняют JSONL-лог событий
+  в stderr с периодическими `sync_progress`; итоговый stdout не смешивается
+  с прогрессом. `NO_COLOR` отключает цвет; ошибки остаются видимыми;
 - `baka search <query> [--mode <text|vector|hybrid>] [--harness <slug>]
   [--host <label|hostname>] [--user <os-username>] [--workspace <name>]
   [--vendor <slug>] [--model <name>] [--reasoning-effort <value>]

@@ -74,6 +74,7 @@ import { selectOne } from "../db/repositories/helpers.ts";
 import { listEmbeddingTables } from "../embeddings/spaces.ts";
 import { headFileHash } from "./head-hash.ts";
 import type { PresenceStatus } from "./deletion-detector.ts";
+import type { SyncProgress } from "./progress.ts";
 
 export interface SyncOptions {
   harness?: HarnessSlug;
@@ -86,6 +87,7 @@ export interface SyncOptions {
   preflight?: boolean;
   hostIdPath?: string;
   logger?: (event: Record<string, unknown>) => void;
+  onProgress?: (progress: SyncProgress) => void;
   /** Deterministic test seam; production always uses snapshotSource. */
   snapshotSource?: typeof snapshotSource;
 }
@@ -163,6 +165,7 @@ async function sourcePathForScannedFile(rootPath: string, relativePath: string):
 async function buildCodexNativeDuplicateSha256Index(
   roots: DiscoveredSourceRoot[],
   log: Logger,
+  progress?: (progress: SyncProgress) => void,
 ): Promise<Set<string> | undefined> {
   const hasOrcaCodexRuntime = roots.some((root) => root.enabled && isOrcaCodexRuntimeRoot(root));
   if (!hasOrcaCodexRuntime) return undefined;
@@ -176,10 +179,18 @@ async function buildCodexNativeDuplicateSha256Index(
   let filesIndexed = 0;
   let errors = 0;
   for (const root of nativeRoots) {
-    const scan = await scanSourceRoot(root.path, HARNESS_FILE_MATCHERS.codex);
+    const report = (detail: string, completed: number, total?: number) =>
+      progress?.({ stage: 3, detail, completed, total, unit: "файлов", root: root.harness });
+    const scan = await scanSourceRoot(root.path, HARNESS_FILE_MATCHERS.codex,
+      (found) => report("Поиск файлов для дедупликации", found));
+    let checked = 0;
+    report("SHA-256 для дедупликации", 0, scan.files.length);
     errors += scan.errors.length;
     for (const file of scan.files) {
-      if (!isJsonlSource(file.relativePath)) continue;
+      if (!isJsonlSource(file.relativePath)) {
+        report("SHA-256 для дедупликации", ++checked, scan.files.length);
+        continue;
+      }
       try {
         const sourcePath = await sourcePathForScannedFile(root.path, file.relativePath);
         hashes.add((await hashFile(sourcePath)).sha256);
@@ -193,6 +204,7 @@ async function buildCodexNativeDuplicateSha256Index(
           error: error instanceof Error ? error.message : String(error),
         });
       }
+      report("SHA-256 для дедупликации", ++checked, scan.files.length);
     }
   }
   log({
@@ -211,15 +223,19 @@ async function filterOrcaCodexDuplicateFiles(
   scan: ScanResult,
   nativeDuplicateSha256Index: Set<string> | undefined,
   log: Logger,
+  progress?: (completed: number, total: number) => void,
 ): Promise<ScanResult> {
   if (!isOrcaCodexRuntimeRoot(root) || !nativeDuplicateSha256Index?.size) return scan;
 
   const files: ScanResult["files"] = [];
   let skipped = 0;
   let errors = 0;
+  let checked = 0;
+  progress?.(0, scan.files.length);
   for (const file of scan.files) {
     if (!isJsonlSource(file.relativePath)) {
       files.push(file);
+      progress?.(++checked, scan.files.length);
       continue;
     }
     try {
@@ -227,6 +243,7 @@ async function filterOrcaCodexDuplicateFiles(
       const sha256 = (await hashFile(sourcePath)).sha256;
       if (nativeDuplicateSha256Index.has(sha256)) {
         skipped += 1;
+        progress?.(++checked, scan.files.length);
         continue;
       }
       files.push(file);
@@ -240,6 +257,7 @@ async function filterOrcaCodexDuplicateFiles(
         error: error instanceof Error ? error.message : String(error),
       });
     }
+    progress?.(++checked, scan.files.length);
   }
   if (skipped > 0 || errors > 0) {
     log({
@@ -256,6 +274,7 @@ async function filterOrcaCodexDuplicateFiles(
 
 export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promise<SyncSummary> {
   const log = options.logger ?? defaultLogger;
+  const progress = options.onProgress;
   const deletionConfirmations = options.deletionConfirmations ?? cfg.deletionConfirmations;
   const enqueueEmbeddings = options.enqueueEmbeddings ?? true;
   const dryRun = options.dryRun ?? false;
@@ -276,7 +295,9 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
   };
   const errors: string[] = [];
 
+  progress?.({ stage: 1, detail: "Проверка архива" });
   if (options.preflight !== false) await assertPreflight(cfg);
+  progress?.({ stage: 1, detail: "Получение блокировки" });
   const release = await acquireLock(cfg.archiveRoot, dryRun ? "sync --dry-run" : "sync");
   let db: Surreal | undefined;
   let syncRunId: RecordId | undefined;
@@ -284,7 +305,9 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
   let primaryError: unknown;
   try {
     // connectDb внутри try: при ошибке подключения lock обязан освободиться.
+    progress?.({ stage: 1, detail: "Подключение к БД" });
     db = await connectDb(cfg);
+    progress?.({ stage: 1, detail: "Проверка схемы" });
     // §10.1 п.3: schema version.
     const schemaVersion = await checkSchemaVersion(db);
     const knownMigrations = await listMigrations();
@@ -296,6 +319,7 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
       );
     }
 
+    progress?.({ stage: 1, detail: "Определение host и пользователя" });
     // §10.1 п.6: host + os_account. dry-run — read-only режим: ничего не
     // создаёт и не обновляет (ни host/os_account, ни harness/source_root).
     let hostId: RecordId | undefined;
@@ -316,10 +340,12 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
     }
 
     // §10.1 п.7: discovery (+ фильтры CLI).
+    progress?.({ stage: 2, detail: "Поиск источников" });
     const discovery = await discoverSourceRoots({ overrides: cfg.sourceOverrides });
     let roots = discovery.roots;
     if (options.harness) roots = roots.filter((r) => r.harness === options.harness);
 
+    progress?.({ stage: 2, detail: "Подготовка запуска и embedding spaces", rootsCompleted: 0, rootsTotal: roots.length });
     if (!dryRun) {
       syncRunId = await createSyncRun(db, {
         kind: "live_sync",
@@ -348,10 +374,15 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
         reason: "нет active embedding_space — jobs не создаются (space и backfill — этап 7)",
       });
     }
-    const codexNativeDuplicateSha256Index = await buildCodexNativeDuplicateSha256Index(roots, log);
+    progress?.({ stage: 3, detail: "Подготовка дедупликации" });
+    const codexNativeDuplicateSha256Index = await buildCodexNativeDuplicateSha256Index(roots, log, progress);
 
     for (const root of roots) {
       counters.roots += 1;
+      const rootProgress = (detail: string, completed?: number, total?: number, unit = "файлов") =>
+        progress?.({ stage: 4, detail, completed, total, unit, root: root.harness,
+          rootsCompleted: counters.roots - 1, rootsTotal: roots.length });
+      rootProgress("Подготовка источника");
       try {
         const outcome = await processSourceRoot(db, cfg, {
           root,
@@ -366,6 +397,7 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
           fullRescan: options.fullRescan ?? false,
           dryRun,
           log,
+          progress: rootProgress,
           snapshot: options.snapshotSource ?? snapshotSource,
         });
         counters.filesSeen += outcome.filesSeen;
@@ -394,6 +426,8 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
           });
         }
       }
+      progress?.({ stage: 4, detail: "Источник обработан", root: root.harness,
+        rootsCompleted: counters.roots, rootsTotal: roots.length });
     }
 
     runStatus = errors.length > 0 || counters.ingestErrors > 0 ? "completed_with_errors" : "completed";
@@ -402,6 +436,7 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
     errors.push(error instanceof Error ? error.message : String(error));
     primaryError = error;
   } finally {
+    progress?.({ stage: 5, detail: "Сохранение итогов и закрытие БД" });
     if (syncRunId && db) {
       try {
         await finishSyncRun(db, syncRunId, {
@@ -434,6 +469,7 @@ export interface ReconcileScannedFilesOptions {
   resolvePath: (relativePath: string) => string;
   /** Seam для regression-тестов; production читает первые 64 КБ файла. */
   readHeadHash?: (filePath: string) => Promise<string | null>;
+  onProgress?: (completed: number, total: number) => void;
 }
 
 /**
@@ -460,15 +496,21 @@ export async function reconcileScannedFiles(
     mtimeMs: Math.round(file.mtimeMs),
   }));
 
+  let checked = 0;
+  options.onProgress?.(0, scanFiles.length);
   if (!options.fullRescan) {
     const readHeadHash = options.readHeadHash ?? headFileHash;
     for (const file of scanFiles) {
       const previousLocation = previousByPath.get(file.relativePath);
-      if (!previousLocation?.headHash) continue;
+      if (!previousLocation?.headHash) {
+        options.onProgress?.(++checked, scanFiles.length);
+        continue;
+      }
       if (
         previousLocation.sizeBytes !== file.sizeBytes ||
         previousLocation.mtimeMs !== file.mtimeMs
       ) {
+        options.onProgress?.(++checked, scanFiles.length);
         continue;
       }
       // null (не прочитался) → sentinel, гарантированно не совпадающий с
@@ -477,8 +519,10 @@ export async function reconcileScannedFiles(
       file.headHash =
         (await readHeadHash(options.resolvePath(file.relativePath))) ??
         `unreadable:${file.relativePath}`;
+      options.onProgress?.(++checked, scanFiles.length);
     }
   }
+  options.onProgress?.(scanFiles.length, scanFiles.length);
 
   return reconcileLocations(
     previous,
@@ -502,6 +546,7 @@ interface ProcessRootArgs {
   dryRun: boolean;
   log: Logger;
   snapshot: typeof snapshotSource;
+  progress: (detail: string, completed?: number, total?: number, unit?: string) => void;
 }
 
 async function processSourceRoot(
@@ -509,7 +554,7 @@ async function processSourceRoot(
   cfg: AppConfig,
   args: ProcessRootArgs,
 ): Promise<RootOutcome> {
-  const { root, log } = args;
+  const { root, log, progress } = args;
   const slug = root.harness;
   const tools = HARNESS_TOOLS[slug];
   const outcome = emptyOutcome();
@@ -549,12 +594,14 @@ async function processSourceRoot(
 
   // §10.2: обход root'а с явным статусом полноты.
   const scanStarted = new Date();
-  const rawScan = await scanSourceRoot(root.path, HARNESS_FILE_MATCHERS[slug]);
+  const rawScan = await scanSourceRoot(root.path, HARNESS_FILE_MATCHERS[slug],
+    (found) => progress("Обход дерева · найдено", found));
   const scan = await filterOrcaCodexDuplicateFiles(
     root,
     rawScan,
     args.codexNativeDuplicateSha256Index,
     log,
+    (completed, total) => progress("Проверка дубликатов", completed, total),
   );
   outcome.filesSeen = scan.files.length;
   outcome.filesDuplicateSkipped = rawScan.files.length - scan.files.length;
@@ -583,6 +630,7 @@ async function processSourceRoot(
   // Всё после создания source_scan — в try: при сбое scan не должен
   // зависнуть незавершённым (finished_at = NONE).
   try {
+    progress("Загрузка сохранённых locations");
     const prevRows = rootId ? await listLocations(db, rootId) : [];
     const prevByPath = new Map(prevRows.map((row) => [row.relative_path, row]));
     const previous: LocationState[] = prevRows.map((r) => ({
@@ -607,6 +655,7 @@ async function processSourceRoot(
       {
         fullRescan: args.fullRescan,
         deletionConfirmations: args.deletionConfirmations,
+        onProgress: (completed, total) => progress("Проверка файлов", completed, total),
         resolvePath: (relativePath) =>
           rootIsFile ? root.path : path.join(root.path, relativePath),
       },
@@ -636,6 +685,10 @@ async function processSourceRoot(
     const failedSnapshotPaths = new Set<string>();
     /** Неудавшийся snapshot НОВОГО файла: rename detection пропускаем (§10.7). */
     let newSnapshotFailed = false;
+    const snapshotTotal = reconcile.actions.reduce(
+      (count, action) => count + Number(action.kind === "new" || action.kind === "changed"), 0);
+    let snapshotsDone = 0;
+    progress("Снимки новых и изменённых файлов", 0, snapshotTotal);
     for (const action of reconcile.actions) {
       if (action.kind !== "new" && action.kind !== "changed") continue;
       const originalPath = rootIsFile ? root.path : path.join(root.path, action.relativePath);
@@ -677,6 +730,7 @@ async function processSourceRoot(
             `${action.relativePath}: ` +
             (error instanceof Error ? error.message : String(error)),
         });
+        progress("Снимки новых и изменённых файлов", ++snapshotsDone, snapshotTotal);
         continue;
       }
 
@@ -715,6 +769,7 @@ async function processSourceRoot(
         rawArchivePath: snapshot.rawArchivePath,
         sha256: snapshot.sha256,
       });
+      progress("Снимки новых и изменённых файлов", ++snapshotsDone, snapshotTotal);
     }
 
     // --- Phase C: parse + canonical write (§9.3 шаги 4–7, §10.4) ---
@@ -787,6 +842,8 @@ async function processSourceRoot(
     };
 
     if (tools.parseUnit === "file") {
+      let parsed = 0;
+      progress("Разбор и запись в БД", 0, pending.length);
       for (const p of pending) {
         const result = await ingestSourceRevision(ingestCtx, {
           sourceRevision: p.revisionId,
@@ -804,10 +861,12 @@ async function processSourceRoot(
           failed: result.dialoguesFailed,
           errors: result.errors,
         });
+        progress("Разбор и запись в БД", ++parsed, pending.length);
       }
     } else {
       // kimi-session: parse unit = каталог сессии, собранный из raw-файлов.
       const bySession = new Map<string, PendingParse[]>();
+      progress("Группировка файлов сессий");
       for (const p of pending) {
         const session = kimiSessionDir(p.relativePath);
         if (!session) {
@@ -825,6 +884,8 @@ async function processSourceRoot(
         bySession.set(session, group);
       }
       let viewCounter = 0;
+      let sessionsDone = 0;
+      progress("Разбор и запись в БД", 0, bySession.size, "сессий");
       for (const [sessionDir, group] of bySession) {
         const viewDir = path.join(
           cfg.archiveRoot,
@@ -874,11 +935,13 @@ async function processSourceRoot(
           });
         } finally {
           await rm(viewDir, { recursive: true, force: true }).catch(() => {});
+          progress("Разбор и запись в БД", ++sessionsDone, bySession.size, "сессий");
         }
       }
     }
 
     // Разрешение старых ingest_errors по всем re-parse'нутым revision (батчи).
+    progress("Разрешение ошибок прошлых запусков");
     await resolveStaleErrors();
 
     // --- Phase D: presence (§10.6) + rename detection (§10.7) ---
@@ -888,9 +951,13 @@ async function processSourceRoot(
         .filter((a) => a.kind === "missing" || a.kind === "deleted")
         .map((a) => [a.relativePath, a.kind] as const),
     );
+    let locationsDone = 0;
+    progress("Проверка наличия и удалений", 0, prevRows.length, "locations");
     for (const loc of reconcile.locations) {
       const row = prevByPath.get(loc.relativePath);
       if (!row) continue; // новые location'ы уже записаны в phase B
+      // Count the preceding location only after its DB update has completed.
+      progress("Проверка наличия и удалений", locationsDone++, prevRows.length, "locations");
       if (seenPaths.has(loc.relativePath)) {
         await updateLocationPresence(db, row.id, {
           presenceStatus: loc.presence.status,
@@ -911,10 +978,12 @@ async function processSourceRoot(
       });
       if (transition) log({ event: `location_${transition}`, path: loc.relativePath });
     }
+    progress("Проверка наличия и удалений", locationsDone, prevRows.length, "locations");
 
     // Rename detection (§10.7): sha новых файлов известны после phase B.
     // Неудавшийся snapshot нового файла создавал бы ложную однозначность
     // (невидимый второй кандидат) — detection пропускаем до следующего sync.
+    progress("Поиск переименований");
     if (scanComplete && !newSnapshotFailed) {
       const missingStates = reconcile.locations.filter(
         (l) => !seenPaths.has(l.relativePath) && l.presence.status !== "active",
@@ -943,6 +1012,7 @@ async function processSourceRoot(
       log({ event: "rename_detection_skipped", reason: "snapshot нового файла не удался" });
     }
 
+    progress("Сохранение итогов источника");
     if (scanId) {
       await finishSourceScan(db, scanId, {
         filesNew: outcome.filesNew,

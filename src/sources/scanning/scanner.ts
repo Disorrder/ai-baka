@@ -63,9 +63,11 @@ function toRelative(root: string, full: string): string {
 export async function scanSourceRoot(
   rootPath: string,
   matcher: FileMatcher = matchAll,
+  onProgress?: (filesFound: number) => void,
 ): Promise<ScanResult> {
   const files: ScannedFile[] = [];
   const errors: ScanError[] = [];
+  onProgress?.(0);
 
   let rootStat;
   try {
@@ -90,6 +92,7 @@ export async function scanSourceRoot(
         mtimeMs: rootStat.mtimeMs,
       });
     }
+    onProgress?.(files.length);
     return { status: "complete", files, errors };
   }
 
@@ -123,6 +126,7 @@ export async function scanSourceRoot(
       } catch (err) {
         errors.push(errorInfo(err, full));
       }
+      onProgress?.(files.length);
     }
   }
 

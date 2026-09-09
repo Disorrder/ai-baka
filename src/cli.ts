@@ -26,7 +26,8 @@ import { acquireLock } from "./infra/lock.ts";
 import { isLocked } from "./infra/lock.ts";
 import { readSentinel } from "./infra/sentinel.ts";
 import { discoverSourceRoots } from "./sources/discovery/discovery.ts";
-import { runSync } from "./sync/sync-run.ts";
+import { runSync, type SyncSummary } from "./sync/sync-run.ts";
+import { createSyncProgress, createSyncProgressLogger } from "./sync/progress.ts";
 import { HARNESSES, type HarnessSlug } from "./sources/adapters/harnesses.ts";
 import { collectStatus, formatStatus } from "./status.ts";
 import { runValidation } from "./validate.ts";
@@ -2484,16 +2485,26 @@ program
           throw new Error(`неизвестный harness: ${options.harness}`);
         }
         const cfg = loadConfig();
-        const summary = await runSync(cfg, {
-          harness: options.harness as HarnessSlug | undefined,
-          fullRescan: options.fullRescan,
-          deletionConfirmations:
-            options.deletionConfirmations && options.deletionConfirmations > 0
-              ? options.deletionConfirmations
-              : undefined,
-          enqueueEmbeddings: options.enqueueEmbeddings,
-          dryRun: options.dryRun,
-        });
+        const progress = process.stderr.isTTY && process.env.TERM !== "dumb" && !options.json
+          ? createSyncProgress()
+          : undefined;
+        let summary: SyncSummary;
+        try {
+          summary = await runSync(cfg, {
+            harness: options.harness as HarnessSlug | undefined,
+            fullRescan: options.fullRescan,
+            deletionConfirmations:
+              options.deletionConfirmations && options.deletionConfirmations > 0
+                ? options.deletionConfirmations
+                : undefined,
+            enqueueEmbeddings: options.enqueueEmbeddings,
+            dryRun: options.dryRun,
+            onProgress: progress?.update ?? createSyncProgressLogger(),
+            logger: progress?.log,
+          });
+        } finally {
+          progress?.stop();
+        }
         if (options.json) {
           console.log(JSON.stringify(summary, null, 2));
         } else {
