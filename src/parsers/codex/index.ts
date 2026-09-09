@@ -56,9 +56,10 @@ import {
 } from "../shared/jsonl.ts";
 import { normalizeModelName } from "../shared/model-normalization.ts";
 import { isSqliteFile } from "../shared/sqlite.ts";
+import { isCodexMetadataSqlite } from "./sqlite-metadata.ts";
 
 export const CODEX_PARSER_NAME = "codex";
-export const CODEX_PARSER_VERSION = 9;
+export const CODEX_PARSER_VERSION = 10;
 
 type ResponseStatus = "completed" | "aborted" | "incomplete";
 
@@ -114,21 +115,20 @@ export class CodexParser implements HarnessParser {
   readonly sourceFormatVersions = ["rollout-jsonl-1"] as const;
 
   async parse(snapshotPath: string, context?: ParseContext): Promise<ParsedSourceSnapshot> {
-    // ~/.codex/sqlite (state/logs/memories/goals и сторонние *.db): parser
-    // поддерживает только rollout-jsonl-1. SQLite архивируется как raw и
-    // помечается unsupported — одна диагностика вместо jsonl_parse_error
-    // на каждую строку бинарного файла (live acceptance, этап 8).
+    // Known service databases are raw-only, not failed transcripts. Unknown
+    // schemas and databases containing archived messages remain unsupported.
     if ((await isSqliteFile(snapshotPath)) === true) {
+      const metadataOnly = isCodexMetadataSqlite(snapshotPath);
       return {
         sourceKind: "file_tree",
         dialogues: (async function* () {})(),
         diagnostics: [
           {
-            code: "unsupported_file",
-            message:
-              `${snapshotPath}: sqlite database (codex state/logs/memories), ` +
-              `archived as raw only (parser: rollout-jsonl-1)`,
-            severity: "error",
+            code: metadataOnly ? "raw_only_metadata" : "unsupported_file",
+            message: metadataOnly
+              ? `${snapshotPath}: recognized Codex service database; archived as raw only`
+              : `${snapshotPath}: unrecognized or dialogue-bearing sqlite database; archived as raw only`,
+            severity: metadataOnly ? "info" : "error",
             sourceLocator: snapshotPath,
           },
         ],

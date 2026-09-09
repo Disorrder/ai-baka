@@ -31,8 +31,8 @@
  *   workspaceIdentifier.uri.fsPath);
  * - ItemTable `composer.composerHeaders` — {allComposers: [...]} с
  *   workspaceIdentifier.uri.fsPath (связка composer → workspace path).
- * - ItemTable `aiService.generations` / `aiService.prompts` (старые chat
- *   tabs в workspace DB): ответов не содержат, не парсятся — eventCounts.
+ * - ItemTable aiService.prompts/generations: incomplete prompt history, not
+ *   conversation transcripts. Recover text without inventing assistant replies.
  *
  * Модель на уровне сообщения в формате отсутствует: имя модели берётся из
  * usageData composerData. Если модель ровно одна — она назначается всем
@@ -68,7 +68,7 @@ import { normalizeModelName } from "../shared/model-normalization.ts";
 import { isSqliteFile } from "../shared/sqlite.ts";
 
 export const CURSOR_PARSER_NAME = "cursor";
-export const CURSOR_PARSER_VERSION = 3;
+export const CURSOR_PARSER_VERSION = 4;
 
 /** Операционные префиксы cursorDiskKV: не сообщения, только счётчики. */
 const OPERATIONAL_KEY_PREFIXES = [
@@ -132,10 +132,16 @@ export class CursorParser implements HarnessParser {
 
     try {
       const tables = tableSet(db);
+      const history = readPromptHistory(db, tables, diagnostics, context);
+      // First, with no external ID: ingest scopes this history container to the
+      // stable source-location fallback (#0), never to the raw snapshot filename.
+      if (history) dialogues.push(history);
       if (!tables.has("cursorDiskKV")) {
-        // Workspace DB без cursorDiskKV: диалогов нет, это не ошибка.
-        countAiService(db, tables, diagnostics, snapshotPath);
-        return { sourceKind: "sqlite", dialogues: empty(), diagnostics };
+        return {
+          sourceKind: "sqlite",
+          dialogues: (async function* () { yield* dialogues; })(),
+          diagnostics,
+        };
       }
 
       const headers = readComposerHeaders(db, tables, snapshotPath, diagnostics);
@@ -153,7 +159,6 @@ export class CursorParser implements HarnessParser {
         );
         if (dialogue) dialogues.push(dialogue);
       }
-      countAiService(db, tables, diagnostics, snapshotPath);
     } finally {
       db.close();
     }
@@ -327,34 +332,91 @@ function countOperationalKeys(db: Database): Map<string, Record<string, number>>
   return counts;
 }
 
-/** aiService.generations/prompts (старые chat tabs) — только diagnostic. */
-function countAiService(
+/**
+ * These arrays have no conversation IDs or replies. Preserve a source-scoped
+ * history container, not a fabricated chat. Exact repeated text is one recovered
+ * prompt, with every source occurrence retained as provenance.
+ */
+function readPromptHistory(
   db: Database,
   tables: Set<string>,
   diagnostics: ParsedDiagnostic[],
-  path: string,
-): void {
-  if (!tables.has("ItemTable")) return;
-  for (const key of ["aiService.generations", "aiService.prompts"]) {
+  context: ParseContext | undefined,
+): ParsedDialogue | undefined {
+  if (!tables.has("ItemTable")) return undefined;
+  const messages: ParsedMessage[] = [];
+  const byText = new Map<string, ParsedMessage>();
+  const eventCounts: Record<string, number> = {};
+  for (const key of ["aiService.prompts", "aiService.generations"]) {
     const row = db.query("SELECT value FROM ItemTable WHERE key = ?").get(key) as
-      | { value: unknown }
-      | null;
-    const text = valueText(row?.value);
-    if (!text) continue;
+      { value: unknown } | null;
+    if (!row) continue;
+    let entries: unknown;
     try {
-      const parsed: unknown = JSON.parse(text);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        diagnostics.push({
-          code: "unsupported_ai_service_entries",
-          message: `${path}: ${key} содержит ${parsed.length} записей старого chat-tabs формата (не парсятся, raw сохранён)`,
-          severity: "warning",
-          sourceLocator: `ItemTable/${key}`,
-        });
-      }
+      entries = JSON.parse(valueText(row.value) ?? "");
+      if (!Array.isArray(entries)) throw new Error("expected an array");
     } catch {
-      // Не JSON — не формат чатов, игнорируем.
+      diagnostics.push({
+        code: "cursor_history_parse_error", severity: "error",
+        message: `${key}: invalid prompt history array`, sourceLocator: `ItemTable/${key}`,
+      });
+      continue;
+    }
+    for (const [index, entry] of (entries as unknown[]).entries()) {
+      const locator = `ItemTable/${key}/${index}`;
+      const obj = asObject(entry);
+      const generation = key === "aiService.generations";
+      const type = asString(obj?.type);
+      const rawText = generation ? obj?.textDescription : obj?.text;
+      const text = typeof rawText === "string" ? rawText : undefined;
+      eventCounts[`${key}.${type ?? "entry"}`] =
+        (eventCounts[`${key}.${type ?? "entry"}`] ?? 0) + 1;
+      // apply/bugbot descriptions are operational, not human prompts.
+      if (generation && obj && (type === "apply" || type === "bugbot" ||
+          (obj.type === undefined && obj.textDescription === undefined))) continue;
+      const recognized = generation
+        ? type === "chat" || type === "composer" || type === "cmdk"
+        : typeof obj?.commandType === "number";
+      if (!obj || !recognized || (!generation && text === undefined) ||
+          (generation && obj.textDescription !== undefined && text === undefined)) {
+        diagnostics.push({
+          code: "cursor_history_unknown_entry", severity: "error",
+          message: `${key}: unrecognized history entry`, sourceLocator: locator,
+        });
+        messages.push(messageOf(messages.length, {
+          role: "unknown", rawRole: "cursor_history_unknown",
+          humanAuthored: false, visibleToUser: false, metadata: {},
+          chunks: [chunkOf({ kind: "unknown", content: JSON.stringify(entry),
+            rawKind: key, sourceLocator: locator, metadata: {} })],
+        }));
+        continue;
+      }
+      if (!text?.trim()) continue;
+      const occurrence = { sourceLocator: locator, ...obj };
+      const existing = byText.get(text);
+      if (existing) {
+        (existing.metadata.historyOccurrences as unknown[]).push(occurrence);
+        continue;
+      }
+      const message = messageOf(messages.length, {
+        role: "user", rawRole: generation ? "generation_description" : "prompt_history",
+        // A generation description alone may be a UI summary, not verbatim input.
+        humanAuthored: generation ? "unknown" : true, visibleToUser: true,
+        metadata: { historyOccurrences: [occurrence], incompleteHistory: true },
+        chunks: [chunkOf({ kind: "text", content: text, rawKind: key,
+          sourceLocator: locator, metadata: {} })],
+      });
+      byText.set(text, message);
+      messages.push(message);
     }
   }
+  if (messages.length === 0) return undefined;
+  return {
+    title: "Cursor prompt history (responses unavailable)",
+    messages,
+    ...(context?.workspaceHint ? { workspace: { path: context.workspaceHint } } : {}),
+    metadata: { historyOnly: true, responsesAvailable: false, eventCounts },
+  };
 }
 
 // --- сборка диалога ---

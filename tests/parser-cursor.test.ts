@@ -2,7 +2,6 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { normalizeUsageEvents } from "../src/parsers/shared/usage-normalization.ts";
 import { collectDialogues } from "../src/parsers/shared/parser.ts";
 import {
-  CURSOR_PARSER_VERSION,
   cursorParser,
 } from "../src/parsers/cursor/index.ts";
 import type {
@@ -47,7 +46,6 @@ async function parseFixture(
 describe("cursor parser: basic-dialogue", () => {
   test("метаданные диалога, workspace из composerHeaders, parser version", async () => {
     expect(cursorParser.parserName).toBe("cursor");
-    expect(CURSOR_PARSER_VERSION).toBe(3);
     const { snapshot, dialogues } = await parseFixture(basicDialogue);
     expect(snapshot.sourceKind).toBe("sqlite");
     expect(dialogues).toHaveLength(1);
@@ -276,5 +274,52 @@ describe("cursor parser: не-sqlite вход (workspace.json)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("cursor parser: incomplete prompt history", () => {
+  test("recovers prompts once without inventing answers or generation timestamps", async () => {
+    const { dialogues, snapshot } = await parseFixture({
+      composers: [],
+      itemTable: {
+        "aiService.prompts": [
+          { text: "Explain the cache", commandType: 4 },
+          { text: "Explain the cache", commandType: 4 },
+          { text: "", commandType: 4 },
+        ],
+        "aiService.generations": [
+          { type: "composer", generationUUID: "g1", unixMs: 1700000000000, textDescription: "Explain the cache" },
+          { type: "chat", generationUUID: "g2", textDescription: "Review the tests" },
+          { type: "apply", textDescription: "Generated patch description" },
+          { type: "composer", textDescription: "" },
+        ],
+      },
+    });
+    expect(snapshot.diagnostics).toEqual([]);
+    expect(dialogues).toHaveLength(1);
+    const history = dialogues[0]!;
+    expect(history.messages.map((message) => message.chunks[0]!.content))
+      .toEqual(["Explain the cache", "Review the tests"]);
+    expect(history.messages.map((message) => message.role)).toEqual(["user", "user"]);
+    expect(history.messages.map((message) => message.humanAuthored)).toEqual([true, "unknown"]);
+    expect(history.messages[0]!.metadata.historyOccurrences).toHaveLength(3);
+    expect(history.messages.every((message) => message.timestamp === undefined && message.usageEvents.length === 0)).toBe(true);
+    expect(history.externalId).toBeUndefined();
+    expect(history.metadata.responsesAvailable).toBe(false);
+  });
+
+  test("unknown entries remain quarantinable while valid history survives", async () => {
+    const { dialogues, snapshot } = await parseFixture({
+      composers: [],
+      itemTable: {
+        "aiService.prompts": [{ text: "Valid prompt", commandType: 4 }, { futureField: "unrecognized payload" }],
+        "aiService.generations": { not: "an array" },
+      },
+    });
+    expect(dialogues[0]!.messages[0]!.chunks[0]!.content).toBe("Valid prompt");
+    expect(dialogues[0]!.messages[1]!.chunks[0]!.kind).toBe("unknown");
+    expect(dialogues[0]!.messages[1]!.chunks[0]!.content).toContain("unrecognized payload");
+    expect(snapshot.diagnostics.map((diagnostic) => [diagnostic.code, diagnostic.severity]))
+      .toEqual([["cursor_history_unknown_entry", "error"], ["cursor_history_parse_error", "error"]]);
   });
 });

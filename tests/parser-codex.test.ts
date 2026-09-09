@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { normalizeUsageEvents } from "../src/parsers/shared/usage-normalization.ts";
 import { collectDialogues } from "../src/parsers/shared/parser.ts";
 import {
-  CODEX_PARSER_VERSION,
   codexParser,
 } from "../src/parsers/codex/index.ts";
 import type { ParsedDialogue } from "../src/domain/canonical-types.ts";
@@ -24,7 +24,6 @@ async function parseFixture(
 describe("codex parser: basic-dialogue", () => {
   test("метаданные диалога и parser version", async () => {
     expect(codexParser.parserName).toBe("codex");
-    expect(CODEX_PARSER_VERSION).toBe(9);
     const { dialogue } = await parseFixture("basic-dialogue.jsonl");
     expect(dialogue.externalId).toBe("11111111-2222-4333-8444-555555555555");
     expect(dialogue.workspace?.path).toBe("/Users/example/projects/demo-app");
@@ -292,7 +291,7 @@ describe("codex parser: truncated", () => {
 });
 
 describe("codex parser: sqlite source (~/.codex/sqlite)", () => {
-  test("sqlite-файл → одна unsupported_file-диагностика, без jsonl_parse_error", async () => {
+  test("corrupt SQLite remains a parse failure, never metadata-only", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "baka-codex-sqlite-"));
     try {
       const file = path.join(dir, "state_5.sqlite");
@@ -300,12 +299,29 @@ describe("codex parser: sqlite source (~/.codex/sqlite)", () => {
         file,
         Buffer.concat([Buffer.from("SQLite format 3\0", "latin1"), Buffer.alloc(128, 7)]),
       );
-      const snapshot = await codexParser.parse(file);
-      expect(await collectDialogues(snapshot)).toHaveLength(0);
-      expect(snapshot.diagnostics).toHaveLength(1);
-      expect(snapshot.diagnostics[0]!.code).toBe("unsupported_file");
-      expect(snapshot.diagnostics[0]!.severity).toBe("error");
+      await expect(codexParser.parse(file)).rejects.toThrow();
     } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("recognizes service schemas but refuses new tables and stored replies", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "baka-codex-metadata-"));
+    const file = path.join(dir, "arbitrary-name.db");
+    const db = new Database(file);
+    try {
+      db.run("CREATE TABLE automation_runs (thread_id TEXT, automation_id TEXT, archived_user_message TEXT, archived_assistant_message TEXT)");
+      const metadata = await codexParser.parse(file);
+      expect(await collectDialogues(metadata)).toEqual([]);
+      expect(metadata.diagnostics.map((diagnostic) => [diagnostic.code, diagnostic.severity]))
+        .toEqual([["raw_only_metadata", "info"]]);
+      db.run("INSERT INTO automation_runs VALUES ('thread', 'automation', 'Question', 'Answer')");
+      expect((await codexParser.parse(file)).diagnostics[0]!.code).toBe("unsupported_file");
+      db.run("DELETE FROM automation_runs");
+      db.run("CREATE TABLE future_transcripts (content TEXT)");
+      expect((await codexParser.parse(file)).diagnostics[0]!.code).toBe("unsupported_file");
+    } finally {
+      db.close();
       await rm(dir, { recursive: true, force: true });
     }
   });

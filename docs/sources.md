@@ -33,6 +33,44 @@
   Orca runtime пропускаются, если такой же transcript уже найден в нативных
   Codex roots (`~/.codex/sessions` или `~/.codex/archived_sessions`).
 
+## Cursor: неполная история промптов
+
+Parser version 4 извлекает `ItemTable/aiService.prompts` из `state.vscdb`,
+а также непустые `textDescription` событий `chat`, `composer`, `cmdk` из
+`aiService.generations`. Описания генераций без совпавшего промпта имеют
+`humanAuthored = "unknown"`: это может быть UI-описание, не дословный ввод.
+`apply`/`bugbot` — операции, а не пользовательские сообщения.
+
+Эти массивы не содержат ответов и идентификаторов диалогов. Они сохраняются
+как отдельный контейнер истории источника (`metadata.historyOnly = true`,
+`responsesAvailable = false`), без выдуманных assistant messages, времён,
+моделей и usage. Точные повторы текста внутри контейнера объединяются;
+исходные вхождения сохраняются в `historyOccurrences`. Контейнер использует
+source-location identity, не имя immutable snapshot. Composer-диалоги
+по-прежнему извлекаются отдельно. Пустые строки пропускаются, повреждённые
+массивы и неизвестные записи дают ошибки, а не молчаливое игнорирование.
+
+## Codex: служебные SQLite
+
+Parser version 10 распознаёт проверенные схемы баз state, logs, memories,
+goals и Codex Desktop. Это raw-only источники: `raw_only_metadata` с
+уровнем `info`, ноль диалогов, успешный parse без замечания
+«неподдерживаемый формат». Raw snapshot сохраняется как прежде.
+
+Классификация основана на таблицах и обязательных колонках, не имени файла.
+Неизвестные таблицы/схемы остаются `unsupported_file`, повреждённая SQLite —
+ошибкой разбора. Для Desktop дополнительно проверяется отсутствие
+`automation_runs.archived_user_message`/`archived_assistant_message` и строк
+`thread_timeline_ledger`: при наличии таких данных база не игнорируется.
+Служебные summaries, цели, настройки автоматизаций и каталоги тредов не
+выдаются за исходные сообщения; основной источник диалогов — rollout JSONL.
+
+Уже сохранённые revisions обновляются явно, без изменения raw:
+`baka reparse --harness cursor --only-outdated` и
+`baka reparse --harness codex --only-outdated`.
+Для предварительного просмотра selection добавляется `--dry-run`;
+для узкого применения вместо harness используются `--source-location <ids...>`.
+
 ## Kimi Code (Kimi CLI)
 
 Kimi Code CLI хранит все данные в `$KIMI_CODE_HOME` (по умолчанию `~/.kimi-code/`,

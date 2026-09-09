@@ -145,7 +145,7 @@ export interface ParsedDiagnostic {
   /** Машинный код, например "jsonl_parse_error", "unknown_event". */
   code: string;
   message: string;
-  severity: "warning" | "error";
+  severity: "info" | "warning" | "error";
   /** Номер строки/путь внутри snapshot'а, если применимо. */
   sourceLocator?: string;
 }
