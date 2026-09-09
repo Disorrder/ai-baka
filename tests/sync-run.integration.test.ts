@@ -9,7 +9,9 @@
  */
 
 import { afterAll, describe, expect } from "bun:test";
-import { cp, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { Database } from "bun:sqlite";
+import { writeFileSync } from "node:fs";
+import { cp, link, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { RecordId } from "surrealdb";
@@ -395,6 +397,83 @@ describe("structured sync (integration)", () => {
     } finally {
       await env.cleanup();
     }
+  });
+
+  testDb("observed mtime survives raw SHA reuse without losing retry", async () => {
+    const env = await makeSyncEnv();
+    try {
+      await runSync(env.cfg, syncOptions(env));
+      const file = basicWire(env);
+      const before = await stat(file);
+      await utimes(file, before.atime, new Date(before.mtimeMs + 5000));
+      const touched = await runSync(env.cfg, syncOptions(env));
+      expect(touched.counters.filesChanged).toBe(1);
+      expect(touched.counters.revisionsCreated).toBe(0);
+      const repeat = await runSync(env.cfg, syncOptions(env));
+      expect(repeat.counters.filesChanged).toBe(0);
+      const loc = await selectOne<{current_revision: RecordId}>(env.t.db,
+        "SELECT current_revision FROM source_location WHERE relative_path = $path",
+        {path: `wd_test/${BASIC_ID}/agents/main/wire.jsonl`});
+      await updateSourceRevisionParse(env.t.db, loc!.current_revision, {parseStatus: "partial"});
+      const retry = await runSync(env.cfg, syncOptions(env));
+      expect(retry.counters.filesChanged).toBe(1);
+      expect(retry.counters.dialoguesWritten).toBe(1);
+    } finally { await env.cleanup(); }
+  });
+
+  testDb("SQLite repeat sync skips VACUUM but WAL-only commits are captured", async () => {
+    const env = await makeSyncEnv();
+    const file = path.join(env.srcRoot, "source.db");
+    const source = new Database(file);
+    try {
+      source.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE sample (value TEXT); INSERT INTO sample VALUES ('one')");
+      env.cfg.sourceOverrides.codex = [file];
+      let snapshots = 0;
+      const options = { ...syncOptions(env), harness: "codex" as const,
+        snapshotSource: async (...args: Parameters<typeof snapshotSource>) => {
+          snapshots += 1;
+          return snapshotSource(...args);
+        } };
+      await runSync(env.cfg, options);
+      snapshots = 0;
+      const repeat = await runSync(env.cfg, options);
+      expect(repeat.counters.filesChanged).toBe(0);
+      expect(snapshots).toBe(0);
+      const before = await stat(file);
+      source.exec("INSERT INTO sample VALUES ('two')");
+      expect((await stat(file)).mtimeMs).toBe(before.mtimeMs);
+      const changed = await runSync(env.cfg, options);
+      expect(changed.counters.filesChanged).toBe(1);
+      expect(changed.counters.revisionsCreated).toBe(1);
+      expect(snapshots).toBe(1);
+      const again = await runSync(env.cfg, options);
+      expect(again.counters.filesChanged).toBe(0);
+    } finally { source.close(); await env.cleanup(); }
+  });
+
+  testDb("duplicate hash reuse recognizes hardlinks but rejects same-size mutations", async () => {
+    const env = await makeSyncEnv();
+    try {
+      const native = path.join(env.srcRoot, "native");
+      const orca = path.join(env.srcRoot, "Library/Application Support/orca/codex-runtime-home/home/sessions");
+      await mkdir(native, {recursive: true});
+      await mkdir(orca, {recursive: true});
+      const file = path.join(native, "sample.jsonl");
+      await writeFile(file, "first");
+      await link(file, path.join(orca, "sample.jsonl"));
+      env.cfg.sourceOverrides.codex = [native, orca];
+      const events: Record<string, unknown>[] = [];
+      const options = {...syncOptions(env), harness: "codex" as const, dryRun: true,
+        logger: (event: Record<string, unknown>) => { events.push(event); }};
+      const first = await runSync(env.cfg, options);
+      expect(first.counters.filesDuplicateSkipped).toBe(1);
+      expect(events.find(e => e.event === "source_duplicate_filter")?.physicalCacheHits).toBe(1);
+      const changed = await runSync(env.cfg, {...options, logger: (event) => {
+        if (event.event === "source_duplicate_index") writeFileSync(file, "other");
+      }});
+      expect(changed.counters.filesDuplicateSkipped).toBe(0);
+      expect(changed.counters.filesSeen).toBe(2);
+    } finally { await env.cleanup(); }
   });
 
   testDb("last_successful_revision очищается при parse_error re-parse + validate (§23.3)", async () => {

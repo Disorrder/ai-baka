@@ -27,7 +27,7 @@ import { isLocked } from "./infra/lock.ts";
 import { readSentinel } from "./infra/sentinel.ts";
 import { discoverSourceRoots } from "./sources/discovery/discovery.ts";
 import { runSync, type SyncSummary } from "./sync/sync-run.ts";
-import { createSyncProgress, createSyncProgressLogger } from "./sync/progress.ts";
+import { createSyncProgress, createSyncProgressLogger, formatSyncSummary } from "./sync/progress.ts";
 import { HARNESSES, type HarnessSlug } from "./sources/adapters/harnesses.ts";
 import { collectStatus, formatStatus } from "./status.ts";
 import { runValidation } from "./validate.ts";
@@ -2491,6 +2491,7 @@ program
         let summary: SyncSummary;
         try {
           summary = await runSync(cfg, {
+            autoStartDatabase: true,
             harness: options.harness as HarnessSlug | undefined,
             fullRescan: options.fullRescan,
             deletionConfirmations:
@@ -2508,11 +2509,7 @@ program
         if (options.json) {
           console.log(JSON.stringify(summary, null, 2));
         } else {
-          console.log(`sync: ${summary.status}`);
-          for (const [key, value] of Object.entries(summary.counters)) {
-            console.log(`  ${key}: ${value}`);
-          }
-          for (const error of summary.errors) console.error(`  error: ${error}`);
+          console.log(formatSyncSummary(summary, undefined, options.dryRun));
         }
         if (summary.status === "failed") process.exitCode = 1;
       },

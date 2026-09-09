@@ -1,3 +1,87 @@
+import type { SyncSummary } from "./sync-run.ts";
+
+/** Human output only; machine-readable counters retain their original contract. */
+export function formatSyncSummary(
+  summary: SyncSummary,
+  columns = process.stdout.isTTY ? process.stdout.columns : undefined,
+  dryRun = false,
+): string {
+  const width = Number.isFinite(columns) && columns! > 0 ? Math.max(1, Math.floor(columns!) - 1) : 80;
+  const number = new Intl.NumberFormat("ru-RU");
+  const lines: string[] = [];
+
+  // Wrap without losing labels or values, including on very narrow terminals.
+  function append(text: string) {
+    let rest = text;
+    while (Bun.stringWidth(rest) > width) {
+      let end = 0;
+      let cells = 0;
+      let space = -1;
+      for (const char of rest) {
+        if (cells + Bun.stringWidth(char) > width) break;
+        if (char === " " && end > 0) space = end;
+        cells += Bun.stringWidth(char);
+        end += char.length;
+      }
+      const split = space > 0 ? space : end;
+      lines.push(rest.slice(0, split));
+      rest = rest.slice(split).trimStart();
+    }
+    lines.push(rest);
+  }
+
+  function section(title: string, metrics: [string, string][]) {
+    lines.push("");
+    append(title);
+    const cells = metrics.map(([key, label]) => `${label}: ${number.format(summary.counters[key] ?? 0)}`);
+    let count = Math.min(3, cells.length);
+    let widths: number[] = [];
+    for (; count >= 1; count--) {
+      widths = Array.from({ length: count }, (_, column) =>
+        Math.max(...cells.filter((_, index) => index % count === column).map((cell) => Bun.stringWidth(cell))));
+      if (2 + widths.reduce((sum, value) => sum + value, 0) + (count - 1) * 3 <= width || count === 1) break;
+    }
+    for (let start = 0; start < cells.length; start += count) {
+      const row = cells.slice(start, start + count);
+      append(`  ${row.map((cell, index) => index === row.length - 1 ? cell
+        : cell + " ".repeat(widths[index]! - Bun.stringWidth(cell))).join("   ")}`);
+    }
+  }
+
+  const status: Record<string, string> = {
+    completed: "завершена",
+    completed_with_errors: "завершена с ошибками",
+    failed: "не завершена",
+    cancelled: "отменена",
+  };
+  append(`Синхронизация: ${status[summary.status] ?? summary.status}`);
+  if (dryRun) append("Пробный запуск — без записи данных.");
+  append(`Ошибки обработки: ${number.format(summary.counters.ingestErrors ?? 0)}`);
+  for (const error of summary.errors) append(`Ошибка: ${error}`);
+
+  section("Диалоги и содержимое", [
+    ["dialoguesWritten", "Обработано диалогов"],
+    ["messagesWritten", "Записано сообщений"],
+    ["chunksWritten", "Фрагментов сообщений"],
+  ]);
+  section("Поиск", [
+    ["searchDocuments", "Текстов для поиска"],
+    ["embeddingJobs", "Заданий на векторизацию"],
+  ]);
+  section("Исходные файлы", [
+    ["filesNew", "Новых файлов"],
+    ["filesChanged", "Изменённых файлов"],
+    ["filesMissing", "Отсутствует в источниках"],
+  ]);
+  section("Детали сканирования и архива", [
+    ["roots", "Источников проверено"],
+    ["filesSeen", "Файлов найдено"],
+    ["filesDuplicateSkipped", "Дубликатов пропущено"],
+    ["revisionsCreated", "Новых снимков файлов"],
+  ]);
+  return lines.join("\n");
+}
+
 export interface SyncProgress {
   stage: number;
   detail: string;
@@ -17,6 +101,8 @@ export function createSyncProgress() {
   let stopped = false;
   let lastDraw = 0;
   let frame = 0;
+  let warningCount = 0;
+  const warnings = new Map<string, number>();
   const color = !process.env.NO_COLOR && process.env.TERM !== "dumb";
   const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -36,10 +122,12 @@ export function createSyncProgress() {
     const spinner = frames[frame++ % frames.length]!;
     const bar = ratio === undefined ? spinner
       : `${spinner} [${"━".repeat(filled)}${"─".repeat(barWidth - filled)}]`;
-    const root = p.rootsTotal === undefined ? p.root ? ` · ${p.root}` : ""
-      : ` · ист. ${p.rootsCompleted}/${p.rootsTotal}${p.root ? ` ${p.root}` : ""}`;
+    const harness = p.root ? ` (${p.root})` : "";
+    const roots = p.rootsTotal === undefined ? ""
+      : ` · источники ${p.rootsCompleted ?? 0}/${p.rootsTotal}`;
     // Bun measures terminal cells, not UTF-16 length; never wrap into another line.
-    const text = ` ${bar} ${p.stage}/5${root}${count} · ${p.detail} · ${elapsed}`
+    const warningSummary = warningCount > 0 ? ` · замечания ${warningCount}` : "";
+    const text = ` ${elapsed} ${bar} ${p.stage}/5 · ${p.detail}${harness}${count}${warningSummary}${roots}`
       .replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
     const width = Math.max(1, (stream.columns || 100) - 1);
     let clipped = "";
@@ -63,19 +151,34 @@ export function createSyncProgress() {
           Date.now() - lastDraw >= 100) draw();
     },
     log(event: Record<string, unknown>) {
+      if (stopped || event.event === "sync_finish" || event.event === "sync_timing") return;
       const name = String(event.event ?? "");
+      const status = String(event.status ?? "");
       if (!event.error && !Number(event.errors) && !Number(event.scanErrors) &&
-          !/failed|error|session_view_skipped/.test(name) &&
-          !(event.status && !["complete", "completed", "parsed"].includes(String(event.status)))) return;
-      // Do not expose source paths or arbitrary parser/provider error payloads.
-      stream.write(`\r\x1b[2K! ${name.replace(/[^a-zA-Z0-9_]/g, "")} · см. итог sync / baka validate\n`);
-      draw();
+          !Number(event.failed) && !/failed|error|session_view_skipped/.test(name) &&
+          !(status && !["complete", "completed", "parsed"].includes(status))) return;
+      // Aggregate notifications, not ingest errors: one event may contain several
+      // diagnostics. The authoritative error total remains in the sync summary.
+      const reason = status === "unsupported" ? "неподдерживаемый формат"
+        : status === "partial" ? "частичная обработка"
+        : status === "parse_error" ? "ошибки обработки диалогов"
+        : name === "session_view_skipped" ? "пропущенные сессии"
+        : event.error || Number(event.errors) || Number(event.scanErrors) ||
+          Number(event.failed) || /failed|error/.test(name) ? "ошибки синхронизации"
+        : "источники недоступны или обработаны не полностью";
+      warnings.set(reason, (warnings.get(reason) ?? 0) + 1);
+      warningCount += 1;
+      if (Date.now() - lastDraw >= 100) draw();
     },
     stop() {
       if (stopped) return;
       stopped = true;
       clearInterval(timer);
       stream.write("\r\x1b[2K");
+      if (warningCount > 0) {
+        const details = [...warnings].map(([reason, count]) => `${reason}: ${count}`).join("; ");
+        stream.write(`Замечания sync (${warningCount}): ${details}. Подробный журнал доступен с --json.\n`);
+      }
     },
   };
 }

@@ -22,6 +22,7 @@ import { pathToFileURL } from "node:url";
 import { isSqlitePath } from "../adapters/file-matchers.ts";
 import { hashFile, type FileHashes } from "./hashing.ts";
 import { rawFileName } from "./naming.ts";
+import { readSourceFingerprint } from "./source-fingerprint.ts";
 
 export class SnapshotError extends Error {}
 
@@ -39,6 +40,8 @@ export interface SnapshotResult {
   /** true, если raw с таким hash уже существовал и копирование не понадобилось. */
   reused: boolean;
   snapshotKind: SnapshotKind;
+  /** Stable SOURCE state bracketing capture, never the VACUUM output fingerprint. */
+  sourceFingerprint?: string;
 }
 
 export interface SnapshotOptions {
@@ -225,7 +228,11 @@ export async function snapshotSource(
   sourcePath: string,
   opts: SnapshotOptions,
 ): Promise<SnapshotResult> {
-  return isSqlitePath(sourcePath)
+  const before = await readSourceFingerprint(sourcePath);
+  const snapshot = await (isSqlitePath(sourcePath)
     ? snapshotSqlite(sourcePath, opts)
-    : snapshotRegularFile(sourcePath, opts);
+    : snapshotRegularFile(sourcePath, opts));
+  const after = await readSourceFingerprint(sourcePath);
+  if (before && before === after) snapshot.sourceFingerprint = before;
+  return snapshot;
 }

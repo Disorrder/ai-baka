@@ -10,20 +10,33 @@ import { httpBaseUrl } from "../backup/http.ts";
 const AUTH_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
 
 /** Подключается к SurrealDB и выбирает namespace/database из конфига. */
-export async function connectDb(cfg: AppConfig): Promise<Surreal> {
+export async function connectDb(cfg: AppConfig, options: { failFast?: boolean } = {}): Promise<Surreal> {
   const db = new Surreal();
+  let timer: NodeJS.Timeout | undefined;
   try {
-    await db.connect(cfg.surrealUrl);
-    await db.signin({ username: cfg.surrealUser, password: cfg.surrealPass });
-    await db.use({ namespace: cfg.surrealNamespace, database: cfg.surrealDatabase });
+    const connect = async () => {
+      await db.connect(cfg.surrealUrl, options.failFast ? { reconnect: false } : undefined);
+      await db.signin({ username: cfg.surrealUser, password: cfg.surrealPass });
+      await db.use({ namespace: cfg.surrealNamespace, database: cfg.surrealDatabase });
+    };
+    if (options.failFast) {
+      await Promise.race([
+        connect(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("SurrealDB: подключение не завершилось за 10 секунд")), 10_000);
+        }),
+      ]);
+    } else {
+      await connect();
+    }
   } catch (error) {
-    // Иначе открытый WS (connect прошёл, signin/use упали) держит event loop
-    // и CLI не завершается после фатальной ошибки (live acceptance, этап 8).
+    // Close failed connections so neither sockets nor SDK retries outlive the command.
     await db.close().catch(() => {});
     throw error;
+  } finally {
+    clearTimeout(timer);
   }
   const refresh = setInterval(() => {
-    // Ошибка refresh'а не фатальна: следующий tick или переподключение команды.
     db.signin({ username: cfg.surrealUser, password: cfg.surrealPass }).catch(() => {});
   }, AUTH_REFRESH_INTERVAL_MS);
   refresh.unref();

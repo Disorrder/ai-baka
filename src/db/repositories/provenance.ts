@@ -163,6 +163,8 @@ export interface LocationRow {
   mtime_ms?: number;
   head_hash?: string;
   raw_archive_path?: string;
+  current_revision?: RecordId;
+  parse_status?: string;
 }
 
 export async function listLocations(
@@ -172,6 +174,7 @@ export async function listLocations(
   return selectAll<LocationRow>(
     db,
     `SELECT id, relative_path, basename, presence_status, missing_complete_scans, renamed_from,
+       current_revision, current_revision.parse_status AS parse_status,
        current_revision.sha256 AS sha256,
        current_revision.size_bytes AS size_bytes,
        current_revision.mtime_ms AS mtime_ms,
@@ -212,7 +215,7 @@ export async function ensureSourceLocation(
 /** Обновление presence-состояния (deletion state machine, §10.6). */
 export async function updateLocationPresence(
   db: Surreal,
-  id: RecordId,
+  id: RecordId | RecordId[],
   input: {
     presenceStatus: string;
     missingCompleteScans: number;
@@ -226,7 +229,7 @@ export async function updateLocationPresence(
     // Файл присутствует: сброс отсутствия (missing_since_at/deleted_at → NONE).
     await db.query(
       `UPDATE $id SET presence_status = $status, missing_complete_scans = $scans,
-         last_seen_at = $now, missing_since_at = NONE, deleted_at = NONE`,
+         last_seen_at = $now, missing_since_at = NONE, deleted_at = NONE RETURN NONE`,
       { id, status: input.presenceStatus, scans: input.missingCompleteScans, now },
     );
     return;
@@ -247,7 +250,7 @@ export async function updateLocationPresence(
     sets.push("deleted_at = $deletedAt");
     vars.deletedAt = input.deletedAt;
   }
-  await db.query(`UPDATE $id SET ${sets.join(", ")}`, vars);
+  await db.query(`UPDATE $id SET ${sets.join(", ")} RETURN NONE`, vars);
 }
 
 export async function setLocationRenamedFrom(

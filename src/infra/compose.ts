@@ -12,19 +12,25 @@ export class ComposeError extends Error {}
 /** Запускает `docker compose` и возвращает stdout. Бросает ComposeError при ненулевом коде. */
 export async function compose(
   args: string[],
-  options: { allowFailure?: boolean } = {},
+  options: { allowFailure?: boolean; timeoutMs?: number } = {},
 ): Promise<string> {
   const fullArgs = ["compose", "--env-file", ENV_FILE, "-f", COMPOSE_FILE, ...args];
   return new Promise((resolve, reject) => {
     const child = spawn("docker", fullArgs, { stdio: ["ignore", "pipe", "pipe"] });
+    const timer = options.timeoutMs === undefined ? undefined : setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new ComposeError(`docker compose: превышено время ожидания ${options.timeoutMs} мс`));
+    }, options.timeoutMs);
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => (stdout += chunk));
     child.stderr.on("data", (chunk) => (stderr += chunk));
-    child.on("error", (error) =>
-      reject(new ComposeError(`docker не найден: ${error.message}`)),
-    );
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(new ComposeError(`docker не запущен: ${error.message}`));
+    });
     child.on("close", (code) => {
+      clearTimeout(timer);
       if (code === 0 || options.allowFailure) {
         resolve(stdout.trim());
       } else {
