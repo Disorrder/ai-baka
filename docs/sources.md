@@ -29,9 +29,10 @@
 - Orca Codex pane хранит те же Codex rollout JSONL в собственном runtime home:
   `~/Library/Application Support/orca/codex-runtime-home/home/sessions`.
   Это импортируется как harness `codex`; Orca здесь только оболочка, не
-  отдельный vendor/harness для аналитики. При sync exact SHA-256 дубли из
-  Orca runtime пропускаются, если такой же transcript уже найден в нативных
-  Codex roots (`~/.codex/sessions` или `~/.codex/archived_sessions`).
+  отдельный vendor/harness для аналитики. При sync дубли из Orca runtime
+  пропускаются, если transcript уже найден в нативных Codex roots
+  (`~/.codex/sessions` или `~/.codex/archived_sessions`): стабильные hardlink'и
+  проверяются по физической identity, отдельные копии — по полному SHA-256.
 
 ## Cursor: неполная история промптов
 

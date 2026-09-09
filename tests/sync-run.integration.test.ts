@@ -526,11 +526,23 @@ describe("structured sync (integration)", () => {
       const first = await runSync(env.cfg, options);
       expect(first.counters.filesDuplicateSkipped).toBe(1);
       expect(events.find(e => e.event === "source_duplicate_filter")?.physicalCacheHits).toBe(1);
+      expect(events.find(e => e.event === "source_duplicate_filter")?.bytesHashed).toBe(0);
       const changed = await runSync(env.cfg, {...options, logger: (event) => {
         if (event.event === "source_duplicate_index") writeFileSync(file, "other");
       }});
       expect(changed.counters.filesDuplicateSkipped).toBe(0);
       expect(changed.counters.filesSeen).toBe(2);
+      const copy = path.join(orca, "copy.jsonl");
+      await cp(file, copy);
+      const copied = await runSync(env.cfg, options);
+      expect(copied.counters.filesDuplicateSkipped).toBe(2);
+      // A distinct inode with identical metadata is not proof of identical bytes.
+      const metadata = await stat(copy);
+      await writeFile(copy, "third");
+      await utimes(copy, metadata.atime, metadata.mtime);
+      const diverged = await runSync(env.cfg, options);
+      expect(diverged.counters.filesDuplicateSkipped).toBe(1);
+      expect(diverged.counters.filesSeen).toBe(2);
     } finally { await env.cleanup(); }
   });
 

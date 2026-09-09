@@ -169,9 +169,12 @@ function isJsonlSource(relativePath: string): boolean {
 
 
 interface CodexDuplicateIndex {
-  hashes: Set<string>;
+  nativeFiles: Map<string, string>;
+  hashes?: Set<string>;
   physical: Map<string, string>;
   cacheHits: number;
+  fullHashes: number;
+  bytesHashed: number;
 }
 
 async function duplicateHash(file: string, index: CodexDuplicateIndex): Promise<string> {
@@ -182,10 +185,12 @@ async function duplicateHash(file: string, index: CodexDuplicateIndex): Promise<
     index.cacheHits += 1;
     return cached;
   }
-  const hash = (await hashFile(file)).sha256;
+  const result = await hashFile(file);
   if (before !== physicalFileState(await stat(file))) throw new Error("source changed during duplicate hashing");
-  index.physical.set(before, hash);
-  return hash;
+  index.fullHashes += 1;
+  index.bytesHashed += result.sizeBytes;
+  index.physical.set(before, result.sha256);
+  return result.sha256;
 }
 
 async function buildCodexNativeDuplicateSha256Index(
@@ -201,8 +206,9 @@ async function buildCodexNativeDuplicateSha256Index(
   );
   if (nativeRoots.length === 0) return undefined;
 
-  const hashes = new Set<string>();
-  const index: CodexDuplicateIndex = { hashes, physical: new Map(), cacheHits: 0 };
+  const index: CodexDuplicateIndex = {
+    nativeFiles: new Map(), physical: new Map(), cacheHits: 0, fullHashes: 0, bytesHashed: 0,
+  };
   let filesIndexed = 0;
   let errors = 0;
   for (const root of nativeRoots) {
@@ -221,7 +227,7 @@ async function buildCodexNativeDuplicateSha256Index(
       }
       try {
         const sourcePath = rootIsFile ? root.path : path.join(root.path, file.relativePath);
-        hashes.add(await duplicateHash(sourcePath, index));
+        index.nativeFiles.set(physicalFileState(await stat(sourcePath)), sourcePath);
         filesIndexed += 1;
       } catch (error) {
         errors += 1;
@@ -240,10 +246,46 @@ async function buildCodexNativeDuplicateSha256Index(
     harness: "codex",
     roots: nativeRoots.length,
     filesIndexed,
-    uniqueSha256: hashes.size,
+    physicalFiles: index.nativeFiles.size,
     errors,
   });
   return index;
+}
+
+async function isNativeCodexDuplicate(
+  file: string,
+  index: CodexDuplicateIndex,
+  log: Logger,
+): Promise<boolean> {
+  const state = physicalFileState(await stat(file));
+  const native = index.nativeFiles.get(state);
+  // Two unchanged paths to the same inode are the same bytes; no SHA read is needed.
+  if (native) {
+    if (state !== physicalFileState(await stat(native)) || state !== physicalFileState(await stat(file))) {
+      throw new Error("source changed during duplicate identity lookup");
+    }
+    index.cacheHits += 1;
+    return true;
+  }
+  // Independent copies still require full SHA proof. Build it only if encountered.
+  if (!index.hashes) {
+    index.hashes = new Set();
+    for (const [expected, sourcePath] of index.nativeFiles) {
+      try {
+        if (expected !== physicalFileState(await stat(sourcePath))) {
+          throw new Error("native source changed since duplicate index");
+        }
+        const hash = await duplicateHash(sourcePath, index);
+        if (expected !== physicalFileState(await stat(sourcePath))) {
+          throw new Error("native source changed during duplicate hashing");
+        }
+        index.hashes.add(hash);
+      } catch (error) {
+        log({ event: "source_duplicate_index_error", error: String(error) });
+      }
+    }
+  }
+  return index.hashes.has(await duplicateHash(file, index));
 }
 
 async function filterOrcaCodexDuplicateFiles(
@@ -253,7 +295,7 @@ async function filterOrcaCodexDuplicateFiles(
   log: Logger,
   progress?: (completed: number, total: number) => void,
 ): Promise<ScanResult> {
-  if (!isOrcaCodexRuntimeRoot(root) || !nativeDuplicateSha256Index?.hashes.size) return scan;
+  if (!isOrcaCodexRuntimeRoot(root) || !nativeDuplicateSha256Index?.nativeFiles.size) return scan;
 
   const files: ScanResult["files"] = [];
   let skipped = 0;
@@ -269,8 +311,7 @@ async function filterOrcaCodexDuplicateFiles(
     }
     try {
       const sourcePath = rootIsFile ? root.path : path.join(root.path, file.relativePath);
-      const sha256 = await duplicateHash(sourcePath, nativeDuplicateSha256Index);
-      if (nativeDuplicateSha256Index.hashes.has(sha256)) {
+      if (await isNativeCodexDuplicate(sourcePath, nativeDuplicateSha256Index, log)) {
         skipped += 1;
         progress?.(++checked, scan.files.length);
         continue;
@@ -297,6 +338,8 @@ async function filterOrcaCodexDuplicateFiles(
       duplicateFilesSkipped: skipped,
       errors,
       physicalCacheHits: nativeDuplicateSha256Index.cacheHits,
+      fullHashes: nativeDuplicateSha256Index.fullHashes,
+      bytesHashed: nativeDuplicateSha256Index.bytesHashed,
     });
   }
   return { ...scan, files };
