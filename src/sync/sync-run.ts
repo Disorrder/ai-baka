@@ -916,11 +916,9 @@ async function processSourceRoot(
 
     // --- Phase C: parse + canonical write (§9.3 шаги 4–7, §10.4) ---
     args.timing.next("parse_and_write");
-    // Парсим все new/changed, даже если revision с таким SHA уже существует
-    // (файл «откатился» к старому содержимому): writer идемпотентен — найдёт
-    // существующую dialogue_revision и переключит current на неё (§10.5).
-    // На обычном пути (fingerprint совпал) файлы сюда не попадают, поэтому
-    // повторный sync не парсит ничего (§19.2 №1).
+    // Only a proven already-processed current file revision can skip parse above.
+    // Historical SHA reuse must still switch current (§10.5); session views,
+    // pipeline changes and failed/partial results must still be processed.
     const ingestCtx: IngestContext = {
       db,
       syncRun: syncRunId,

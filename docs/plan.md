@@ -1230,6 +1230,34 @@ SurrealDB поддерживает транзакции для нескольк�
    * нормализовать;
    * записать dialogue revisions.
 
+
+Повторный sync хранит наблюдённое состояние **исходника** отдельно от raw:
+`<dirname(BAKA_DB_ROOT)>/sync-cache/<sha256>.json` — удаляемый локальный
+кэш, не часть canonical corpus или backup. Ключ файла включает archive root,
+URL/namespace/database; запись привязана к location, текущей revision,
+parse status и версиям parser/extractor/segmenter. Файл публикуется атомарно
+под sync lock; dry-run его не изменяет. Потеря/повреждение кэша означает
+холодную проверку, не потерю данных. Ошибка сохранения логируется.
+
+Fingerprint включает dev/inode, size/mtime/ctime и первые 64 КиБ исходника;
+для SQLite — также состояние и полный SHA-256 WAL. Активный rollback journal,
+ошибка чтения или изменение во время наблюдения запрещают reuse. Snapshot
+получает наблюдение только при совпадении состояний до и после capture.
+Размер/head hash результата `VACUUM INTO` больше не служат доказательством
+неизменности исходной SQLite. Без валидного наблюдения SQLite переснимается.
+Старые метаданные immutable revision не переписываются при прежнем SHA.
+
+Повторный parse пропускается только для уже обработанной текущей file revision
+с прежним pipeline; исторический SHA, partial/parse_error/pending и session
+parse-view не обходятся. Неподдерживаемый неизменный файл не разбирается снова,
+но существующий quarantine не закрывается этим пропуском. Presence updates
+группируются по одинаковым переходам, максимум 250 locations на запрос,
+с прежними правилами complete/partial scan и reappearance.
+
+Поиск дублей Codex/Orca переиспользует полный SHA внутри одного запуска по
+проверенным dev/inode/size/mtime/ctime. Копии с другими inode по-прежнему
+проверяются полным хешем; межзапускового кэша SHA нет.
+
 ## 10.4. Atomicity unit
 
 Для обычного JSONL, содержащего один диалог, единицей транзакции является
@@ -2467,8 +2495,9 @@ baka recovery:rebuild
 `status`, `dryRun`; для root — также `root` и `harness`. Длительности
 измеряются монотонными часами, отдельно для preflight/lock, подключения/
 схемы/identity, discovery, metadata embeddings, индекса дублей, обхода,
-фильтра дублей, загрузки locations, reconcile, snapshot, parse/write,
-разрешения ошибок, presence, rename и финализации. `total` — итог scope,
+фильтра дублей, загрузки locations, reconcile, source fingerprints, snapshot,
+parse/write, разрешения ошибок, presence, rename, чтения/записи локального
+кэша и финализации. `total` — итог scope,
 а `sync.roots` включает все root-этапы: складывать их повторно нельзя.
 Незавершённый этап при ошибке также логируется. Dry-run не измеряет
 snapshot/parse/write/presence: его время не заменяет замер полного sync.

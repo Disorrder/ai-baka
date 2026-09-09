@@ -448,6 +448,15 @@ describe("structured sync (integration)", () => {
       expect(snapshots).toBe(1);
       const again = await runSync(env.cfg, options);
       expect(again.counters.filesChanged).toBe(0);
+      const metadata = await stat(file);
+      await utimes(file, metadata.atime, new Date(metadata.mtimeMs + 5000));
+      const touched = await runSync(env.cfg, options);
+      expect(touched.counters.filesChanged).toBe(1);
+      expect(touched.counters.revisionsCreated).toBe(0);
+      // Same raw + current pipeline must not create another unsupported diagnostic.
+      expect(touched.counters.ingestErrors).toBe(0);
+      expect(snapshots).toBe(2);
+      expect((await runSync(env.cfg, options)).counters.filesChanged).toBe(0);
     } finally { source.close(); await env.cleanup(); }
   });
 
