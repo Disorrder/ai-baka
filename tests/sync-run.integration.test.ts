@@ -415,9 +415,58 @@ describe("structured sync (integration)", () => {
         "SELECT current_revision FROM source_location WHERE relative_path = $path",
         {path: `wd_test/${BASIC_ID}/agents/main/wire.jsonl`});
       await updateSourceRevisionParse(env.t.db, loc!.current_revision, {parseStatus: "partial"});
-      const retry = await runSync(env.cfg, syncOptions(env));
+      const snapshots: string[] = [];
+      const retry = await runSync(env.cfg, {
+        ...syncOptions(env),
+        snapshotSource: async (file, options) => {
+          snapshots.push(file);
+          return snapshotSource(file, options);
+        },
+      });
       expect(retry.counters.filesChanged).toBe(1);
       expect(retry.counters.dialoguesWritten).toBe(1);
+      expect(snapshots).toEqual([]);
+    } finally { await env.cleanup(); }
+  });
+
+  testDb("completed SQLite roots stay cached after interruption before the next root", async () => {
+    const env = await makeSyncEnv();
+    try {
+      const files = ["first.db", "second.db"].map((name) => path.join(env.srcRoot, name));
+      for (const file of files) {
+        const source = new Database(file);
+        source.exec("CREATE TABLE sample (value TEXT); INSERT INTO sample VALUES ('one')");
+        source.close();
+      }
+      env.cfg.sourceOverrides.codex = files;
+      const child = Bun.spawn([process.execPath, "-e", `
+        import { runSync } from ${JSON.stringify(new URL("../src/sync/sync-run.ts", import.meta.url).href)};
+        const { cfg, options } = JSON.parse(await Bun.stdin.text());
+        await runSync(cfg, { ...options, logger: () => {}, onProgress: (progress) => {
+          if (progress.detail === "Подготовка источника" && progress.rootsCompleted === 1) process.exit(77);
+        } });
+      `], {
+        stdin: new Blob([JSON.stringify({
+          cfg: env.cfg,
+          options: { ...syncOptions(env), harness: "codex" },
+        })]),
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const stderr = await new Response(child.stderr).text();
+      expect(await child.exited, stderr).toBe(77);
+      const snapshots: string[] = [];
+      const resumed = await runSync(env.cfg, {
+        ...syncOptions(env),
+        harness: "codex",
+        snapshotSource: async (file, options) => {
+          snapshots.push(file);
+          return snapshotSource(file, options);
+        },
+      });
+      expect(snapshots).toEqual([files[1]!]);
+      expect(resumed.counters.filesChanged).toBe(0);
+      expect(resumed.counters.filesNew).toBe(1);
     } finally { await env.cleanup(); }
   });
 
@@ -482,6 +531,96 @@ describe("structured sync (integration)", () => {
       }});
       expect(changed.counters.filesDuplicateSkipped).toBe(0);
       expect(changed.counters.filesSeen).toBe(2);
+    } finally { await env.cleanup(); }
+  });
+
+  testDb("stable malformed JSONL retries parsing without recapturing raw", async () => {
+    const env = await makeSyncEnv();
+    try {
+      const file = path.join(env.srcRoot, "session.jsonl");
+      const valid = await readFile(path.join(import.meta.dir, "fixtures/codex/basic-dialogue.jsonl"), "utf8");
+      await writeFile(file, `${valid}\n{`);
+      env.cfg.sourceOverrides.codex = [file];
+      let snapshots = 0;
+      const options = { ...syncOptions(env), harness: "codex" as const,
+        snapshotSource: async (...args: Parameters<typeof snapshotSource>) => {
+          snapshots += 1;
+          return snapshotSource(...args);
+        } };
+      const first = await runSync(env.cfg, options);
+      expect(first.status).toBe("completed_with_errors");
+      expect(first.counters.dialoguesWritten).toBe(1);
+      expect(snapshots).toBe(1);
+      const retry = await runSync(env.cfg, options);
+      expect(retry.status).toBe("completed_with_errors");
+      expect(retry.counters.ingestErrors).toBeGreaterThan(0);
+      expect(retry.counters.dialoguesWritten).toBe(1);
+      expect(snapshots).toBe(1);
+      await writeFile(file, valid);
+      const repaired = await runSync(env.cfg, options);
+      expect(repaired.status).toBe("completed");
+      expect(snapshots).toBe(2);
+    } finally { await env.cleanup(); }
+  });
+
+  testDb("stable SQLite parse errors retry without VACUUM and missing raw is recaptured", async () => {
+    const env = await makeSyncEnv();
+    try {
+      const file = path.join(env.srcRoot, "source.db");
+      const source = new Database(file);
+      source.exec("CREATE TABLE sample (value TEXT)");
+      source.close();
+      env.cfg.sourceOverrides.opencode = [file];
+      let snapshots = 0;
+      const options = { ...syncOptions(env), harness: "opencode" as const,
+        snapshotSource: async (...args: Parameters<typeof snapshotSource>) => {
+          snapshots += 1;
+          return snapshotSource(...args);
+        } };
+      expect((await runSync(env.cfg, options)).status).toBe("completed_with_errors");
+      expect(snapshots).toBe(1);
+      expect((await runSync(env.cfg, options)).counters.ingestErrors).toBeGreaterThan(0);
+      expect(snapshots).toBe(1);
+      const revision = await selectOne<{raw_archive_path: string}>(env.t.db,
+        "SELECT raw_archive_path FROM source_revision LIMIT 1");
+      await rm(path.join(env.archiveRoot, revision!.raw_archive_path));
+      expect((await runSync(env.cfg, options)).counters.ingestErrors).toBeGreaterThan(0);
+      expect(snapshots).toBe(2);
+    } finally { await env.cleanup(); }
+  });
+
+  testDb("capture checkpoint survives interruption while reparsing an existing SQLite revision", async () => {
+    const env = await makeSyncEnv();
+    try {
+      const file = path.join(env.srcRoot, "source.db");
+      const db = new Database(file);
+      db.exec("CREATE TABLE sample (value TEXT)");
+      db.close();
+      env.cfg.sourceOverrides.codex = [file];
+      const options = { ...syncOptions(env), harness: "codex" as const };
+      const initial = await runSync(env.cfg, options);
+      await rm(path.join(path.dirname(env.cfg.dbRoot), "sync-cache"), { recursive: true, force: true });
+      const child = Bun.spawn([process.execPath, "-e", `
+        import { runSync } from ${JSON.stringify(new URL("../src/sync/sync-run.ts", import.meta.url).href)};
+        const { cfg, options } = JSON.parse(await Bun.stdin.text());
+        await runSync(cfg, { ...options, logger: () => {}, onProgress: (progress) => {
+          if (progress.detail === "Чтение диалогов") process.exit(77);
+        } });
+      `], {
+        stdin: new Blob([JSON.stringify({ cfg: env.cfg, options })]),
+        stdout: "ignore", stderr: "pipe",
+      });
+      const stderr = await new Response(child.stderr).text();
+      expect(await child.exited, stderr).toBe(77);
+      let snapshots = 0;
+      const resumed = await runSync(env.cfg, { ...options,
+        snapshotSource: async (...args: Parameters<typeof snapshotSource>) => {
+          snapshots += 1;
+          return snapshotSource(...args);
+        } });
+      expect(resumed.status).toBe(initial.status);
+      expect(snapshots).toBe(0);
+      expect(resumed.counters.revisionsCreated).toBe(0);
     } finally { await env.cleanup(); }
   });
 

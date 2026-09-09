@@ -484,14 +484,15 @@ export async function runSync(cfg: AppConfig, options: SyncOptions = {}): Promis
           });
         }
       } finally {
+        // Persist completed source observations before starting another slow root.
+        rootTiming.next("source_cache_save", rootStatus);
+        if (!dryRun) await observations.save().catch((error) =>
+          log({ event: "source_cache_write_error", error: String(error) }));
         rootTiming.finish(rootStatus);
       }
       progress?.({ stage: 4, detail: "Источник обработан", root: root.harness,
         rootsCompleted: counters.roots, rootsTotal: roots.length });
     }
-    timing.next("source_cache_save");
-    if (!dryRun) await observations.save().catch((error) =>
-      log({ event: "source_cache_write_error", error: String(error) }));
 
     runStatus = errors.length > 0 || counters.ingestErrors > 0 ? "completed_with_errors" : "completed";
   } catch (error) {
@@ -539,6 +540,8 @@ export interface ReconcileScannedFilesOptions {
   resolvePath: (relativePath: string) => string;
   /** Seam для regression-тестов; production читает первые 64 КБ файла. */
   readHeadHash?: (filePath: string) => Promise<string | null>;
+  /** Caller will validate the full source observation after metadata reconciliation. */
+  hasSourceObservation?: (relativePath: string) => boolean;
   onProgress?: (completed: number, total: number) => void;
 }
 
@@ -572,7 +575,7 @@ export async function reconcileScannedFiles(
     const readHeadHash = options.readHeadHash ?? headFileHash;
     for (const file of scanFiles) {
       const previousLocation = previousByPath.get(file.relativePath);
-      if (!previousLocation?.headHash) {
+      if (!previousLocation?.headHash || options.hasSourceObservation?.(file.relativePath)) {
         options.onProgress?.(++checked, scanFiles.length);
         continue;
       }
@@ -737,27 +740,49 @@ async function processSourceRoot(
         onProgress: (completed, total) => progress("Проверка файлов", completed, total),
         resolvePath: (relativePath) =>
           rootIsFile ? root.path : path.join(root.path, relativePath),
+        hasSourceObservation: (relativePath) => {
+          const row = prevByPath.get(relativePath);
+          return Boolean(row && args.observations.getCapture(row.id.toString(), row.current_revision?.toString()));
+        },
       },
     );
     // Observed source state is distinct from immutable raw identity (especially VACUUM).
     // Cache is revision/pipeline/status-bound; missing SQLite observations fail closed.
     args.timing.next("source_fingerprints");
     let observationHits = 0;
+    const parseOnly = new Map<string, PendingParse>();
     for (const action of reconcile.actions) {
       if (action.kind !== "changed" && action.kind !== "unchanged") continue;
       const row = prevByPath.get(action.relativePath)!;
       const filePath = rootIsFile ? root.path : path.join(root.path, action.relativePath);
-      const cached = args.observations.get(row.id.toString(), row.current_revision?.toString(), pipeline, row.parse_status);
-      if (cached) {
+      const captured = args.observations.getCapture(row.id.toString(), row.current_revision?.toString());
+      if (captured) {
         const fingerprint = await readSourceFingerprint(filePath);
-        action.kind = fingerprint && fingerprint === cached.fingerprint ? "unchanged" : "changed";
-        if (action.kind === "unchanged") observationHits += 1;
+        action.kind = "changed";
+        if (fingerprint && fingerprint === captured.fingerprint) {
+          if (args.observations.get(row.id.toString(), row.current_revision?.toString(), pipeline, row.parse_status)) {
+            action.kind = "unchanged";
+            observationHits += 1;
+          } else if (row.current_revision && row.raw_archive_path && row.sha256) {
+            // Retry/upgrade the parser, not the already captured immutable bytes.
+            const rawArchivePath = path.join(cfg.archiveRoot, row.raw_archive_path);
+            const rawStat = await stat(rawArchivePath).catch(() => undefined);
+            if (rawStat?.isFile() && rawStat.size === row.size_bytes) {
+              parseOnly.set(action.relativePath, {
+                locationId: row.id, revisionId: row.current_revision,
+                revisionCreated: false, revisionParseStatus: row.parse_status,
+                relativePath: action.relativePath, rawArchivePath,
+                sha256: row.sha256, sourceFingerprint: fingerprint,
+              });
+            }
+          }
+        }
       } else if (isSqlitePath(filePath) || args.observations.has(row.id.toString()) ||
           ["pending", "partial", "parse_error"].includes(row.parse_status ?? "")) {
         action.kind = "changed";
       }
     }
-    log({ event: "source_observations", root: root.path, hits: observationHits });
+    log({ event: "source_observations", root: root.path, hits: observationHits, parseOnly: parseOnly.size });
     const scanByPath = new Map(scan.files.map((f) => [f.relativePath, f]));
     const seenPaths = new Set(scan.files.map((f) => f.relativePath));
 
@@ -767,7 +792,7 @@ async function processSourceRoot(
         if (action.kind === "new") outcome.filesNew += 1;
         if (action.kind === "changed") outcome.filesChanged += 1;
         if (action.kind === "missing" || action.kind === "deleted") outcome.filesMissing += 1;
-        log({ event: "dry_run_action", root: root.path, ...action });
+        log({ event: "dry_run_action", root: root.path, ...action, parseOnly: parseOnly.has(action.relativePath) });
       }
       return outcome;
     }
@@ -786,11 +811,19 @@ async function processSourceRoot(
     /** Неудавшийся snapshot НОВОГО файла: rename detection пропускаем (§10.7). */
     let newSnapshotFailed = false;
     const snapshotTotal = reconcile.actions.reduce(
-      (count, action) => count + Number(action.kind === "new" || action.kind === "changed"), 0);
+      (count, action) => count + Number((action.kind === "new" || action.kind === "changed") &&
+        !parseOnly.has(action.relativePath)), 0);
     let snapshotsDone = 0;
     progress("Сохранение новых и изменённых файлов", 0, snapshotTotal);
     for (const action of reconcile.actions) {
       if (action.kind !== "new" && action.kind !== "changed") continue;
+      const captured = parseOnly.get(action.relativePath);
+      if (captured) {
+        outcome.filesChanged += 1;
+        pending.push(captured);
+        log({ event: "snapshot_skipped", path: action.relativePath, reason: "stable_raw_for_reparse" });
+        continue;
+      }
       const originalPath = rootIsFile ? root.path : path.join(root.path, action.relativePath);
       const location = await ensureSourceLocation(db, {
         sourceRoot: sourceRootId,
@@ -887,6 +920,16 @@ async function processSourceRoot(
       progress("Сохранение новых и изменённых файлов", ++snapshotsDone, snapshotTotal);
     }
 
+    // A cancelled parse must not discard proof of bytes already captured.
+    args.timing.next("source_capture_save");
+    for (const p of pending) {
+      if (p.sourceFingerprint) args.observations.set(p.locationId.toString(), {
+        revision: p.revisionId.toString(), pipeline, fingerprint: p.sourceFingerprint, status: "pending",
+      });
+    }
+    await args.observations.save().catch((error) =>
+      log({ event: "source_cache_write_error", error: String(error) }));
+
     // --- Phase C: parse + canonical write (§9.3 шаги 4–7, §10.4) ---
     args.timing.next("parse_and_write");
     // Only a proven already-processed current file revision can skip parse above.
@@ -929,7 +972,7 @@ async function processSourceRoot(
         currentRevision: p.revisionId,
         lastSuccessfulRevision: parsedOk ? p.revisionId : undefined,
       });
-      if (p.sourceFingerprint && (result.status === "parsed" || result.status === "unsupported")) {
+      if (p.sourceFingerprint) {
         args.observations.set(p.locationId.toString(), {
           revision: p.revisionId.toString(), pipeline, fingerprint: p.sourceFingerprint, status: result.status,
         });

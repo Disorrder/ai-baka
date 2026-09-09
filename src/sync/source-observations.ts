@@ -31,15 +31,22 @@ export class SourceObservations {
         const value = row[1];
         if (value && typeof value.revision === "string" && typeof value.pipeline === "string" &&
             typeof value.fingerprint === "string" && value.fingerprint.startsWith("source-v1:") &&
-            ["parsed", "unsupported"].includes(value.status)) cache.entries.set(row[0], value);
+            ["parsed", "unsupported", "partial", "parse_error", "pending"].includes(value.status)) cache.entries.set(row[0], value);
       }
     } catch { /* Missing or damaged cache is a cold scan. */ }
     return cache;
   }
 
   get(location: string, revision: string | undefined, pipeline: string, status: string | undefined): SourceObservation | undefined {
+    const entry = this.getCapture(location, revision);
+    return entry && (status === "parsed" || status === "unsupported") &&
+      entry.pipeline === pipeline && entry.status === status ? entry : undefined;
+  }
+
+  /** Stable captured bytes can be reused even when parsing must be retried. */
+  getCapture(location: string, revision: string | undefined): SourceObservation | undefined {
     const entry = this.entries.get(location);
-    return entry && entry.revision === revision && entry.pipeline === pipeline && entry.status === status ? entry : undefined;
+    return entry?.revision === revision ? entry : undefined;
   }
 
   has(location: string): boolean {
