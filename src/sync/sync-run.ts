@@ -78,6 +78,7 @@ import type { PresenceStatus } from "./deletion-detector.ts";
 import type { SyncProgress } from "./progress.ts";
 import { readSourceFingerprint, physicalFileState } from "../sources/snapshot/source-fingerprint.ts";
 import { SourceObservations } from "./source-observations.ts";
+import { stageTimer, type StageTimer } from "./timing.ts";
 import { EXTRACTOR_VERSION } from "../search/extractors/types.ts";
 import { SEGMENTATION_VERSION } from "../search/segmenter.ts";
 
@@ -112,34 +113,6 @@ function defaultLogger(event: Record<string, unknown>): void {
   console.error(JSON.stringify({ time: new Date().toISOString(), ...event }));
 }
 
-interface StageTimer {
-  next(stage: string, status?: string): void;
-  finish(status: string): void;
-}
-
-/** Sequential, non-overlapping stages; root totals are nested in sync.roots. */
-function stageTimer(log: Logger, scope: Record<string, unknown>, initialStage: string): StageTimer {
-  const started = performance.now();
-  let stageStarted = started;
-  let stage = initialStage;
-  const emit = (status: string) => {
-    const now = performance.now();
-    log({ event: "sync_timing", ...scope, stage, status,
-      durationMs: Number((now - stageStarted).toFixed(3)) });
-    stageStarted = now;
-  };
-  return {
-    next(nextStage: string, status = "completed") {
-      emit(status);
-      stage = nextStage;
-    },
-    finish(status: string) {
-      emit(status);
-      log({ event: "sync_timing", ...scope, stage: "total", status,
-        durationMs: Number((performance.now() - started).toFixed(3)) });
-    },
-  };
-}
 
 interface PendingParse {
   locationId: RecordId;
@@ -998,6 +971,8 @@ async function processSourceRoot(
           parsePath: p.rawArchivePath,
           relativePath: p.relativePath,
           harnessSlug: slug,
+          onProgress: progress,
+          logger: log,
         });
         await applyOutcomeToRevision(p, result, result.dialoguesDiscovered);
         accumulateOutcome(result);
@@ -1072,6 +1047,8 @@ async function processSourceRoot(
             parsePath: viewDir,
             relativePath: sessionDir,
             harnessSlug: slug,
+            onProgress: progress,
+            logger: log,
           });
           for (const p of group) {
             await applyOutcomeToRevision(p, result, p === primary ? result.dialoguesDiscovered : 0);

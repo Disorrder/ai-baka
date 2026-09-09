@@ -25,6 +25,7 @@ import {
 import { createIngestError } from "../db/repositories/provenance.ts";
 import { modelKeyOf, writeDialogueRevision } from "../db/repositories/corpus.ts";
 import { sha256hex } from "../db/transactions.ts";
+import { stageTimer } from "./timing.ts";
 
 export type IngestParseStatus = "parsed" | "partial" | "parse_error" | "unsupported";
 
@@ -52,6 +53,8 @@ export interface IngestOptions {
   relativePath: string;
   harnessSlug: string;
   workspaceHint?: string;
+  onProgress?: (detail: string, completed?: number, total?: number, unit?: string) => void;
+  logger?: (event: Record<string, unknown>) => void;
 }
 
 export interface IngestOutcome {
@@ -124,6 +127,9 @@ export async function ingestSourceRevision(
     embeddingJobsCreated: 0,
     errors: 0,
   };
+  const scope = { sourceRevision: opts.sourceRevision.toString(), harness: opts.harnessSlug };
+  const timing = opts.logger ? stageTimer(opts.logger, { ...scope, scope: "source" }, "parse") : undefined;
+  opts.onProgress?.("Чтение диалогов");
 
   let dialogues: ParsedDialogue[];
   let diagnostics: Array<{ code: string; message: string; severity: string; sourceLocator?: string }>;
@@ -142,15 +148,22 @@ export async function ingestSourceRevision(
     });
     outcome.status = "parse_error";
     outcome.errors = 1;
+    timing?.finish("failed");
     return outcome;
   }
 
   outcome.dialoguesDiscovered = dialogues.length;
+  timing?.next("dialogues");
+  opts.onProgress?.("Обработка диалогов", 0, dialogues.length, "диалогов");
   const canonicalHashes: string[] = [];
   const fallbackBase = fallbackDialogueSourceId(opts.harnessSlug, opts.relativePath);
 
   for (const [index, dialogue] of dialogues.entries()) {
     const sourceDialogueId = dialogue.externalId ?? `${fallbackBase}#${index}`;
+    const dialogueTiming = opts.logger ? stageTimer(opts.logger,
+      { ...scope, scope: "dialogue", dialogue: index + 1, dialogues: dialogues.length }, "identity") : undefined;
+    let writeStatus = "failed";
+    opts.onProgress?.("Подготовка диалога", index, dialogues.length, "диалогов");
     try {
       const modelIds = await ensureDialogueModels(ctx, dialogue);
       const workspace = await ensureWorkspace(ctx.db, {
@@ -164,6 +177,8 @@ export async function ingestSourceRevision(
         dialogue.externalId,
         sourceDialogueId,
       );
+      dialogueTiming?.next("write");
+      opts.onProgress?.("Запись диалогов", index, dialogues.length, "диалогов");
       const result = await writeDialogueRevision(ctx.db, {
         identityKey,
         harnessInstallation: ctx.harnessInstallation,
@@ -188,6 +203,7 @@ export async function ingestSourceRevision(
         outcome.embeddingJobsCreated += result.embeddingJobCount;
       }
       canonicalHashes.push(result.revisionId.toString());
+      writeStatus = result.created ? "created" : result.switched ? "switched" : "unchanged";
     } catch (error) {
       outcome.dialoguesFailed += 1;
       outcome.errors += 1;
@@ -198,9 +214,13 @@ export async function ingestSourceRevision(
         code: "dialogue_write_failed",
         message: error instanceof Error ? (error.stack ?? error.message) : String(error),
       });
+    } finally {
+      dialogueTiming?.finish(writeStatus);
+      opts.onProgress?.("Обработка диалогов", index + 1, dialogues.length, "диалогов");
     }
   }
 
+  timing?.next("diagnostics");
   // Диагностики parser'а с severity=error — в карантин (без молчаливых skip).
   for (const diagnostic of diagnostics) {
     if (diagnostic.severity !== "error") continue;
@@ -230,5 +250,6 @@ export async function ingestSourceRevision(
   } else {
     outcome.status = "parsed";
   }
+  timing?.finish(outcome.status);
   return outcome;
 }
