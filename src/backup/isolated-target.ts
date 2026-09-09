@@ -16,9 +16,9 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const EXPECTED_IMAGE_REPOSITORY = "surrealdb/surrealdb";
-export const ISOLATED_SURREAL_VERSION = "3.2.3";
+export const ISOLATED_SURREAL_VERSION = "3.2.4";
 const PINNED_IMAGE_PATTERN =
-  /^surrealdb\/surrealdb:v(3\.2\.3)@sha256:([0-9a-f]{64})$/u;
+  /^surrealdb\/surrealdb:v(3\.2\.4)@sha256:([0-9a-f]{64})$/u;
 const IDENTITY_TOKEN_PATTERN = /^[0-9a-f]{32}$/u;
 const CONTAINER_NAME_PATTERN = /^baka-restore-target-[0-9a-f]{32}$/u;
 const VOLUME_NAME_PATTERN = /^baka-restore-target-data-[0-9a-f]{32}$/u;
@@ -57,9 +57,9 @@ export interface IsolatedTargetResourceProfile {
 }
 
 /**
- * Compile-time FULLTEXT indexing behavior of surrealdb-core 3.2.3 at
- * 40522d1d2fd8e30017ebc2625a14aa5435c27347. It is attested from the exact
- * pinned image and deliberately is not presented as a configurable resource.
+ * Compile-time FULLTEXT indexing behavior of surrealdb-core 3.2.4 at
+ * 93ab219d69f09d8f999851b0359c80ebe6726102 (kvs/consts.rs and kvs/index/builder.rs).
+ * These source-level bounds are not configurable resource settings.
  */
 export interface PinnedIndexingBehavior {
   readonly probeRecords: 16;
@@ -188,7 +188,7 @@ export interface IsolatedTargetCleanupEvidence {
 export interface IsolatedTargetEvidence {
   formatVersion: 2;
   image: string;
-  version: "3.2.3";
+  version: "3.2.4";
   runtimeVersion?: string;
   identity: IsolatedTargetIdentity;
   hostAddress: "127.0.0.1";
@@ -399,7 +399,7 @@ function unquoteYamlScalar(value: string): string | undefined {
 /** Extracts exactly one literal image from the compose `surrealdb` service. */
 export function pinnedSurrealImageFromCompose(compose: string): {
   image: string;
-  version: "3.2.3";
+  version: "3.2.4";
 } {
   const lines = compose.replaceAll("\r\n", "\n").split("\n");
   const serviceIndex = lines.findIndex((line) => /^  surrealdb:\s*(?:#.*)?$/u.test(line));
@@ -424,7 +424,7 @@ export function pinnedSurrealImageFromCompose(compose: string): {
   }
   const match = images[0]!.match(PINNED_IMAGE_PATTERN);
   if (!match || !images[0]!.startsWith(`${EXPECTED_IMAGE_REPOSITORY}:`)) {
-    throw new Error("compose surrealdb image must be exact v3.2.3 tag plus sha256 digest");
+    throw new Error("compose surrealdb image must be exact v3.2.4 tag plus sha256 digest");
   }
   return { image: images[0]!, version: ISOLATED_SURREAL_VERSION };
 }
@@ -434,7 +434,7 @@ export function validateIsolatedTargetLaunchPlan(
 ): IsolatedTargetLaunchPlan {
   const imageMatch = input.image.match(PINNED_IMAGE_PATTERN);
   if (!imageMatch || input.version !== ISOLATED_SURREAL_VERSION) {
-    throw new Error("isolated target requires the exact pinned SurrealDB v3.2.3 image");
+    throw new Error("isolated target requires the exact pinned SurrealDB v3.2.4 image");
   }
   const identity = validateIsolatedTargetIdentity(input.identity);
   if (input.hostAddress !== "127.0.0.1") {

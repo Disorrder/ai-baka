@@ -30,7 +30,7 @@ function counter(): ExactTokenCounter {
 
 const NOW = () => new Date("2026-07-26T12:00:00Z");
 const VERSION_SCRIPT =
-  "console.log(JSON.stringify({id:'ai-baka-exact-tokenizer',protocolVersion:1,scriptVersion:1,package:{name:'tiktoken',version:'0.13.0'},resolver:'encoding_for_model'}))";
+  "console.log(JSON.stringify({id:'ai-baka-exact-tokenizer',protocolVersion:1,scriptVersion:1,package:{name:'tiktoken',version:'0.14.0'},resolver:'encoding_for_model'}))";
 
 describe("exact token-count workflow (Stage 11)", () => {
   test("counts in bounded batches, verifies hashes, and uses only configured price", async () => {

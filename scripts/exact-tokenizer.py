@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "tiktoken==0.13.0",
+#   "tiktoken==0.14.0",
 # ]
 # ///
 """Trusted exact-token JSON protocol for ai-baka.
@@ -36,7 +36,7 @@ import tiktoken
 PROTOCOL_ID = "ai-baka-exact-tokenizer"
 PROTOCOL_VERSION = 1
 SCRIPT_VERSION = 1
-TIKTOKEN_VERSION = "0.13.0"
+TIKTOKEN_VERSION = "0.14.0"
 MAX_BATCH_SIZE = 1_000
 
 
@@ -108,7 +108,7 @@ def resolve_encoding(model: str) -> tiktoken.Encoding:
         return tiktoken.encoding_for_model(model)
     except KeyError as error:
         # No get_encoding/model-prefix guess: the requested model must be one
-        # tiktoken 0.13.0 explicitly knows how to resolve.
+        # tiktoken 0.14.0 explicitly knows how to resolve.
         raise ProtocolError("unknown-model") from error
     except Exception as error:
         raise ProtocolError("encoding-resolution-failed") from error

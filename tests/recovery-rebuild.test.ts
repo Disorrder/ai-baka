@@ -56,14 +56,14 @@ function config(archiveRoot: string): AppConfig {
 function manifest(): BackupManifest {
   return {
     createdAt: "2026-07-27T00:01:50.000Z",
-    surrealdbVersion: "surrealdb-3.2.3",
+    surrealdbVersion: "surrealdb-3.2.4",
     schemaVersion: 5,
     bakaCommit: "test",
     namespace: "baka",
     database: "archive",
     recordCounts: { search_document: 2, chunk: 3 },
     rawManifestSha256: "c".repeat(64),
-    exportFile: "2026-07-27T161832Z__schema-5__surreal-3.2.3.surql.zst",
+    exportFile: "2026-07-27T161832Z__schema-5__surreal-3.2.4.surql.zst",
     compression: "zstd",
     exportBytes: 123,
     exportSha256: EXPORT_SHA,
@@ -296,7 +296,7 @@ describe("recovery:rebuild orchestration", () => {
 
       await writeFile(manifestPath, `${JSON.stringify({
         ...exact,
-        surrealdbVersion: "3.2.4",
+        surrealdbVersion: "3.2.3",
       })}\n`);
       await expect(authenticateRecoveryBackup(config(archiveRoot), exportPath))
         .rejects.toThrow("exact authenticated schema-5");

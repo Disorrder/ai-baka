@@ -342,8 +342,8 @@ isolatedTest(
       });
 
       expect(result.value.hostPort).not.toBe(8901);
-      expect(result.evidence.version).toBe("3.2.3");
-      expect(result.evidence.runtimeVersion).toStartWith("3.2.3");
+      expect(result.evidence.version).toBe("3.2.4");
+      expect(result.evidence.runtimeVersion).toStartWith("3.2.4");
       expect(result.evidence.cleanup).toEqual(expect.objectContaining({
         containerRemoved: true,
         volumeRemoved: true,

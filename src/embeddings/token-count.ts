@@ -19,7 +19,7 @@ export const EXACT_TOKEN_REPORT_FORMAT_VERSION = 1;
 /** API limit is 8192; valid inputs must be strictly smaller (§13.2/§13.4). */
 export const EMBEDDING_MODEL_TOKEN_LIMIT = 8192;
 export const EXACT_TOKENIZER_ID =
-  "ai-baka-exact-tokenizer/1+script@1+tiktoken@0.13.0";
+  "ai-baka-exact-tokenizer/1+script@1+tiktoken@0.14.0";
 
 export interface EligibleCorpusDocument {
   id: string;
@@ -328,7 +328,7 @@ interface CommandTokenizerVersion {
   id: "ai-baka-exact-tokenizer";
   protocolVersion: 1;
   scriptVersion: 1;
-  package: { name: "tiktoken"; version: "0.13.0" };
+  package: { name: "tiktoken"; version: "0.14.0" };
   resolver: "encoding_for_model";
 }
 
@@ -336,7 +336,7 @@ const EXPECTED_COMMAND_TOKENIZER_VERSION: CommandTokenizerVersion = {
   id: "ai-baka-exact-tokenizer",
   protocolVersion: 1,
   scriptVersion: 1,
-  package: { name: "tiktoken", version: "0.13.0" },
+  package: { name: "tiktoken", version: "0.14.0" },
   resolver: "encoding_for_model",
 };
 

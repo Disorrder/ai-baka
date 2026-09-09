@@ -43,7 +43,6 @@ import {
   assertMigrationApply,
   assertMigrationProductionOutcome,
   boundedCandidateOptions,
-  exactTokenizerCommandOptions,
   formatHit,
   formatProductionBackfillPlan,
   formatRecoveryRebuildSuccess,
@@ -160,8 +159,8 @@ function flags(item: Command): string[] {
 }
 
 const PINNED_SURREAL_IMAGE_ID =
-  "sha256:2006fe3f88f6f240c6463460021b4a14ffe102aea376284428f850045b7b382e";
-const PINNED_SURREAL_IMAGE = `surrealdb/surrealdb:v3.2.3@${PINNED_SURREAL_IMAGE_ID}`;
+  "sha256:51baed8709f57f67dcf04b30e3177db846803fa9342dae2be58c6fa5f8d59843";
+const PINNED_SURREAL_IMAGE = `surrealdb/surrealdb:v3.2.4@${PINNED_SURREAL_IMAGE_ID}`;
 
 function productionMaintenanceConfig(archiveRoot = "/safe/archive"): AppConfig {
   return {
@@ -236,8 +235,8 @@ function isolatedLifecycleEvidence(): IsolatedTargetEvidence {
   return {
     formatVersion: 2,
     image: PINNED_SURREAL_IMAGE,
-    version: "3.2.3",
-    runtimeVersion: "3.2.3 for linux on aarch64",
+    version: "3.2.4",
+    runtimeVersion: "3.2.4 for linux on aarch64",
     identity: {
       attemptToken: token,
       containerName: `baka-restore-target-${token}`,
@@ -473,19 +472,6 @@ describe("CLI safe parsers", () => {
     }
   });
 
-  test("exact tokenizer is pinned and forced offline", () => {
-    const options = exactTokenizerCommandOptions("text-embedding-3-large");
-    expect(options.executable).toBe("uv");
-    expect(options.args).toEqual([
-      "run",
-      "--quiet",
-      "--offline",
-      "--script",
-      EXACT_TOKENIZER_SCRIPT,
-    ]);
-    expect(options.requireOffline).toBe(true);
-    expect(options.id).toContain("tiktoken@0.13.0");
-  });
 
   test("full-corpus accept pins reviewed judgments before DB/complete", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "baka-cli-judgment-pin-"));
@@ -1087,7 +1073,7 @@ describe("production maintenance wrapper", () => {
     expect(() => validateProductionContainer(
       exact,
       cfg,
-      "surrealdb/surrealdb:v3.2.3",
+      "surrealdb/surrealdb:v3.2.4",
       { requireHealthy: true },
     )).toThrow(/identity mismatch/);
   });

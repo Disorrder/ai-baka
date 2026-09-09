@@ -17,8 +17,8 @@ import {
 } from "../src/backup/isolated-target.ts";
 
 const PINNED_IMAGE =
-  "surrealdb/surrealdb:v3.2.3@sha256:" +
-  "2006fe3f88f6f240c6463460021b4a14ffe102aea376284428f850045b7b382e";
+  "surrealdb/surrealdb:v3.2.4@sha256:" +
+  "51baed8709f57f67dcf04b30e3177db846803fa9342dae2be58c6fa5f8d59843";
 const ATTEMPT_UUID = "11111111-2222-4333-8444-555555555555";
 const ATTEMPT_TOKEN = ATTEMPT_UUID.replaceAll("-", "");
 const COMPOSE = `services:
@@ -205,7 +205,7 @@ class FakeDocker {
       if (args.includes("version")) {
         return this.failVersion
           ? this.result(19, "", this.commandFailureText)
-          : this.result(0, "3.2.3 for linux on aarch64\n");
+          : this.result(0, "3.2.4 for linux on aarch64\n");
       }
     }
     if (args[0] === "container" && args[1] === "stats") {
@@ -257,7 +257,7 @@ function validPlan(): IsolatedTargetLaunchPlan {
   const identity = createIsolatedTargetIdentity(ATTEMPT_UUID);
   return {
     image: PINNED_IMAGE,
-    version: "3.2.3",
+    version: "3.2.4",
     identity,
     hostAddress: "127.0.0.1",
     containerPort: 8000,
@@ -275,15 +275,15 @@ function lifecycleFailure(error: unknown): IsolatedTargetLifecycleError {
 }
 
 describe("isolated target fail-closed launch contract", () => {
-  test("derives one exact v3.2.3 tag+digest and rejects every unpinned form", () => {
+  test("derives the exact pinned tag+digest and rejects every unpinned form", () => {
     expect(pinnedSurrealImageFromCompose(COMPOSE)).toEqual({
       image: PINNED_IMAGE,
-      version: "3.2.3",
+      version: "3.2.4",
     });
     for (const image of [
-      "surrealdb/surrealdb:v3.2.3",
+      "surrealdb/surrealdb:v3.2.4",
       "surrealdb/surrealdb:latest@sha256:" + "a".repeat(64),
-      "surrealdb/surrealdb:v3.2.2@sha256:" + "a".repeat(64),
+      "surrealdb/surrealdb:v3.2.3@sha256:" + "a".repeat(64),
       "${SURREAL_IMAGE}",
     ]) {
       expect(() => pinnedSurrealImageFromCompose(`services:\n  surrealdb:\n    image: ${image}\n`))
@@ -450,8 +450,8 @@ describe("isolated target dependency-injected lifecycle", () => {
     expect(result.value.endpoint).toBe("http://127.0.0.1:49152");
     expect(result.evidence.image).toBe(PINNED_IMAGE);
     expect(result.evidence.formatVersion).toBe(2);
-    expect(result.evidence.version).toBe("3.2.3");
-    expect(result.evidence.runtimeVersion).toStartWith("3.2.3 ");
+    expect(result.evidence.version).toBe("3.2.4");
+    expect(result.evidence.runtimeVersion).toStartWith("3.2.4 ");
     expect(result.evidence.resources).toEqual(DEFAULT_ISOLATED_TARGET_RESOURCE_PROFILE);
     expect(result.evidence.pinnedIndexingBehavior).toEqual(
       PINNED_SURREAL_INDEXING_BEHAVIOR,

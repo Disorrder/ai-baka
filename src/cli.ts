@@ -2095,7 +2095,7 @@ export interface IsolatedRestoreTargetFailureEvidence {
   finishedAt?: string;
   failure: { stage: string; code: string };
   target?: {
-    image: { version: "3.2.3"; digest: typeof PINNED_RESTORE_TARGET_IMAGE_DIGEST };
+    image: { version: "3.2.4"; digest: typeof PINNED_RESTORE_TARGET_IMAGE_DIGEST };
     dataIdentitySha256: string;
     resourceBounds: RestoreTargetEvidence["resourceBounds"];
     pinnedIndexingBehavior: RestoreTargetEvidence["pinnedIndexingBehavior"];

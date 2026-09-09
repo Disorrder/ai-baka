@@ -11,7 +11,7 @@ const KNOWN_TEXTS = [
   "👩‍💻 café\n第二行",
   "<|endoftext|>",
 ];
-// tiktoken==0.13.0, encoding_for_model("text-embedding-3-large") → cl100k_base.
+// tiktoken==0.14.0, encoding_for_model("text-embedding-3-large") → cl100k_base.
 const KNOWN_COUNTS = [0, 2, 7, 12, 7];
 
 interface Invocation {
@@ -62,7 +62,7 @@ beforeAll(async () => {
 });
 
 describe("exact-tokenizer trusted JSON protocol", () => {
-  test("returns known tiktoken 0.13.0 counts for empty/Unicode/special-looking text", () => {
+  test("returns known tiktoken counts for empty/Unicode/special-looking text", () => {
     expect(warmInvocation.stderr).toBe("");
     expect(warmInvocation.stdout.endsWith("\n")).toBe(true);
     const response = JSON.parse(warmInvocation.stdout) as { counts: number[] };
@@ -90,7 +90,7 @@ describe("exact-tokenizer trusted JSON protocol", () => {
       id: "ai-baka-exact-tokenizer",
       protocolVersion: 1,
       scriptVersion: 1,
-      package: { name: "tiktoken", version: "0.13.0" },
+      package: { name: "tiktoken", version: "0.14.0" },
       resolver: "encoding_for_model",
     });
   });
@@ -99,7 +99,7 @@ describe("exact-tokenizer trusted JSON protocol", () => {
     const counter = createCommandTokenCounter({
       executable: "uv",
       args: ["run", "--quiet", "--offline", "--script", SCRIPT],
-      id: "ai-baka-exact-tokenizer/1+tiktoken@0.13.0",
+      id: "ai-baka-exact-tokenizer/1+tiktoken@0.14.0",
       model: MODEL,
       requireOffline: true,
     });
