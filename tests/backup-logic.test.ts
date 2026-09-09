@@ -9,7 +9,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   CORE_TABLES,
-  SCHEMA_5_CORE_TABLES,
   backupTimestamp,
   coreTablesForSchemaVersion,
   exportBaseName,
@@ -44,7 +43,7 @@ async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   }
 }
 
-function discoveryManifest(exportFile: string, exportBytes: number, schemaVersion = 4) {
+function discoveryManifest(exportFile: string, exportBytes: number, schemaVersion = 1) {
   return {
     createdAt: "2026-07-26T00:00:00.000Z",
     surrealdbVersion: "3.2.3",
@@ -62,25 +61,10 @@ function discoveryManifest(exportFile: string, exportBytes: number, schemaVersio
 }
 
 describe("backup naming", () => {
-  test("таблицы backup строго зависят от версии схемы", () => {
-    const schema4 = coreTablesForSchemaVersion(4);
-    const schema5 = coreTablesForSchemaVersion(5);
-    expect(SCHEMA_5_CORE_TABLES).toEqual([
-      "migration_row_commit",
-      "migration_quarantine",
-    ]);
-    expect(schema4).toEqual(
-      CORE_TABLES.filter((table) => !SCHEMA_5_CORE_TABLES.includes(
-        table as typeof SCHEMA_5_CORE_TABLES[number],
-      )),
-    );
-    expect(schema5).toEqual(CORE_TABLES);
-    expect(coreTablesForSchemaVersion(6)).toEqual(CORE_TABLES);
-    expect(coreTablesForSchemaVersion(7)).toEqual(CORE_TABLES);
-    expect(coreTablesForSchemaVersion(8)).toEqual(CORE_TABLES);
-    expect(coreTablesForSchemaVersion(9)).toEqual(CORE_TABLES);
-    expect(() => coreTablesForSchemaVersion(3)).toThrow(/неподдерживаемая версия схемы/);
-    expect(() => coreTablesForSchemaVersion(10)).toThrow(/неподдерживаемая версия схемы/);
+  test("backup rejects uninitialized, obsolete and unknown schemas", () => {
+    for (const version of [0, 2, 4, 5, 6, 7, 8, 9, 10, NaN]) {
+      expect(() => coreTablesForSchemaVersion(version)).toThrow(/неподдерживаемая версия схемы/);
+    }
   });
 
   test("timestamp по формату §16.1", () => {
@@ -88,19 +72,19 @@ describe("backup naming", () => {
   });
 
   test("имя export'а и manifest'а", () => {
-    const base = exportBaseName("2026-07-24T120000Z", 4, "3.2.3");
-    expect(base).toBe("2026-07-24T120000Z__schema-4__surreal-3.2.3");
+    const base = exportBaseName("2026-07-24T120000Z", 1, "3.2.3");
+    expect(base).toBe("2026-07-24T120000Z__schema-1__surreal-3.2.3");
     expect(exportFileName(base, "zstd")).toBe(`${base}.surql.zst`);
     expect(exportFileName(base, "gzip")).toBe(`${base}.surql.gz`);
     // строка /version с build metadata нормализуется до semver
-    expect(exportBaseName("2026-07-24T120000Z", 4, "surrealdb-3.2.3+20260721.40522d1")).toBe(base);
+    expect(exportBaseName("2026-07-24T120000Z", 1, "surrealdb-3.2.3+20260721.40522d1")).toBe(base);
   });
 
   test("manifestPathForExport для zst и gz", () => {
     for (const ext of ["zst", "gz"]) {
-      const exportPath = `/archive/backups/surreal/ts__schema-4__surreal-3.2.3.surql.${ext}`;
+      const exportPath = `/archive/backups/surreal/ts__schema-1__surreal-3.2.3.surql.${ext}`;
       expect(manifestPathForExport(exportPath)).toBe(
-        "/archive/backups/manifests/ts__schema-4__surreal-3.2.3.json",
+        "/archive/backups/manifests/ts__schema-1__surreal-3.2.3.json",
       );
     }
   });
@@ -111,7 +95,7 @@ describe("backup naming", () => {
       const manifests = path.join(dir, "backups", "manifests");
       await mkdir(surreal, { recursive: true });
       await mkdir(manifests, { recursive: true });
-      const good = path.join(surreal, "2026-07-24T120000Z__schema-4__surreal-3.2.3.surql.zst");
+      const good = path.join(surreal, "2026-07-24T120000Z__schema-1__surreal-3.2.3.surql.zst");
       await writeFile(good, "x");
       await writeFile(
         manifestPathForExport(good),
@@ -119,7 +103,7 @@ describe("backup naming", () => {
       );
       // остаток аварийно прерванного backup'а с более поздним timestamp
       await writeFile(
-        path.join(surreal, ".tmp-1-2026-07-25T120000Z__schema-4__surreal-3.2.3.surql.zst.part"),
+        path.join(surreal, ".tmp-1-2026-07-25T120000Z__schema-1__surreal-3.2.3.surql.zst.part"),
         "partial",
       );
       expect(await latestExportPath(dir)).toBe(good);
@@ -134,7 +118,7 @@ describe("backup naming", () => {
       await mkdir(manifests, { recursive: true });
       const committed = path.join(
         surreal,
-        "2026-07-24T120000Z__schema-4__surreal-3.2.3.surql.gz",
+        "2026-07-24T120000Z__schema-1__surreal-3.2.3.surql.gz",
       );
       await writeFile(committed, "committed");
       await writeFile(
@@ -144,20 +128,20 @@ describe("backup naming", () => {
 
       const exportOnly = path.join(
         surreal,
-        "2026-07-25T120000Z__schema-4__surreal-3.2.3.surql.gz",
+        "2026-07-25T120000Z__schema-1__surreal-3.2.3.surql.gz",
       );
       await writeFile(exportOnly, "partial");
 
       const malformed = path.join(
         surreal,
-        "2026-07-26T120000Z__schema-4__surreal-3.2.3.surql.gz",
+        "2026-07-26T120000Z__schema-1__surreal-3.2.3.surql.gz",
       );
       await writeFile(malformed, "complete-looking");
       await writeFile(manifestPathForExport(malformed), "{not-json");
 
       const mismatched = path.join(
         surreal,
-        "2026-07-27T120000Z__schema-4__surreal-3.2.3.surql.gz",
+        "2026-07-27T120000Z__schema-1__surreal-3.2.3.surql.gz",
       );
       await writeFile(mismatched, "same-size");
       await writeFile(
@@ -167,7 +151,7 @@ describe("backup naming", () => {
 
       const sizedPartial = path.join(
         surreal,
-        "2026-07-28T120000Z__schema-4__surreal-3.2.3.surql.gz",
+        "2026-07-28T120000Z__schema-1__surreal-3.2.3.surql.gz",
       );
       await writeFile(sizedPartial, "partial");
       await writeFile(
@@ -197,58 +181,25 @@ describe("backup identifier and publication safety", () => {
         return [[{ n: 0 }]];
       },
     } as unknown as Surreal;
-    await expect(recordCounts(db, 5)).rejects.toThrow(/небезопасный внутренний идентификатор/);
+    await expect(recordCounts(db, 1)).rejects.toThrow(/небезопасный внутренний идентификатор/);
     expect(queries.some((sql) => sql.includes("FROM search_embedding_ok;"))).toBe(false);
   });
 
-  test("recordCounts schema 4 не запрашивает таблицы 0005, schema 5 запрашивает обе", async () => {
-    const queries: string[] = [];
-    const db = {
-      query: async (sql: string) => {
-        queries.push(sql);
-        if (sql.includes("SELECT id, physical_table FROM embedding_space")) return [[]];
-        return [[{ n: 0 }]];
-      },
-    } as unknown as Surreal;
-
-    const schema4 = await recordCounts(db, 4);
-    expect(Object.keys(schema4).sort()).toEqual([...coreTablesForSchemaVersion(4)].sort());
-    expect(queries.some((sql) => sql.includes("FROM migration_row_commit"))).toBe(false);
-    expect(queries.some((sql) => sql.includes("FROM migration_quarantine"))).toBe(false);
-
-    queries.length = 0;
-    const schema5 = await recordCounts(db, 5);
-    expect(schema5.migration_row_commit).toBe(0);
-    expect(schema5.migration_quarantine).toBe(0);
-    expect(queries.some((sql) => sql.includes("FROM migration_row_commit"))).toBe(true);
-    expect(queries.some((sql) => sql.includes("FROM migration_quarantine"))).toBe(true);
-  });
-
-  test("restore count contract rejects missing and cross-version tables", () => {
-    const schema4 = Object.fromEntries(coreTablesForSchemaVersion(4).map((table) => [table, 0]));
-    expect(validateRecordCountTables(schema4, new Set(), 4)).toHaveLength(
-      coreTablesForSchemaVersion(4).length,
-    );
+  test("restore count contract rejects omitted durable and unowned tables", () => {
+    const counts = Object.fromEntries(CORE_TABLES.map((table) => [table, 0]));
     expect(() => validateRecordCountTables(
-      { ...schema4, migration_quarantine: 0 },
-      new Set(),
-      4,
+      { ...counts, unowned_table: 0 }, new Set(), 1,
     )).toThrow(/неизвестную/);
-
-    const incompleteSchema5 = Object.fromEntries(
-      CORE_TABLES.filter((table) => table !== "migration_row_commit").map((table) => [table, 0]),
-    );
-    expect(() => validateRecordCountTables(incompleteSchema5, new Set(), 5))
+    const { migration_row_commit: _omitted, ...incomplete } = counts;
+    expect(() => validateRecordCountTables(incomplete, new Set(), 1))
       .toThrow(/migration_row_commit/);
-    expect(() => validateRecordCountTables(schema4, new Set(), 6))
-      .toThrow(/migration_quarantine/);
   });
 
   test("manifest recordCounts injection is rejected during parsing", () => {
     expect(() => parseBackupManifest({
       createdAt: "2026-07-26T00:00:00.000Z",
       surrealdbVersion: "3.2.3",
-      schemaVersion: 5,
+      schemaVersion: 1,
       bakaCommit: "test",
       namespace: "baka",
       database: "archive",

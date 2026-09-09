@@ -1,5 +1,5 @@
 import { afterAll, describe, expect } from "bun:test";
-import { copyFile, cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { cp, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   applyMigrations,
@@ -20,8 +20,8 @@ import {
 
 // Явный skip в отчёте, если SurrealDB не поднят (вместо молчаливого return).
 const testDb = await dbTest();
-const LATEST_SCHEMA_VERSION = 9;
-const LATEST_MIGRATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+const LATEST_SCHEMA_VERSION = 1;
+const LATEST_MIGRATIONS = [1];
 
 afterAll(async () => {
   await finishLiveTestFile();
@@ -92,69 +92,6 @@ describe("migrations (integration, живой SurrealDB)", () => {
     }
   });
 
-  testDb("upgrade schema 4→5 удаляет только chunk_content index и сохраняет canonical chunks", async () => {
-    const t = await createTestDb(false);
-    try {
-      await withTempDir(async (dir) => {
-        const schemaDir = path.join(dir, "schema");
-        await mkdir(schemaDir);
-        for (const file of [
-          "0001_initial.surql",
-          "0002_search_documents.surql",
-          "0003_embedding_spaces.surql",
-          "0004_legacy_migration_metadata.surql",
-        ]) {
-          await copyFile(path.join(SCHEMA_DIR, file), path.join(schemaDir, file));
-        }
-
-        const before = await applyMigrations(t.db, {
-          schemaDir,
-          sentinel: sentinelFor(t.name),
-          bakaCommit: "schema4",
-          surrealdbVersion: "test-server",
-        });
-        expect(before.version).toBe(4);
-        const [indexed] = await t.db.query<[{ indexes: Record<string, string> }]>(
-          "INFO FOR TABLE chunk",
-        );
-        expect(indexed!.indexes).toHaveProperty("chunk_content");
-
-        await t.db.query(`CREATE chunk:preserved SET
-          dialogue = dialogue:preserved,
-          dialogue_revision = dialogue_revision:preserved,
-          message = message:preserved,
-          sequence = 0,
-          kind = "thought",
-          role = "assistant",
-          content = "canonical survives",
-          content_sha256 = "${"a".repeat(64)}",
-          content_bytes = 18`);
-
-        await copyFile(
-          path.join(SCHEMA_DIR, "0005_legacy_migration_run.surql"),
-          path.join(schemaDir, "0005_legacy_migration_run.surql"),
-        );
-        const upgraded = await applyMigrations(t.db, {
-          schemaDir,
-          sentinel: sentinelFor(t.name),
-          bakaCommit: "schema5",
-          surrealdbVersion: "test-server",
-        });
-        expect(upgraded).toEqual({ applied: [5], version: 5 });
-        const [withoutGlobalForensic] = await t.db.query<
-          [{ indexes: Record<string, string> }]
-        >("INFO FOR TABLE chunk");
-        expect(withoutGlobalForensic!.indexes).not.toHaveProperty("chunk_content");
-        const [preserved] = await t.db.query<[Array<{ content: string }>]>(
-          "SELECT content FROM chunk:preserved",
-        );
-        expect(preserved).toEqual([{ content: "canonical survives" }]);
-      });
-    } finally {
-      await dropTestDb(t);
-    }
-  });
-
   testDb("повторное применение идемпотентно", async () => {
     const t = await createTestDb(false);
     try {
@@ -183,12 +120,12 @@ describe("migrations (integration, живой SurrealDB)", () => {
         await applyMigrations(t.db, { schemaDir: dir });
         // «Подделываем» уже применённый файл
         await writeFile(
-          path.join(dir, "0002_search_documents.surql"),
+          path.join(dir, "0001_initial.surql"),
           "-- комментарий, изменивший checksum\n",
           { flag: "a" },
         );
-        expect(applyMigrations(t.db, { schemaDir: dir })).rejects.toThrow(MigrationError);
-        expect(applyMigrations(t.db, { schemaDir: dir })).rejects.toThrow(/checksum/);
+        await expect(applyMigrations(t.db, { schemaDir: dir })).rejects.toThrow(MigrationError);
+        await expect(applyMigrations(t.db, { schemaDir: dir })).rejects.toThrow(/checksum/);
       });
     } finally {
       await dropTestDb(t);
@@ -204,7 +141,7 @@ describe("migrations (integration, живой SurrealDB)", () => {
           version = 99, name = "from_the_future", checksum = "x",
           applied_at = time::now(), baka_commit = "?", surrealdb_version = "?"`,
       );
-      expect(applyMigrations(t.db, { schemaDir: SCHEMA_DIR })).rejects.toThrow(
+      await expect(applyMigrations(t.db, { schemaDir: SCHEMA_DIR })).rejects.toThrow(
         /новее всех известных/,
       );
     } finally {

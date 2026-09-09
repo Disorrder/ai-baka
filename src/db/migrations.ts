@@ -41,7 +41,6 @@ export interface ApplyOptions {
   sentinel?: ArchiveSentinel;
 }
 
-const EMBEDDING_TABLE_NAME = /^search_embedding_[a-zA-Z0-9_]+$/;
 
 type LoadedMigration = Readonly<
   MigrationFile & {
@@ -190,26 +189,6 @@ async function upsertArchiveMeta(
   );
 }
 
-/**
- * Физические embedding-таблицы создаются динамически, поэтому их индексы не
- * могут жить в numbered .surql schema-файле. Схема 0007 вводит writer
- * reference indexes; этот helper догоняет уже существующие search_embedding_*.
- */
-async function ensureEmbeddingReferenceIndexes(db: Surreal): Promise<void> {
-  const [spaces] = await db.query<[Array<{ physical_table?: string }>]>(
-    "SELECT physical_table FROM embedding_space",
-  );
-  for (const space of spaces ?? []) {
-    const table = space.physical_table;
-    if (!table) continue;
-    if (!EMBEDDING_TABLE_NAME.test(table)) {
-      throw new MigrationError(`небезопасное имя embedding-таблицы в БД: ${table}`);
-    }
-    await db.query(
-      `DEFINE INDEX IF NOT EXISTS search_document_idx ON TABLE ${table} FIELDS search_document;`,
-    );
-  }
-}
 
 /**
  * Применяет недостающие миграции последовательно (docs/plan.md §6):
@@ -240,9 +219,6 @@ export async function applyMigrations(
   const appliedNow: number[] = [];
   for (const migration of pending) {
     await db.query(migration.content);
-    if (migration.version === 7) {
-      await ensureEmbeddingReferenceIndexes(db);
-    }
     await db.query(
       `CREATE schema_migration SET
         version = $version,
@@ -269,9 +245,6 @@ export async function applyMigrations(
     await upsertArchiveMeta(db, options.sentinel, version, bakaCommit);
   }
 
-  if (version >= 7) {
-    await ensureEmbeddingReferenceIndexes(db);
-  }
 
   return { applied: appliedNow, version };
 }

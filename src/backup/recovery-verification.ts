@@ -42,7 +42,7 @@ export interface RecoverySearchSourceChunkOwnership {
 
 export interface RecoveryDatabaseVerification {
   ok: true;
-  schemaVersion: 5;
+  schemaVersion: 1;
   recordCounts: Record<string, number>;
   rawManifestSha256: string;
   rawFilesChecked: number;
@@ -232,9 +232,9 @@ export async function verifyRecoveryIndexTopology(
 }
 
 export async function verifyRecoveryRelationalChecks(db: Surreal): Promise<void> {
-  // Recovery accepts schema 5 as the only baseline, so its durable migration
+  // Recovery accepts schema 1 as the only baseline, so its durable migration
   // ledger/quarantine references are part of the same fail-closed check set.
-  for (const [, sql] of restoreRelationalChecksForSchemaVersion(5)) {
+  for (const [, sql] of restoreRelationalChecksForSchemaVersion(1)) {
     const violations = (await selectOne<{ n: number }>(db, sql))?.n ?? 0;
     if (violations !== 0) throw new Error("recovery relational invariant failed");
   }
@@ -319,13 +319,13 @@ export async function verifyRecoveryDatabase(
     verifyTopology?: (cfg: AppConfig) => Promise<RecoveryDatabaseVerification["fulltext"]>;
   } = {},
 ): Promise<RecoveryDatabaseVerification> {
-  if (manifest.schemaVersion !== 5 || !manifest.rawManifestSha256) {
-    throw new Error("recovery verification requires authenticated schema 5 manifest");
+  if (manifest.schemaVersion !== 1 || !manifest.rawManifestSha256) {
+    throw new Error("recovery verification requires authenticated schema 1 manifest");
   }
   const db = await (options.connect ?? connectDb)(cfg);
   try {
-    if (await checkSchemaVersion(db) !== 5) throw new Error("recovery schema version mismatch");
-    const counts = await recordCounts(db, 5);
+    if (await checkSchemaVersion(db) !== 1) throw new Error("recovery schema version mismatch");
+    const counts = await recordCounts(db, 1);
     if (!exactCounts(counts, manifest.recordCounts)) {
       throw new Error("recovery record counts differ from authenticated manifest");
     }
@@ -348,7 +348,7 @@ export async function verifyRecoveryDatabase(
     const fulltext = await (options.verifyTopology ?? verifyRecoveryIndexTopology)(cfg);
     return {
       ok: true,
-      schemaVersion: 5,
+      schemaVersion: 1,
       recordCounts: counts,
       rawManifestSha256: rawHash,
       rawFilesChecked: raw.checked,

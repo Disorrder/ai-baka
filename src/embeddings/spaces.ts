@@ -1,7 +1,7 @@
 /**
  * Embedding spaces (docs/plan.md §13.1–§13.3, этап 7).
  *
- * Каждое space — metadata-запись embedding_space (schema/0003) + отдельная
+ * Каждое space — metadata-запись embedding_space (schema/0001_initial.surql) + отдельная
  * физическая vector-таблица search_embedding_<slug> с HNSW-индексом
  * (DEFINE TABLE/INDEX выполняются рантаймом, schema-файлы не меняются).
  * В одной vector-таблице — только одно space (инвариант §23.13).

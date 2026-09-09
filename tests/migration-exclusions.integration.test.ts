@@ -255,7 +255,7 @@ isolatedTest(
                  first_seen_at = $now, last_seen_at = $now;
                CREATE ONLY sync_run:exclusion_fixture SET kind = "migration", status = "completed",
                  started_at = $now, host = host:exclusion_fixture, baka_commit = "fixture",
-                 schema_version = 5;
+                 schema_version = 1;
                CREATE ONLY $sourceOne SET source_root = source_root:exclusion_fixture,
                  relative_path = "active/thread.jsonl",
                  original_path = "/active/thread.jsonl", basename = "thread.jsonl",

@@ -249,7 +249,7 @@ describe("thread export integration", () => {
         kind: "fixture",
         host,
         bakaCommit: "test",
-        schemaVersion: 5,
+        schemaVersion: 1,
       });
       const location = await ensureSourceLocation(t.db, {
         sourceRoot: root,

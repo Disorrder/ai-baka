@@ -3,9 +3,9 @@
  *
  * Обычный режим — BM25 по search_document (только текущие revisions:
  * projection и так содержит только current, §8.1) с highlights
- * (FULLTEXT-индекс с HIGHLIGHTS, schema/0002).
+ * (FULLTEXT-индекс с HIGHLIGHTS, schema/0001_initial.surql).
  *
- * Глобальный forensic BM25 по chunk.content отключён в schema 5: canonical
+ * Глобальный forensic BM25 по chunk.content отключён в schema 1: canonical
  * chunks и historical revisions сохранены, но индекс всех физических chunks
  * слишком дорог для обязательного backup/restore path. Legacy forensic-флаги
  * fail closed до появления отдельной ограниченной derived projection; ни один
@@ -277,7 +277,7 @@ export async function searchText(
 
 /**
  * Compatibility seam для старых library callers. Всегда отказывает до
- * обращения к БД: schema 5 не имеет глобального chunk_content index.
+ * обращения к БД: schema 1 не имеет глобального chunk_content index.
  */
 export async function searchForensic(
   _db: Surreal,

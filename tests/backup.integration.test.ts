@@ -13,7 +13,6 @@ import { copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  coreTablesForSchemaVersion,
   manifestPathForExport,
   runLogicalBackup,
   type BackupManifest,
@@ -26,7 +25,6 @@ import {
 } from "../src/backup/restore-test.ts";
 import { buildRawManifest, hashRawManifest, verifyRawFiles } from "../src/backup/raw-verify.ts";
 import { loadConfig, type AppConfig } from "../src/config.ts";
-import { applyMigrations, SCHEMA_DIR } from "../src/db/migrations.ts";
 import { hashFile } from "../src/sources/snapshot/hashing.ts";
 import {
   createTestDb,
@@ -49,7 +47,7 @@ const testDb = await dbTest();
 // RocksDB под нагрузкой suite может пересечь общий 30s; конечный локальный
 // предел всё ещё ловит настоящее зависание.
 const RESTORE_DRILL_TEST_TIMEOUT_MS = 60_000;
-const LATEST_SCHEMA_VERSION = 9;
+const LATEST_SCHEMA_VERSION = 1;
 
 let t: TestDb;
 let archiveRoot: string;
@@ -134,68 +132,6 @@ afterAll(async () => {
 });
 
 describe("backup → restore:test → raw:verify", () => {
-  testDb("schema 4 backup restores with pre-0005 checks and removes its namespace", async () => {
-    const schema4Db = await createTestDb(false);
-    const schema4Root = await mkdtemp(path.join(tmpdir(), "baka-backup-schema4-it-"));
-    try {
-      const schemaDir = path.join(schema4Root, "schema");
-      await mkdir(schemaDir, { recursive: true });
-      for (const file of [
-        "0001_initial.surql",
-        "0002_search_documents.surql",
-        "0003_embedding_spaces.surql",
-        "0004_legacy_migration_metadata.surql",
-      ]) {
-        await copyFile(path.join(SCHEMA_DIR, file), path.join(schemaDir, file));
-      }
-      await applyMigrations(schema4Db.db, {
-        schemaDir,
-        bakaCommit: "anonymized-test",
-        surrealdbVersion: "test",
-      });
-      const schema4Cfg = loadConfig({
-        BAKA_ARCHIVE_ROOT: schema4Root,
-        SURREAL_URL,
-        SURREAL_USER,
-        SURREAL_PASS,
-        SURREAL_NAMESPACE: TEST_NAMESPACE,
-        SURREAL_DATABASE: schema4Db.name,
-      });
-
-      const result = await withLiveServerOperationGuard(
-        "http-export",
-        () => runLogicalBackup(schema4Cfg),
-      );
-      expect(result.manifest.schemaVersion).toBe(4);
-      expect(Object.keys(result.manifest.recordCounts).sort()).toEqual(
-        [...coreTablesForSchemaVersion(4)].sort(),
-      );
-      expect(result.manifest.recordCounts).not.toHaveProperty("migration_row_commit");
-      expect(result.manifest.recordCounts).not.toHaveProperty("migration_quarantine");
-
-      const report = await withLiveServerOperationGuard(
-        "http-import",
-        () => runRestoreTest(schema4Cfg, {
-          exportPath: result.exportPath,
-          targetEvidence: isolatedRestoreTargetEvidence(),
-        }),
-      );
-      expect(report.ok).toBe(true);
-      expect(report.schemaVersion).toBe(4);
-      const schema4RawManifestSha256 = result.manifest.rawManifestSha256;
-      if (!schema4RawManifestSha256) throw new Error("schema 4 backup omitted raw manifest hash");
-      expect(report.rawManifestSha256).toBe(schema4RawManifestSha256);
-      expect(report.checks.every((check) => check.ok)).toBe(true);
-      expect(report.checks.some((check) => check.name.includes("migration_row_commit"))).toBe(false);
-      expect(report.checks.some((check) => check.name.includes("migration_quarantine"))).toBe(false);
-      const [rootInfo] = await schema4Db.db.query<[unknown]>("INFO FOR ROOT");
-      expect(JSON.stringify(rootInfo)).not.toContain(report.namespace);
-    } finally {
-      await dropTestDb(schema4Db);
-      await rm(schema4Root, { recursive: true, force: true });
-    }
-  }, RESTORE_DRILL_TEST_TIMEOUT_MS);
-
   testDb("logical backup: export + manifest", async () => {
     const result = await withLiveServerOperationGuard(
       "http-export",

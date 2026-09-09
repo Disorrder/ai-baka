@@ -154,7 +154,7 @@ describe("ExFAT-compatible no-clobber publication", () => {
       const manifestsDir = path.join(archiveRoot, "backups", "manifests");
       await mkdir(surrealDir, { recursive: true });
       await mkdir(manifestsDir, { recursive: true });
-      const exportFile = "2026-07-27T120000Z__schema-4__surreal-3.2.3.surql.gz";
+      const exportFile = "2026-07-27T120000Z__schema-1__surreal-3.2.3.surql.gz";
       const exportPath = path.join(surrealDir, exportFile);
       const exportTemp = path.join(surrealDir, ".prepared-export.part");
       const content = Buffer.from("complete fallback export");
@@ -169,7 +169,7 @@ describe("ExFAT-compatible no-clobber publication", () => {
       const manifest = {
         createdAt: "2026-07-27T12:00:00.000Z",
         surrealdbVersion: "3.2.3",
-        schemaVersion: 4,
+        schemaVersion: 1,
         bakaCommit: "anonymized-test",
         namespace: "baka_test",
         database: "archive_test",

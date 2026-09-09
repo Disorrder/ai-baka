@@ -27,7 +27,7 @@ const IMAGE_ID = PINNED_RESTORE_TARGET_IMAGE_DIGEST;
 const DATA_VOLUME = "4".repeat(64);
 const LOGS_VOLUME = "5".repeat(64);
 
-test("schema-5 recovery verifies migration ledger and quarantine references", async () => {
+test("schema-1 recovery verifies migration ledger and quarantine references", async () => {
   const statements: string[] = [];
   const db = {
     query: async (sql: string) => {

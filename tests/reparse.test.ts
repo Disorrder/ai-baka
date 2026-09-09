@@ -564,7 +564,7 @@ describe("reparse integration", () => {
         kind: "fixture",
         host,
         bakaCommit: "test",
-        schemaVersion: 5,
+        schemaVersion: 1,
       });
       const revision = await ensureSourceRevision(t.db, {
         sourceLocation: location.id,
@@ -590,7 +590,7 @@ describe("reparse integration", () => {
         kind: "reparse",
         host,
         bakaCommit: "test",
-        schemaVersion: 5,
+        schemaVersion: 1,
       });
 
       const summary = await reparseSourceRevisions(t.db, archive, {

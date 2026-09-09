@@ -1,5 +1,5 @@
 /**
- * Fail-closed production rebuild from an authenticated schema-5 logical backup.
+ * Fail-closed production rebuild from an authenticated schema-1 logical backup.
  *
  * The corrupt RocksDB tree is never opened or renamed. A fresh BAKA_DB_ROOT on
  * a POSIX filesystem is restored and verified behind the archive process lock.
@@ -140,7 +140,7 @@ export interface RecoveryRebuildReport {
   exportSha256: string;
   manifestSha256: string;
   rawManifestSha256: string;
-  schemaVersion: 5;
+  schemaVersion: 1;
   dbRoot: string;
   corruptDbRoot: string;
   sourceMode: RecoveryPaths["sourceMode"];
@@ -525,12 +525,12 @@ export async function authenticateRecoveryBackup(
   const manifestText = await readFile(manifestPath, "utf8");
   const manifest = parseBackupManifest(JSON.parse(manifestText), manifestPath);
   if (
-    manifest.schemaVersion !== 5 || manifest.namespace !== cfg.surrealNamespace ||
+    manifest.schemaVersion !== 1 || manifest.namespace !== cfg.surrealNamespace ||
     manifest.database !== cfg.surrealDatabase || manifest.exportFile !== path.basename(exportPath) ||
     !manifest.rawManifestSha256 ||
     /\d+\.\d+\.\d+/u.exec(manifest.surrealdbVersion)?.[0] !== PINNED_RESTORE_TARGET_VERSION
   ) {
-    throw new Error("recovery manifest is not the exact authenticated schema-5 target");
+    throw new Error("recovery manifest is not the exact authenticated schema-1 target");
   }
   const sourceIdentity = await authenticateRegularFileIdentity(
     exportPath,
@@ -803,7 +803,7 @@ export async function runRecoveryRebuild(
       exportSha256: backup.exportSha256,
       manifestSha256: backup.manifestSha256,
       rawManifestSha256: backup.manifest.rawManifestSha256!,
-      schemaVersion: 5,
+      schemaVersion: 1,
       dbRoot: paths.dbRoot,
       corruptDbRoot: paths.corruptDbRoot,
       sourceMode: paths.sourceMode,

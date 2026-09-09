@@ -185,7 +185,7 @@ async function authorizedOptions(
   await writeFile(manifestPath, `${JSON.stringify({
     createdAt: backupCreatedAt,
     surrealdbVersion: "surrealdb-3.2.3",
-    schemaVersion: 5,
+    schemaVersion: 1,
     bakaCommit: "test",
     namespace: "baka",
     database: "archive",
@@ -221,7 +221,7 @@ async function authorizedOptions(
     manifestFile: path.basename(manifestPath),
     manifestSha256: manifest.sha256,
     rawManifestSha256: "b".repeat(64),
-    schemaVersion: 5,
+    schemaVersion: 1,
     searchDocuments: 0,
     chunks: 0,
     checks: expectedSuccessfulRestoreCheckNames(0, 0).map((name) => ({
@@ -245,7 +245,7 @@ async function authorizedOptions(
       sha256Fingerprint: keyFingerprint,
     },
     safetyContext: {
-      schemaVersion: 5,
+      schemaVersion: 1,
       sourceNamespace: "baka",
       sourceDatabase: "archive",
       restoreNamespace,
@@ -404,7 +404,7 @@ testDb("migration run: synthetic SQLite → SurrealDB, повтор без ду�
     const staleHost = await ensureHost(t.db, identity);
     await t.db.query(
       `CREATE ONLY sync_run:stale_migration SET kind = "migration", status = "running",
-         started_at = time::now(), host = $host, baka_commit = "stale", schema_version = 5;
+         started_at = time::now(), host = $host, baka_commit = "stale", schema_version = 1;
        CREATE ONLY migration_meta:stale_migration SET status = "running",
          started_at = time::now(), sync_run = sync_run:stale_migration;`,
       { host: staleHost },
@@ -416,7 +416,7 @@ testDb("migration run: synthetic SQLite → SurrealDB, повтор без ду�
       approvedHostMappings: approvedHost(identity),
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
     };
     const first = await runLegacyMigrationWithSurreal({
       ...common,
@@ -614,7 +614,7 @@ testDb("bulk identity failure in batch two rolls back batch one mappings and led
     };
     await t.db.query(
       `CREATE ONLY $sync SET kind = "migration", status = "running",
-       started_at = time::now(), host = $host, baka_commit = "test", schema_version = 5;
+       started_at = time::now(), host = $host, baka_commit = "test", schema_version = 1;
        CREATE ONLY $migration SET status = "running", started_at = time::now(),
        sync_run = $sync;`,
       { sync: run.syncRunId, migration: run.migrationId, host },
@@ -680,7 +680,7 @@ testDb("stale prefetched mapping target fails closed inside the atomic transacti
     };
     await t.db.query(
       `CREATE ONLY $sync SET kind = "migration", status = "running",
-       started_at = time::now(), host = $host, baka_commit = "test", schema_version = 5;
+       started_at = time::now(), host = $host, baka_commit = "test", schema_version = 1;
        CREATE ONLY $migration SET status = "running", started_at = time::now(),
        sync_run = $sync;`,
       { sync: run.syncRunId, migration: run.migrationId, host },
@@ -741,7 +741,7 @@ testDb("dangling identity target fails before mapping and ledger writes", async 
     };
     await t.db.query(
       `CREATE ONLY $sync SET kind = "migration", status = "running",
-       started_at = time::now(), host = $host, baka_commit = "test", schema_version = 5;
+       started_at = time::now(), host = $host, baka_commit = "test", schema_version = 1;
        CREATE ONLY $migration SET status = "running", started_at = time::now(),
        sync_run = $sync;`,
       { sync: run.syncRunId, migration: run.migrationId, host },
@@ -805,7 +805,7 @@ testDb("published report recovers a crash before lifecycle finish", async () => 
       ...snapshot,
       ...firstAuth,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: failingBackend,
     })).rejects.toThrow("simulated finish crash");
     const published = JSON.parse(await readFile(firstAuth.reportPath, "utf8")) as {
@@ -828,7 +828,7 @@ testDb("published report recovers a crash before lifecycle finish", async () => 
       ...snapshot,
       ...secondAuth,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
     });
     const [after] = await t.db.query<[Array<{ status: string; report_sha256: string }>]>(
       "SELECT status, report_sha256 FROM migration_meta WHERE report_path = $path",
@@ -900,7 +900,7 @@ async function assertLifecycleTamperModes(
         ...snapshot,
         ...auth,
         bakaCommit: "test",
-        schemaVersion: 5,
+        schemaVersion: 1,
         backend,
       })).rejects.toThrow();
       const [meta] = await t.db.query<[Array<{
@@ -958,7 +958,7 @@ testDb("post-commit authentication downgrades tamper and valid lost-ack recovers
       ...snapshot,
       ...tamperAuth,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: new SurrealLegacyMigrationBackend(t.db, archiveRoot, identity, mappings, {
         afterLifecycleCommitBeforeFinalAuthentication: async (_run, publication) => {
           const bytes = await readFile(publication!.path, "utf8");
@@ -977,7 +977,7 @@ testDb("post-commit authentication downgrades tamper and valid lost-ack recovers
       ...snapshot,
       ...lostAckAuth,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: new SurrealLegacyMigrationBackend(t.db, archiveRoot, identity, mappings, {
         afterLifecycleCommitBeforeFinalAuthentication: () => {
           throw new Error("simulated lost acknowledgement");
@@ -1034,7 +1034,7 @@ testDb("legacy split-write APIs fail closed and stale startup removes only prove
       legacyDbPath: snapshot.snapshotPath,
       legacyDbSha256: snapshot.snapshotSha256,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       approvalArtifactSha256: authorized.authorization.approval.artifactSha256,
       approvalFileSha256: authorized.authorization.approvalFile!.sha256,
       approvalAttestationSha256: migrationArtifactSha256(authorized.authorization.attestation),
@@ -1141,7 +1141,7 @@ testDb("stale-run cleanup preserves shared live state, pointers and preexisting 
     await t.db.query(
       `CREATE ONLY sync_run:shared_live SET kind = "sync", status = "completed",
        started_at = time::now(), finished_at = time::now(), host = $host,
-       baka_commit = "live", schema_version = 5;`,
+       baka_commit = "live", schema_version = 1;`,
       { host },
     );
     const root = await ensureSourceRoot(t.db, {
@@ -1192,7 +1192,7 @@ testDb("stale-run cleanup preserves shared live state, pointers and preexisting 
       `CREATE ONLY legacy_identity_map:shared_live_mapping SET legacy_table = "projects",
        legacy_id = "preexisting", target = $workspace, created_at = time::now();
        CREATE ONLY sync_run:shared_stale SET kind = "migration", status = "running",
-       started_at = time::now(), host = $host, baka_commit = "stale", schema_version = 5;
+       started_at = time::now(), host = $host, baka_commit = "stale", schema_version = 1;
        CREATE ONLY migration_meta:shared_stale SET status = "running", started_at = time::now(),
        sync_run = sync_run:shared_stale;
        CREATE ONLY workspace:shared_uncommitted SET name = "uncommitted",
@@ -1235,7 +1235,7 @@ testDb("stale-run cleanup preserves shared live state, pointers and preexisting 
     await writeFile(partialReport, '{"status":"completed"}\n');
     await t.db.query(
       `CREATE ONLY sync_run:partial_report SET kind = "migration", status = "running",
-       started_at = time::now(), host = $host, baka_commit = "stale", schema_version = 5;
+       started_at = time::now(), host = $host, baka_commit = "stale", schema_version = 1;
        CREATE ONLY migration_meta:partial_report SET status = "running", started_at = time::now(),
        sync_run = sync_run:partial_report, legacy_db_sha256 = $sha, report_path = $report;`,
       { host, sha: "e".repeat(64), report: partialReport },
@@ -1313,7 +1313,7 @@ testDb("legacy_missing_raw requires signed exact ENOENT and retries without dupl
       identity,
       approvedHostMappings: approvedHost(identity),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
     };
     const first = await runLegacyMigrationWithSurreal({
       ...base,
@@ -1459,7 +1459,7 @@ testDb("legacy_missing_raw: поздний repaired backup заполняет NO
       identity,
       approvedHostMappings: approvedHost(identity),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
     };
     await runLegacyMigrationWithSurreal({
       ...base,
@@ -1596,7 +1596,7 @@ testDb("Codex exact live ownership rejects wrong lines and null source provenanc
       identity,
       approvedHostMappings: approvedHost(identity),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
     };
     const live = await runLegacyMigrationWithSurreal({
       ...base,
@@ -1756,7 +1756,7 @@ testDb("exact live identity owns historical legacy rows without canonical writes
       identity,
       approvedHostMappings: approvedHost(identity),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
     };
     await runLegacyMigrationWithSurreal({
       ...base,
@@ -1919,7 +1919,7 @@ testDb("payload replay uses dedicated provenance and cannot repair same-SHA lega
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, approvedHost(identity), temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot: async (input) => input.source === "payload"
         ? {
             externalId: input.threadExternalId,
@@ -2010,7 +2010,7 @@ testDb("multi-source thread records bind to their own exact source revision", as
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot: async (input) => input.source === "payload"
         ? {
             externalId: input.threadExternalId,
@@ -2101,7 +2101,7 @@ testDb("active denial and deleted no-message failure preserve exact source-owned
       identity,
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot: async () => undefined,
     };
     const first = await runLegacyMigrationWithSurreal({ ...common, ...authorized });
@@ -2184,7 +2184,7 @@ testDb("source provenance pointer, presence, mapping and classification have no 
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: firstBackend,
     });
     expect(first.reconciliation).toMatchObject({ quarantined: 0, lost: 0, ok: true });
@@ -2205,7 +2205,7 @@ testDb("source provenance pointer, presence, mapping and classification have no 
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: new SurrealLegacyMigrationBackend(t.db, archiveRoot, identity, mappings),
     });
     expect(repaired.reconciliation).toMatchObject({ quarantined: 0, lost: 0, ok: true });
@@ -2259,7 +2259,7 @@ testDb("source plus raw_backups identity race rolls back the whole atomic bundle
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: new SurrealLegacyMigrationBackend(t.db, archiveRoot, identity, mappings, {
         beforeAtomicRowQuery: async (kind) => {
           if (kind !== "source" || injected) return;
@@ -2348,7 +2348,7 @@ testDb("preexisting raw_backups identity conflict rejects the whole source bundl
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: new SurrealLegacyMigrationBackend(t.db, archiveRoot, identity, mappings),
     });
 
@@ -2437,7 +2437,7 @@ testDb("hard crash after each atomic project/source/dialogue COMMIT leaves only 
         ...snapshot,
         ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
         bakaCommit: "test",
-        schemaVersion: 5,
+        schemaVersion: 1,
         recoverSnapshot,
         backend: new SurrealLegacyMigrationBackend(t.db, archiveRoot, identity, mappings, {
           afterAtomicRowQuery: (kind) => {
@@ -2477,7 +2477,7 @@ testDb("hard crash after each atomic project/source/dialogue COMMIT leaves only 
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot,
     });
     expect(completed.status).toBe("completed");
@@ -2536,7 +2536,7 @@ testDb("explicit host mapping keeps same user/path/external id distinct and repo
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot: async (input) => input.source === "payload"
         ? {
             externalId: input.threadExternalId,
@@ -2622,7 +2622,7 @@ testDb("runtime consumes exact source_relation/project_relation assignments", as
       ...snapshot,
       ...authorized,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot: async (input) => input.source === "payload"
         ? {
             externalId: input.threadExternalId,
@@ -2705,7 +2705,7 @@ testDb("host attribution reports committed actual rows, never planned assignment
       ...snapshot,
       ...authorized,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
     });
     expect(report.status).toBe("completed_with_errors");
     expect(report.hostAttribution.actualAssignments).toEqual([]);
@@ -2803,7 +2803,7 @@ testDb("legacy root cannot collide with or disable an existing live source_root"
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, approvedHost(identity), temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
     });
     const [live] = await t.db.query<[
       Array<{ path: string; source_kind: string; parser_name: string; snapshot_strategy: string; enabled: boolean }>,
@@ -2881,7 +2881,7 @@ testDb("source SHA + source dialogue id dedups before derived installation ident
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot: async (input) => input.source === "payload"
         ? {
             externalId: input.threadExternalId,
@@ -2983,7 +2983,7 @@ testDb("all reliable dialogue keys must agree before any corpus/model/search wri
       ...seedSnapshot,
       ...(await authorizedOptions(t.db, seedSnapshot, mappings, temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot: seedRecovery,
     });
     expect(seed.status).toBe("completed");
@@ -3071,7 +3071,7 @@ testDb("all reliable dialogue keys must agree before any corpus/model/search wri
       ],
       ...conflictSnapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot: conflictRecovery,
     };
     const firstConflict = await runLegacyMigrationWithSurreal({
@@ -3134,7 +3134,7 @@ testDb("all reliable dialogue keys must agree before any corpus/model/search wri
       ],
       ...agreeSnapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot: seedRecovery,
     };
     const agree = await runLegacyMigrationWithSurreal({
@@ -3204,7 +3204,7 @@ testDb("durable thread mapping conflict is quarantined before canonical/model si
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, approvedHost(identity), temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot: async (input) => input.source === "payload"
         ? {
             externalId: input.threadExternalId,
@@ -3291,7 +3291,7 @@ testDb("thread commit has no post-corpus mark boundary and retry preserves ledge
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot,
       backend: new SurrealLegacyMigrationBackend(t.db, archiveRoot, identity, mappings, {
         beforeIdentityBind: (table) => {
@@ -3334,7 +3334,7 @@ testDb("thread commit has no post-corpus mark boundary and retry preserves ledge
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot,
       backend: new SurrealLegacyMigrationBackend(t.db, archiveRoot, identity, mappings, {
         beforeMarkRevisionParsed: () => {
@@ -3364,7 +3364,7 @@ testDb("thread commit has no post-corpus mark boundary and retry preserves ledge
       ...snapshot,
       ...(await authorizedOptions(t.db, snapshot, mappings, temp)),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       recoverSnapshot,
       backend: new SurrealLegacyMigrationBackend(t.db, archiveRoot, identity, mappings),
     });

@@ -75,9 +75,9 @@ import {
 export const RESTORE_NAMESPACE = "baka_restore_test";
 const RESTORE_NAMESPACE_PATTERN = /^baka_restore_test_[0-9a-f]{32}$/;
 export const PERSISTED_RESTORE_REPORT_FORMAT_VERSION = 5;
-export const PINNED_RESTORE_TARGET_VERSION = "3.2.3";
+export const PINNED_RESTORE_TARGET_VERSION = "3.2.4";
 export const PINNED_RESTORE_TARGET_IMAGE_DIGEST =
-  "sha256:2006fe3f88f6f240c6463460021b4a14ffe102aea376284428f850045b7b382e";
+  "sha256:51baed8709f57f67dcf04b30e3177db846803fa9342dae2be58c6fa5f8d59843";
 const SEARCH_PROBE_LIMIT = 3;
 const SEARCH_PROBE_SOURCE_LIMIT = 32;
 
@@ -378,7 +378,7 @@ async function countOf(db: Surreal, table: string): Promise<number> {
  * существующую запись; current_revision — на ready-ревизию этого же
  * dialogue. Restored обязан иметь НОЛЬ нарушений.
  */
-const SCHEMA_4_RESTORE_RELATIONAL_CHECKS: ReadonlyArray<readonly [string, string]> = [
+export const RESTORE_RELATIONAL_CHECKS: ReadonlyArray<readonly [string, string]> = [
   [
     "os_account.host",
     `SELECT count() AS n FROM os_account WHERE host IS NONE OR !record::exists(host) GROUP ALL`,
@@ -528,10 +528,6 @@ const SCHEMA_4_RESTORE_RELATIONAL_CHECKS: ReadonlyArray<readonly [string, string
     `SELECT count() AS n FROM migration_meta
      WHERE sync_run IS NOT NONE AND !record::exists(sync_run) GROUP ALL`,
   ],
-];
-
-/** Referential checks for durable tables introduced by migration 0005. */
-const SCHEMA_5_RESTORE_RELATIONAL_CHECKS: ReadonlyArray<readonly [string, string]> = [
   [
     "migration_row_commit migration/target",
     `SELECT count() AS n FROM migration_row_commit
@@ -546,19 +542,12 @@ const SCHEMA_5_RESTORE_RELATIONAL_CHECKS: ReadonlyArray<readonly [string, string
   ],
 ];
 
-/** Current-schema compatibility export retained for existing callers/tests. */
-export const RESTORE_RELATIONAL_CHECKS: ReadonlyArray<readonly [string, string]> = [
-  ...SCHEMA_4_RESTORE_RELATIONAL_CHECKS,
-  ...SCHEMA_5_RESTORE_RELATIONAL_CHECKS,
-];
-
 /** Never query tables which are absent from the authenticated backup schema. */
 export function restoreRelationalChecksForSchemaVersion(
   schemaVersion: number,
 ): ReadonlyArray<readonly [string, string]> {
-  if (schemaVersion === 4) return SCHEMA_4_RESTORE_RELATIONAL_CHECKS;
-  if (schemaVersion >= 5 && schemaVersion <= 9) return RESTORE_RELATIONAL_CHECKS;
-  throw new Error(`restore:test: unsupported schema ${schemaVersion}; expected 4–9`);
+  if (schemaVersion === 1) return RESTORE_RELATIONAL_CHECKS;
+  throw new Error(`restore:test: unsupported schema ${schemaVersion}; expected 1`);
 }
 
 async function invalidSearchSourceChunks(db: Surreal): Promise<number> {
@@ -687,15 +676,7 @@ export async function verifyRestoredSearch(
   });
 }
 
-const COMMON_REQUIRED_RESTORE_CHECK_NAMES = [
-  "record_counts",
-  ...SCHEMA_4_RESTORE_RELATIONAL_CHECKS.map(([name]) => `invariant: ${name}`),
-  "invariant: search_document.source_chunks ownership",
-  "invariant: embedding physical ownership/vector symmetry",
-  "info: dialogue без current_revision",
-] as const;
-
-/** Exact schema-5 success contract retained for final migration acceptance. */
+/** Exact initial-schema success contract for restore and migration acceptance. */
 export const REQUIRED_RESTORE_CHECK_NAMES = [
   "record_counts",
   ...RESTORE_RELATIONAL_CHECKS.map(([name]) => `invariant: ${name}`),
@@ -707,9 +688,8 @@ export const REQUIRED_RESTORE_CHECK_NAMES = [
 export function requiredRestoreCheckNamesForSchemaVersion(
   schemaVersion: number,
 ): readonly string[] {
-  if (schemaVersion === 4) return COMMON_REQUIRED_RESTORE_CHECK_NAMES;
-  if (schemaVersion >= 5 && schemaVersion <= 9) return REQUIRED_RESTORE_CHECK_NAMES;
-  throw new Error(`restore report: unsupported schema ${schemaVersion}; expected 4–9`);
+  if (schemaVersion === 1) return REQUIRED_RESTORE_CHECK_NAMES;
+  throw new Error(`restore report: unsupported schema ${schemaVersion}; expected 1`);
 }
 
 const RESTORE_FINAL_CHECK_NAMES = [
@@ -720,7 +700,7 @@ const RESTORE_FINAL_CHECK_NAMES = [
 export function expectedSuccessfulRestoreCheckNames(
   searchDocuments: number,
   probeCount: number,
-  schemaVersion: SupportedBackupSchemaVersion = 5,
+  schemaVersion: SupportedBackupSchemaVersion = 1,
 ): string[] {
   if (!Number.isSafeInteger(searchDocuments) || searchDocuments < 0) {
     throw new Error("searchDocuments must be a non-negative safe integer");
@@ -1323,7 +1303,7 @@ export async function runRestoreTest(
     const relationalChecks = restoreRelationalChecksForSchemaVersion(manifest.schemaVersion);
     if (!manifest.rawManifestSha256) {
       failureCode = "raw_manifest_hash_required";
-      throw new Error("schema 4/5 restore manifest requires rawManifestSha256");
+      throw new Error("schema 1 restore manifest requires rawManifestSha256");
     }
     if (manifest.database !== cfg.surrealDatabase) {
       failureCode = "manifest_database_binding_failed";

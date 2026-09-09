@@ -212,16 +212,8 @@ async function buildFailure(
 }
 
 describe("deferred restore FULLTEXT index validation", () => {
-  test("whitelist contains only the core search index from migration 0002", async () => {
-    const schema = await readFile(
-      path.join(import.meta.dir, "..", "schema", "0002_search_documents.surql"),
-      "utf8",
-    );
-    const migrationIndexes = schema.match(/DEFINE INDEX[\s\S]*?;/gu) ?? [];
-    expect(migrationIndexes).toHaveLength(2);
-    expect(validateDeferredFulltextIndexes(
-      migrationIndexes.filter((statement) => statement.includes("search_document_content")),
-    )).toEqual(
+  test("accepts the curated search index and rejects the forensic chunk index", () => {
+    expect(validateDeferredFulltextIndexes([SEARCH_INDEX])).toEqual(
       RESTORE_FULLTEXT_INDEX_DEFINITIONS,
     );
     expect(() => validateDeferredFulltextIndexes([CHUNK_INDEX, SEARCH_INDEX]))

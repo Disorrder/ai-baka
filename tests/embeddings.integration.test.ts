@@ -498,7 +498,7 @@ async function makeCtx(t: TestDb): Promise<Ctx> {
     kind: "live_sync",
     host,
     bakaCommit: "test",
-    schemaVersion: 4,
+    schemaVersion: 1,
   });
   const root = await ensureSourceRoot(t.db, {
     harnessInstallation: installation,

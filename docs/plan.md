@@ -134,28 +134,34 @@ adapter и физическое удаление legacy. Legacy SQLite всег�
 
 External System и его SurrealDB остаются без изменений.
 
-## 3.2. Используется SurrealDB 3.2.3
+## 3.2. Используется SurrealDB 3.2.4
 
-На 24 июля 2026 года последним стабильным patch-релизом является SurrealDB
-**3.2.3 от 21 июля 2026 года**. Новый проект следует начинать с него, а не с
-3.1.5, используемой старым независимым стеком `other-project`. Docker image
-фиксируется не только тегом, но и digest.
+На 9 сентября 2026 года закреплён стабильный [SurrealDB 3.2.4](https://github.com/surrealdb/surrealdb/releases/tag/v3.2.4).
+Docker image фиксируется тегом и digest
+`sha256:51baed8709f57f67dcf04b30e3177db846803fa9342dae2be58c6fa5f8d59843`.
+Обновление pin в исходниках не означает обновления или приёмки production.
 
 Фиксируются вместе:
 
 ```text
-SurrealDB server: surrealdb/surrealdb:v3.2.3@sha256:...
+SurrealDB server: surrealdb/surrealdb:v3.2.4@sha256:...
 SurrealDB JS SDK: точная версия в bun.lock
 Schema version: целое число
 baka git commit: commit SHA
 ```
 
-Обновление SurrealDB выполняется только после:
+Обновление production SurrealDB выполняется только после:
 
 1. logical backup;
 2. тестового restore;
 3. прогона integration-тестов;
 4. smoke-теста на копии RocksDB.
+
+При смене exact pin прежнее restore evidence не принимается как доказательство
+проверки нового образа. Для 3.2.4 сохраняется bounded resource profile ниже;
+полный Docker restore и приёмка боевого архива выполняются отдельно.
+Зависимости инструментов: TypeScript 7.0.2, `@types/bun` 1.4.2 и tiktoken 0.14.0.
+Изменение tokenizer identity требует новых exact-token отчётов и связанных планов.
 
 ## 3.3. Трёхслойная модель архива
 
@@ -331,7 +337,7 @@ surrealdb
 
 | Параметр         | Значение                                |
 | ---------------- | --------------------------------------- |
-| Image            | `surrealdb/surrealdb:v3.2.3@sha256:...` |
+| Image            | `surrealdb/surrealdb:v3.2.4@sha256:...` |
 | Host binding     | `127.0.0.1:8901`                        |
 | Container port   | `8000`                                  |
 | Storage          | RocksDB                                 |
@@ -413,25 +419,31 @@ bun run disk:eject
 
 # 6. Версионирование схемы
 
-Схема не хранится одной строкой в `db.ts`.
+Для релиза приложения **0.1.0** задана одна начальная миграция и числовая
+версия схемы **1**:
 
 ```text
 schema/
-├── 0001_initial.surql
-├── 0002_search_documents.surql
-├── 0003_embedding_spaces.surql
-├── 0004_legacy_migration_metadata.surql
-├── 0005_legacy_migration_run.surql
-└── 0006_content_character_counts.surql
+└── 0001_initial.surql
 ```
 
-Текущая schema version — 6. Миграция 0005 добавляет durable migration run,
-quarantine/identity metadata, удаляет глобальный производный FULLTEXT-индекс
-`chunk_content` (canonical `chunk` records не удаляются) и допускает
-`source_revision.raw_archive_path = NONE` только для намеренного
-`snapshot_kind = legacy_missing_raw`. Миграция 0006 добавляет cached
-`content_chars` на `message` и `chunk` для аналитики длины сообщений; значения
-производны от сохранённого `chunk.content` и не меняют canonical hash.
+Файл сразу создаёт полный актуальный набор таблиц, полей и индексов:
+canonical corpus, search projection, embedding spaces/jobs, durable legacy
+import/quarantine, `content_chars`, response timing и Codex lineage.
+`source_revision.raw_archive_path = NONE` допускается только для намеренного
+`snapshot_kind = legacy_missing_raw`. Глобальный FULLTEXT `chunk_content`
+не создаётся; canonical chunks и historical revisions сохраняются.
+
+Новые numbered migrations добавляются только при переходе на последующие
+релизы. После публикации применённые файлы не редактируются.
+Версия приложения, версия схемы и `formatVersion` файлов/отчётов — разные
+контракты; свёртка схемы не меняет форматы отчётов.
+
+Дорелизная история миграций `0001`–`0009` свёрнута, не является поддерживаемой
+цепочкой обновления и несовместима по номерам/checksum с этой начальной схемой.
+Существующие БД и backup artifacts не перенумеровываются автоматически.
+Для переноса такого архива требуется отдельная явно согласованная процедура;
+удалять `schema_migration`, подменять checksum или очищать рабочую БД нельзя.
 
 В базе хранится:
 
@@ -445,7 +457,7 @@ schema_migration
   surrealdb_version
 ```
 
-На старте приложение:
+По явной команде `baka db migrate` приложение:
 
 1. читает текущую schema version;
 2. проверяет checksums уже применённых migrations;
@@ -453,10 +465,9 @@ schema_migration
 4. отказывается работать при неизвестной более новой версии;
 5. не изменяет схему неявно.
 
-Тестируются два сценария:
-
-* создание пустой базы с нуля;
-* обновление базы с каждой поддерживаемой предыдущей версии.
+Проверяются создание пустой базы, повторный запуск без изменений и отказ
+при несовпадении checksum или неизвестной версии. При появлении следующего
+релиза проверяется также обновление с поддерживаемой предыдущей версии.
 
 ---
 
@@ -1500,10 +1511,9 @@ FULLTEXT ANALYZER archive_mixed
 BM25 HIGHLIGHTS;
 ```
 
-Migration 0002 исторически создавала также `chunk_content`; при upgrade 4→5
-migration 0005 удаляет только этот индекс через `REMOVE INDEX`, сохраняя все
-canonical chunks и historical revisions. На пустой базе последовательность
-0001→0005 имеет тот же итоговый contract.
+Начальная схема создаёт только `search_document_content`. Глобальный
+`chunk_content` не создаётся: canonical chunks и historical revisions
+сохраняются без производного forensic FULLTEXT-индекса.
 
 ---
 
@@ -2188,7 +2198,7 @@ SurrealDB поддерживает logical export в SurrealQL и последу
 
 ```text
 backups/surreal/
-  2026-07-26T120000Z__schema-5__surreal-3.2.3.surql.zst
+  2026-07-26T120000Z__schema-1__surreal-3.2.3.surql.zst
 ```
 
 Связанный manifest хранится в `backups/manifests/`:
@@ -2197,7 +2207,7 @@ backups/surreal/
 {
   "createdAt": "...",
   "surrealdbVersion": "3.2.3",
-  "schemaVersion": 7,
+  "schemaVersion": 1,
   "bakaCommit": "...",
   "namespace": "baka",
   "database": "archive",
@@ -2211,7 +2221,7 @@ backups/surreal/
 
 Export и manifest публикуются атомарно; incomplete `.part` не считается
 backup. Status признаёт только полностью существующую пару с повторно
-проверенными SHA/size и обязательным `rawManifestSha256` для schema 5.
+проверенными SHA/size и обязательным `rawManifestSha256` для schema 1.
 
 ## 16.2. Raw manifest
 
@@ -2290,9 +2300,9 @@ same-server fallback. Перед maintenance window он fail-closed прове�
   остановкой только immutable ID exact `baka-surrealdb`.
 
 При остановленном production container создаётся disposable SurrealDB из
-того же exact `v3.2.3@sha256:…`: уникальные allowlisted container/named-volume
+того же exact `v3.2.4@sha256:…`: уникальные allowlisted container/named-volume
 identity, новый Docker local volume, случайный `127.0.0.1` port (8901
-запрещён), никакого production/archive path mount. Exact измеренный профиль:
+запрещён), никакого production/archive path mount. Сохранённый bounded профиль:
 
 ```text
 memory/swap       12 GiB / 12 GiB
@@ -2305,9 +2315,9 @@ HTTP import max   32 GiB
 index resume      0 (disabled)
 ```
 
-Размер FULLTEXT batch не является launch-конфигурацией. Exact pinned binary
-`3.2.3+20260721.40522d1` соответствует `surrealdb-core 3.2.3` commit
-`40522d1d2fd8e30017ebc2625a14aa5435c27347`: `CommonConfig` не парсит
+Размер FULLTEXT batch не является launch-конфигурацией. Release binary
+`3.2.4+20260803.93ab219` соответствует `surrealdb-core 3.2.4` commit
+`93ab219d69f09d8f999851b0359c80ebe6726102`: `CommonConfig` не парсит
 `indexing_batch_size`, поэтому `SURREAL_INDEXING_BATCH_SIZE` не передаётся и
 не включается в resource profile. В core начальный scan использует compile-time
 probe 16 records, затем adaptive размер стремится к soft target 8 388 608 raw
@@ -2326,7 +2336,7 @@ RestoreTestReport v5 обязателен; v4 с обязательным гло
 Credentials передаются Docker только значениями environment наследуемого
 процесса (`--env NAME` без value), а HTTP import — через stdin-config curl;
 они не могут появляться в argv, логах или report. До любого DB mutation drill
-проверяет exact export/manifest SHA и size, затем импортирует schema 4 или 5
+проверяет exact export/manifest SHA и size, затем импортирует schema 1
 export в уникальный namespace `baka_restore_test_<32 hex>` disposable
 server. Проверяются:
 
@@ -2335,7 +2345,7 @@ server. Проверяются:
 3. authenticated BM25 probe по `search_document.content`;
 4. raw references и `rawManifestSha256` относительно `--raw-archive-root`;
 5. exact FULLTEXT index `search_document_content` в terminal `ready`, а
-   `chunk_content` отсутствует для schema 5;
+   `chunk_content` отсутствует для schema 1;
 6. cleanup в строгом порядке: started FULLTEXT indexes в обратном порядке,
    exact attempt namespace, затем explicit idempotent finalize disposable
    container и named volume с повторной проверкой их отсутствия.
@@ -2365,7 +2375,7 @@ Restore test обязателен до migration и до любого решен
 
 ## 16.5. One-way rebuild повреждённого RocksDB
 
-`baka recovery:rebuild` принимает exact independently pinned schema-5
+`baka recovery:rebuild` принимает exact independently pinned schema-1
 export/manifest и требует все fail-closed gates:
 
 ```text
@@ -2441,6 +2451,29 @@ baka recovery:rebuild
 * не удаляет canonical данные;
 * не изменяет legacy SQLite.
 
+Текстовая сводка показывает статус и ошибки первыми, затем диалоги/
+содержимое, поиск, исходные файлы и детали сканирования. Метрики имеют
+русские названия, числа — разделители тысяч; в строке не больше трёх
+метрик с подбором колонок по ширине stdout-терминала (без TTY — 80
+колонок). На узком экране текст переносится без усечения. `--json`
+сохраняет исходные имена и структуру счётчиков.
+«Обработано диалогов» включает повторную обработку существующих диалогов,
+а не только новые; «Отсутствует в источниках» не означает удаление из
+архива. «Заданий на векторизацию» — поставленные задания, не готовые
+векторы и не вызовы OpenAI. Пробный запуск помечается «без записи данных».
+
+В JSONL-журнале stderr (`baka sync --json`, также вывод без TTY) события
+`sync_timing` содержат `scope` (`sync`/`root`), `stage`, `durationMs`,
+`status`, `dryRun`; для root — также `root` и `harness`. Длительности
+измеряются монотонными часами, отдельно для preflight/lock, подключения/
+схемы/identity, discovery, metadata embeddings, индекса дублей, обхода,
+фильтра дублей, загрузки locations, reconcile, snapshot, parse/write,
+разрешения ошибок, presence, rename и финализации. `total` — итог scope,
+а `sync.roots` включает все root-этапы: складывать их повторно нельзя.
+Незавершённый этап при ошибке также логируется. Dry-run не измеряет
+snapshot/parse/write/presence: его время не заменяет замер полного sync.
+Интерактивный progress не превращает технические тайминги в предупреждения.
+
 Опции:
 
 ```text
@@ -2508,7 +2541,7 @@ provenance, а recovery chain всегда сообщает `cutover=not_asserte
 * unresolved `migration_quarantine` и legacy migration `ingest_error`.
 
 `raw_archive_path = NONE` считается намеренным только при
-`snapshot_kind = legacy_missing_raw`; это schema 5 migration contract, а не
+`snapshot_kind = legacy_missing_raw`; это schema 1 migration contract, а не
 missing-file ошибка.
 
 ## 17.4. `baka doctor`
@@ -2555,7 +2588,7 @@ baka reparse
   [--no-enqueue-embeddings] [--no-verify-raw] [--json]
 ```
 
-Search выдаёт enriched provenance. В schema 5 legacy forensic flags вместо
+Search выдаёт enriched provenance. В schema 1 legacy forensic flags вместо
 DB query дают fail-closed сообщение о выключенном глобальном индексе.
 Vector/hybrid используют privacy-safe query embedding и hybrid явно
 деградирует в text при недоступном provider. `export-thread` исключает paths
@@ -2830,7 +2863,7 @@ surreal start memory
 
 Критерий:
 
-* SurrealDB 3.2.3 запускается;
+* закреплённая SurrealDB 3.2.4 запускается;
 * данные действительно создаются на archive volume;
 * после restart записи сохраняются;
 * запуск без archive volume блокируется.
@@ -3330,7 +3363,7 @@ cause/path/content остаётся внутри локальной ошибки
 
 ### CODE COMPLETE / проверяемые implementation contracts
 
-* SurrealDB 3.2.3 и JS SDK pinned; sentinel, loopback,
+* SurrealDB 3.2.4 и JS SDK pinned; sentinel, loopback,
   `db:up/down/status/preflight` и `disk:eject` реализованы.
 * Все восемь harness’ов, immutable/hash-addressed raw, consistent SQLite
   snapshots, revision history, deletion state machine и host identity
@@ -3338,7 +3371,7 @@ cause/path/content остаётся внутри локальной ошибки
 * Full-text/vector/hybrid по curated search projection, fail-closed legacy
   forensic flags, segmentation v2 и HNSW audit реализованы; reasoning/tool
   content не индексируется глобально и не эмбеддится.
-* Schema 5, migration/retry/reconciliation и fail-closed signed authorization
+* Schema 1, migration/retry/reconciliation и fail-closed signed authorization
   contracts реализованы.
 * Candidate/full-corpus paid gates, exact offline tokenizer и vector audit
   реализованы; generic embeddings worker закрыт.

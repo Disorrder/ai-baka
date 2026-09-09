@@ -97,14 +97,14 @@ async function makeFixture(): Promise<Fixture> {
   await writeFile(path.join(archiveRoot, "db", "rocks.db"), "not-a-backup");
 
   const exportFile =
-    "2026-07-26T100000Z__schema-5__surreal-3.2.3.surql.gz";
+    "2026-07-26T100000Z__schema-1__surreal-3.2.3.surql.gz";
   const exportPath = path.join(archiveRoot, "backups", "surreal", exportFile);
   await writeFile(exportPath, "logical-surreal-export");
   const exportHashes = await hashFile(exportPath);
   const logicalManifest: BackupManifest = {
     createdAt: "2026-07-26T10:00:00.000Z",
     surrealdbVersion: "3.2.3",
-    schemaVersion: 5,
+    schemaVersion: 1,
     bakaCommit: "test",
     namespace: "baka",
     database: "archive",
@@ -120,16 +120,10 @@ async function makeFixture(): Promise<Fixture> {
     `${JSON.stringify(logicalManifest, null, 2)}\n`,
   );
 
-  for (let version = 1; version <= 5; version += 1) {
-    await writeFile(
-      path.join(
-        projectRoot,
-        "schema",
-        `${String(version).padStart(4, "0")}_migration_${version}.surql`,
-      ),
-      `-- schema ${version}\n`,
-    );
-  }
+  await writeFile(
+    path.join(projectRoot, "schema", "0001_initial.surql"),
+    "-- initial schema 1\n",
+  );
   await writeFile(
     path.join(projectRoot, "reports", "migration-preflight-2026-07-26.md"),
     "# migration report\n",
@@ -174,7 +168,7 @@ describe("off-device backup plan", () => {
       expect(await exists(fixture.destination)).toBe(false);
       expect(result.plan.manifest.totals.rawFiles).toBe(1);
       expect(result.plan.manifest.totals.rawOrphans).toBe(1);
-      expect(result.plan.manifest.totals.schemaMigrations).toBe(5);
+      expect(result.plan.manifest.totals.schemaMigrations).toBe(1);
       expect(result.plan.manifest.totals.migrationReports).toBe(2);
       expect(result.plan.manifest.files.some((file) => file.path.includes("rocks.db"))).toBe(false);
       expect(result.plan.manifest.files.map((file) => file.category)).toContain("logical_export");
@@ -182,7 +176,7 @@ describe("off-device backup plan", () => {
       expect(result.plan.manifest.files.map((file) => file.category)).toContain("sentinel");
       expect(
         result.plan.manifest.files.some(
-          (file) => file.path === "project/schema/0005_migration_5.surql",
+          (file) => file.path === "project/schema/0001_initial.surql",
         ),
       ).toBe(true);
     });

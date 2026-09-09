@@ -107,11 +107,11 @@ function exactRestoreReport(input: {
   manifestFile: string;
   manifestSha256: string;
   rawManifestSha256?: string;
-  schemaVersion?: 4 | 5;
+  schemaVersion?: 1;
   startedAt?: string;
   finishedAt?: string;
 }): RestoreTestReport {
-  const schemaVersion = input.schemaVersion ?? 5;
+  const schemaVersion = input.schemaVersion ?? 1;
   const checks = expectedSuccessfulRestoreCheckNames(0, 0, schemaVersion).map((name) => ({
     name,
     ok: true as const,
@@ -223,7 +223,7 @@ function productionInspection(
 
 function productionBaseline(hash = "b".repeat(64)): ProductionCorpusBaseline {
   return {
-    schemaVersion: 5,
+    schemaVersion: 1,
     dialogueCount: 12,
     currentRevisionCount: 11,
     currentRevisionSha256: hash,
@@ -366,8 +366,8 @@ describe("CLI safe parsers", () => {
       surrealNamespace: "current_ns",
       surrealDatabase: "current_db",
       archiveRoot: "/private/archive/../archive",
-    }, 5, RESTORE_TEST_NAMESPACE)).toEqual({
-      schemaVersion: 5,
+    }, 1, RESTORE_TEST_NAMESPACE)).toEqual({
+      schemaVersion: 1,
       sourceNamespace: "current_ns",
       sourceDatabase: "current_db",
       restoreNamespace: RESTORE_TEST_NAMESPACE,
@@ -393,7 +393,7 @@ describe("CLI safe parsers", () => {
       const manifest = {
         createdAt: "2026-07-26T10:00:00.000Z",
         surrealdbVersion: "surrealdb-3.2.3",
-        schemaVersion: 5,
+        schemaVersion: 1,
         bakaCommit: "test",
         namespace: sourceNamespace,
         database: sourceDatabase,
@@ -439,7 +439,7 @@ describe("CLI safe parsers", () => {
       const valid = await writeEvidence("current_ns", "current_db");
       await expect(runConfiguredMigrationSafetyCliGate({
         cfg,
-        schemaVersion: 5,
+        schemaVersion: 1,
         restoreReport: valid,
         restoreReportPath: restorePath,
       }, writer)).resolves.toBe(true);
@@ -452,7 +452,7 @@ describe("CLI safe parsers", () => {
         const foreign = await writeEvidence(namespace, database);
         await expect(runConfiguredMigrationSafetyCliGate({
           cfg,
-          schemaVersion: 5,
+          schemaVersion: 1,
           restoreReport: foreign,
           restoreReportPath: restorePath,
         }, writer)).rejects.toThrow(/source namespace\/database|current schema\/database/);
@@ -462,7 +462,7 @@ describe("CLI safe parsers", () => {
       const current = await writeEvidence("current_ns", "current_db");
       await expect(runConfiguredMigrationSafetyCliGate({
         cfg: { ...cfg, surrealNamespace: "wrong_cfg" },
-        schemaVersion: 5,
+        schemaVersion: 1,
         restoreReport: current,
         restoreReportPath: restorePath,
       }, writer)).rejects.toThrow("source namespace/database runtime binding mismatch");
@@ -872,7 +872,7 @@ describe("managed isolated restore:test lifecycle", () => {
 });
 
 describe("managed isolated restore:test disposable integration", () => {
-  isolatedRoundtripTest("roundtrips a schema-5 logical export across two pinned disposable targets", async () => {
+  isolatedRoundtripTest("roundtrips a schema-1 logical export across two pinned disposable targets", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "baka-isolated-roundtrip-"));
     const credentials = { username: "root", password: "ephemeral-test-password" };
     const baseCfg = productionMaintenanceConfig(root);
@@ -947,7 +947,7 @@ describe("managed isolated restore:test disposable integration", () => {
 
       expect(restored.value.ok).toBe(true);
       expect(restored.value.formatVersion).toBe(5);
-      expect(restored.value.schemaVersion).toBe(5);
+      expect(restored.value.schemaVersion).toBe(1);
       expect(restored.value.target.fulltextIndexes.map((index) => index.name)).toEqual([
         "search_document_content",
       ]);
@@ -1209,32 +1209,6 @@ describe("production maintenance wrapper", () => {
 });
 
 describe("restore:test status artifact", () => {
-  test("persists honest schema 4 success evidence with the pre-migration contract", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "baka-cli-restore-schema4-"));
-    try {
-      const report = exactRestoreReport({
-        archiveRoot: root,
-        exportFile: "schema4.surql.gz",
-        exportBytes: 42,
-        exportSha256: "a".repeat(64),
-        manifestFile: "schema4.json",
-        manifestSha256: "b".repeat(64),
-        schemaVersion: 4,
-      });
-      const result = await persistRestoreTestReport(root, report, {
-        runId: "restore_test:schema4",
-        now: new Date("2026-07-26T12:00:00.000Z"),
-        suffix: "schema4",
-      });
-      expect(result.persisted.schemaVersion).toBe(4);
-      expect(result.persisted.checks.map((check) => check.name)).toEqual(
-        expectedSuccessfulRestoreCheckNames(0, 0, 4),
-      );
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
   test("persists a private top-level successful report discoverable by status", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "baka-cli-restore-report-"));
     try {
@@ -1249,7 +1223,7 @@ describe("restore:test status artifact", () => {
       const manifestJson = `${JSON.stringify({
         createdAt: "2026-07-26T11:00:00.000Z",
         surrealdbVersion: "3.2.3",
-        schemaVersion: 5,
+        schemaVersion: 1,
         bakaCommit: "test",
         namespace: "baka",
         database: "baka",
@@ -1428,7 +1402,7 @@ describe("migration mandatory backup/restore gate", () => {
     manifest: {
       createdAt: "2026-07-26T12:00:00.000Z",
       surrealdbVersion: "3.2.3",
-      schemaVersion: 5,
+      schemaVersion: 1,
       bakaCommit: "test",
       namespace: "baka",
       database: "archive",

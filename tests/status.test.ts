@@ -38,10 +38,10 @@ async function writeLocalLogicalBackup(
   createdAt: string,
   content: string,
   includeRawManifestSha256 = true,
-  schemaVersion: 4 | 5 = 5,
+  schemaVersion: 1 = 1,
 ): Promise<{
   database: string;
-  schemaVersion: 4 | 5;
+  schemaVersion: 1;
   rawManifestSha256?: string;
   exportPath: string;
   exportFile: string;
@@ -177,14 +177,14 @@ async function makeOffDeviceRestoreEvidence(base: string): Promise<{
   };
   const rawManifestPath = path.join(manifests, "raw-manifest-2026-07-26T100100Z.json");
   await writeFile(rawManifestPath, JSON.stringify(rawManifest));
-  const exportFile = "2026-07-26T100000Z__schema-5__surreal-3.2.3.surql.gz";
+  const exportFile = "2026-07-26T100000Z__schema-1__surreal-3.2.3.surql.gz";
   const localExportPath = path.join(surreal, exportFile);
   await writeFile(localExportPath, "standalone-export");
   const exportHashes = await hashFile(localExportPath);
   const logicalManifest: BackupManifest = {
     createdAt: "2026-07-26T10:00:00.000Z",
     surrealdbVersion: "3.2.3",
-    schemaVersion: 5,
+    schemaVersion: 1,
     bakaCommit: "test",
     namespace: "baka",
     database: "archive",
@@ -230,7 +230,7 @@ async function makeOffDeviceRestoreEvidence(base: string): Promise<{
   const reportPath = path.join(manifests, "restore-test-off-device.json");
   const backup: TestBackup = {
     database: logicalManifest.database,
-    schemaVersion: 5,
+    schemaVersion: 1,
     rawManifestSha256: logicalManifest.rawManifestSha256,
     exportPath: localExportPath,
     exportFile,
@@ -361,41 +361,6 @@ describe("status database (§17.2)", () => {
 });
 
 describe("status durable artifacts (§17.2)", () => {
-  test("recognizes strict schema 4 restore evidence without weakening schema 5 checks", async () => {
-    await withTempDir(async (root) => {
-      const backup = await writeLocalLogicalBackup(
-        root,
-        "schema4-pre-migration",
-        "2026-07-26T00:00:00.000Z",
-        "schema4-export",
-        true,
-        4,
-      );
-      const reportPath = path.join(
-        root,
-        "backups",
-        "manifests",
-        "restore-test-schema4.json",
-      );
-      await writeFile(reportPath, JSON.stringify(strictRestoreReport(
-        backup,
-        path.resolve(root),
-        "2026-07-26T00:01:00.000Z",
-      )));
-
-      const artifacts = await collectStatusArtifacts(root);
-      expect(artifacts.lastBackup?.schemaVersion).toBe(4);
-      expect(artifacts.lastSuccessfulRestore).toMatchObject({
-        schemaVersion: 4,
-        reportFile: "restore-test-schema4.json",
-        integrity: "verified",
-      });
-      expect(artifacts.lastSuccessfulRestore?.checks).toBe(
-        expectedSuccessfulRestoreCheckNames(0, 0, 4).length,
-      );
-    });
-  });
-
   test("отклоняет partial/fixed-namespace report и принимает строгий unique report", async () => {
     await withTempDir(async (root) => {
       const manifests = path.join(root, "backups", "manifests");
@@ -411,7 +376,7 @@ describe("status durable artifacts (§17.2)", () => {
         createdAt: "2026-07-24T00:00:00Z",
         surrealdbVersion: "3.2.3",
         exportFile: "old.surql.zst",
-        schemaVersion: 5,
+        schemaVersion: 1,
         bakaCommit: "test",
         namespace: "baka",
         database: "archive",
@@ -424,7 +389,7 @@ describe("status durable artifacts (§17.2)", () => {
       const oldManifestHashes = await hashFile(oldManifestPath);
       const oldBackup: TestBackup = {
         database: "archive",
-        schemaVersion: 5,
+        schemaVersion: 1,
         rawManifestSha256: "c".repeat(64),
         exportPath: oldExport,
         exportFile: "old.surql.zst",
@@ -439,7 +404,7 @@ describe("status durable artifacts (§17.2)", () => {
         createdAt: "2026-07-26T00:00:00Z",
         surrealdbVersion: "3.2.3",
         exportFile: "missing.surql.zst",
-        schemaVersion: 5,
+        schemaVersion: 1,
         bakaCommit: "test",
         namespace: "baka",
         database: "archive",
@@ -509,7 +474,7 @@ describe("status durable artifacts (§17.2)", () => {
       await writeFile(manifestPath, JSON.stringify({
         createdAt: "2026-07-26T00:00:00Z",
         surrealdbVersion: "3.2.3",
-        schemaVersion: 5,
+        schemaVersion: 1,
         bakaCommit: "test",
         namespace: "baka",
         database: "archive",
@@ -540,7 +505,7 @@ describe("status durable artifacts (§17.2)", () => {
     });
   });
 
-  test("schema 5 logical backup без rawManifestSha256 не считается durable", async () => {
+  test("schema 1 logical backup без rawManifestSha256 не считается durable", async () => {
     await withTempDir(async (root) => {
       await writeLocalLogicalBackup(
         root,
@@ -560,7 +525,7 @@ describe("status durable artifacts (§17.2)", () => {
       await writeFile(path.join(manifests, "crashed.json"), JSON.stringify({
         createdAt: "2026-07-26T00:00:00.000Z",
         surrealdbVersion: "3.2.3",
-        schemaVersion: 5,
+        schemaVersion: 1,
         bakaCommit: "test",
         namespace: "baka",
         database: "archive",
@@ -738,7 +703,7 @@ describe("status CLI formatter", () => {
         exportFile: "backup.surql.zst",
         manifestPath: "/tmp/archive/backups/manifests/backup.json",
         manifestFile: "backup.json",
-        schemaVersion: 5,
+        schemaVersion: 1,
         exportBytes: 1024,
         exportSha256: "a".repeat(64),
         manifestSha256: "b".repeat(64),
@@ -758,7 +723,7 @@ describe("status CLI formatter", () => {
         exportSha256: "a".repeat(64),
         manifestSha256: "b".repeat(64),
         artifactSource: "local_archive",
-        schemaVersion: 5,
+        schemaVersion: 1,
         rawManifestSha256: "c".repeat(64),
         integrity: "verified",
         externalTrust: "local_archive_boundary_required",

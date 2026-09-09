@@ -213,7 +213,7 @@ async function makeCtx(t: TestDb): Promise<Ctx> {
     kind: "live_sync",
     host,
     bakaCommit: "test",
-    schemaVersion: 4,
+    schemaVersion: 1,
   });
   const root = await ensureSourceRoot(t.db, {
     harnessInstallation: installation,
@@ -501,7 +501,7 @@ describe("full-text search (integration)", () => {
 
       const summary = await rebuildSearchProjection(t.db, {
         host: ctx.host,
-        schemaVersion: 4,
+        schemaVersion: 1,
         enqueueEmbeddings: true,
       });
       expect(summary.revisions).toBe(1);
@@ -524,7 +524,7 @@ describe("full-text search (integration)", () => {
       // Повторный rebuild идемпотентен (те же id, то же число документов).
       const second = await rebuildSearchProjection(t.db, {
         host: ctx.host,
-        schemaVersion: 4,
+        schemaVersion: 1,
         enqueueEmbeddings: true,
       });
       expect(second.searchDocuments).toBe(summary.searchDocuments);

@@ -158,7 +158,7 @@ isolatedTest(
               kind: "fixture",
               host,
               bakaCommit: "reparse-isolated-test",
-              schemaVersion: 5,
+              schemaVersion: 1,
             });
             const seeded: SeededTarget[] = [];
             for (let index = 0; index < 5; index += 1) {
@@ -246,7 +246,7 @@ isolatedTest(
               kind: "reparse",
               host,
               bakaCommit: "reparse-isolated-test",
-              schemaVersion: 5,
+              schemaVersion: 1,
             });
             const first = await reparseSourceRevisions(db, archive, {
               selection,
@@ -310,7 +310,7 @@ isolatedTest(
               kind: "reparse",
               host,
               bakaCommit: "reparse-isolated-test",
-              schemaVersion: 5,
+              schemaVersion: 1,
             });
             const second = await reparseSourceRevisions(db, archive, {
               selection,

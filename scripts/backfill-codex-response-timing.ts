@@ -232,7 +232,7 @@ async function main(): Promise<void> {
   try {
     db = await connectDb(cfg);
     const schemaVersion = await checkSchemaVersion(db);
-    if (schemaVersion < 8) {
+    if (schemaVersion !== 1) {
       throw new Error(`schema version ${schemaVersion} does not have response timing fields`);
     }
     const targets = await selectTargets(db, options.limit);

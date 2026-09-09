@@ -100,8 +100,8 @@ migration; recovery не оставляет отдельный retained large ca
 
 Off-device bundle публикуется отдельно как
 `<destination>/<backupId>/{archive/,off-device-manifest.json,off-device-report.json}`.
-Schema 5 задаётся миграциями `schema/0001_*.surql` …
-`schema/0005_legacy_migration_run.surql`.
+Полная начальная схема 1 релиза 0.1.0 задаётся единственным файлом
+`schema/0001_initial.surql`; последующие миграции — только для новых релизов.
 
 ## Изолированный restore acceptance
 
@@ -129,7 +129,7 @@ threads/jobs 4/4, subcompactions 2, threshold 6 GiB и index resume 0.
 adaptive indexing (probe 16 records, soft target 8 388 608 raw bytes, clamp и
 replay максимум 250 records). Эти значения, exact image digest, opaque data
 identity, readiness `search_document_content`, отсутствие `chunk_content` для
-schema 5 и cleanup входят в durable report.
+schema 1 и cleanup входят в durable report.
 OOM/ошибка не разрешает success: сохраняется только privacy-safe
 stage/code/counters/cleanup evidence,
 а production container всё равно перезапускается и проверяется. Same-server
@@ -190,7 +190,7 @@ limit не делают structured sync неуспешным.
 11. Архив восстанавливается из logical export + raw backup только через
     isolated pinned target; strict v5 report связан с exact
     export/manifest/raw hashes, durable resource profile, ready
-    `search_document_content`, отсутствующим `chunk_content` для schema 5,
+    `search_document_content`, отсутствующим `chunk_content` для schema 1,
     полным target cleanup и неизменным production baseline.
 12. Off-device checksums доказывают целостность, но не физическую provenance:
     `st_dev` показывает другой filesystem, а доверие к устройству/manifest

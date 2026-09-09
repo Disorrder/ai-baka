@@ -38,7 +38,7 @@ async function main(): Promise<void> {
   try {
     db = await connectDb(cfg);
     const schemaVersion = await checkSchemaVersion(db);
-    if (schemaVersion < 9) throw new Error(`schema version ${schemaVersion} does not have lineage fields`);
+    if (schemaVersion !== 1) throw new Error(`schema version ${schemaVersion} does not have lineage fields`);
     const lineage = await analyzeCodexLineage(db, cfg.archiveRoot);
     let updated = 0;
     for (const row of lineage.details) {

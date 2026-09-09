@@ -3364,7 +3364,7 @@ export function formatRecoveryRebuildSuccess(report: {
 program
   .command("recovery:rebuild <export>")
   .description(
-    "Fail-closed rebuild fresh APFS DB из authenticated internal schema-5 copy без cutover",
+    "Fail-closed rebuild fresh APFS DB из authenticated internal schema-1 copy без cutover",
   )
   .requiredOption(
     "--export-sha256 <sha256>",
@@ -4882,8 +4882,8 @@ async function executeMigration(
         try {
           schemaDb = await connectDb(cfg);
           schemaVersion = await checkSchemaVersion(schemaDb);
-          if (schemaVersion < 5) {
-            throw new Error(`migration requires schema >= 5; current ${schemaVersion}`);
+          if (schemaVersion !== 1) {
+            throw new Error(`migration requires schema 1; current ${schemaVersion}`);
           }
           currentLiveProbe = await probeLiveCorpusFromDb(schemaDb);
         } finally {
@@ -5098,8 +5098,8 @@ async function applyMigrationOperatorExclusions(
     const snapshot = await ensureLegacySnapshot(options.legacyDb, cfg.archiveRoot);
     db = await connectDb(cfg);
     const schemaVersion = await checkSchemaVersion(db);
-    if (schemaVersion < 5 || schemaVersion > 9) {
-      throw new Error(`operator exclusions require schema 5–9; current ${schemaVersion}`);
+    if (schemaVersion !== 1) {
+      throw new Error(`operator exclusions require schema 1; current ${schemaVersion}`);
     }
     const report = await applyOperatorExclusions({
       db,

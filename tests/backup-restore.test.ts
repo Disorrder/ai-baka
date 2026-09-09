@@ -68,7 +68,7 @@ async function writeManifest(
   await writeFile(manifestPath, `${JSON.stringify({
     createdAt: "2026-07-26T00:00:00.000Z",
     surrealdbVersion: "3.2.3",
-    schemaVersion: 5,
+    schemaVersion: 1,
     bakaCommit: "test",
     namespace: "source_must_not_be_queried",
     database: "archive",
@@ -157,7 +157,7 @@ function persistedRestoreReport(
     manifestFile,
     manifestSha256: "b".repeat(64),
     rawManifestSha256: "c".repeat(64),
-    schemaVersion: 5,
+    schemaVersion: 1,
     searchDocuments,
     chunks: 0,
     checks: expectedSuccessfulRestoreCheckNames(searchDocuments, 0).map((name) => ({
@@ -210,11 +210,11 @@ describe("restore namespace and connection lifecycle", () => {
 });
 
 describe("strict persisted restore evidence v5", () => {
-  test("accepts the exact schema-5 zero-document contract", () => {
+  test("accepts the exact schema-1 zero-document contract", () => {
     const root = path.resolve("/tmp/baka-restore-contract");
     const parsed = parsePersistedRestoreTestReport(persistedRestoreReport(root));
     expect(parsed.namespace).toBe(`baka_restore_test_${"a".repeat(32)}`);
-    expect(parsed.schemaVersion).toBe(5);
+    expect(parsed.schemaVersion).toBe(1);
     expect(parsed.searchDocuments).toBe(0);
   });
 
@@ -249,45 +249,20 @@ describe("strict persisted restore evidence v5", () => {
     expect(() => parsePersistedRestoreTestReport(forgedForensic)).toThrow(/unknown|checks/);
   });
 
-  test("accepts schema 4 with its exact pre-migration check contract", () => {
-    const root = path.resolve("/tmp/baka-restore-contract-schema4");
-    const checks = expectedSuccessfulRestoreCheckNames(0, 0, 4).map((name) => ({
-      name,
-      ok: true,
-      detail: "verified",
-    }));
-    const parsed = parsePersistedRestoreTestReport(persistedRestoreReport(root, {
-      schemaVersion: 4,
-      checks,
-    }));
-    expect(parsed.schemaVersion).toBe(4);
-    expect(checks.some((check) => check.name.includes("migration_row_commit"))).toBe(false);
-    expect(checks.some((check) => check.name.includes("migration_quarantine"))).toBe(false);
-  });
-
-  test("schema-specific reports cannot substitute the other version's checks", () => {
+  test("rejects obsolete schema reports and missing durable migration checks", () => {
     const root = path.resolve("/tmp/baka-restore-contract-schema-binding");
-    const schema4Names = requiredRestoreCheckNamesForSchemaVersion(4);
-    const schema5Names = requiredRestoreCheckNamesForSchemaVersion(5);
-    expect(schema5Names).toContain("invariant: migration_row_commit migration/target");
-    expect(schema5Names).toContain("invariant: migration_quarantine migration/previous_attempt");
-    expect(schema4Names.some((name) => name.includes("migration_row_commit"))).toBe(false);
-    expect(schema4Names.some((name) => name.includes("migration_quarantine"))).toBe(false);
-    expect(restoreRelationalChecksForSchemaVersion(4).some(
-      ([name]) => name.includes("migration_quarantine"),
-    )).toBe(false);
-
-    const wrongSchema4 = persistedRestoreReport(root, { schemaVersion: 4 });
-    expect(() => parsePersistedRestoreTestReport(wrongSchema4)).toThrow(/checks/);
-
-    const wrongSchema5 = persistedRestoreReport(root, {
-      checks: expectedSuccessfulRestoreCheckNames(0, 0, 4).map((name) => ({
-        name,
-        ok: true,
-        detail: "verified",
-      })),
+    const valid = persistedRestoreReport(root);
+    for (const schemaVersion of [0, 2, 4, 5, 6, 7, 8, 9]) {
+      expect(() => parsePersistedRestoreTestReport({ ...valid, schemaVersion })).toThrow();
+      expect(() => requiredRestoreCheckNamesForSchemaVersion(schemaVersion)).toThrow();
+      expect(() => restoreRelationalChecksForSchemaVersion(schemaVersion)).toThrow();
+    }
+    const missingLedgerCheck = persistedRestoreReport(root, {
+      checks: (valid.checks as Array<{ name: string }>).filter(
+        (check) => !check.name.includes("migration_row_commit"),
+      ),
     });
-    expect(() => parsePersistedRestoreTestReport(wrongSchema5)).toThrow(/checks/);
+    expect(() => parsePersistedRestoreTestReport(missingLedgerCheck)).toThrow(/checks/);
   });
 
   test("rejects unknown, duplicate, partial, fixed-namespace and incomplete-cleanup reports", () => {
@@ -336,7 +311,7 @@ describe("strict isolated restore target evidence", () => {
     const parsed = parseRestoreTargetEvidence(isolatedTargetEvidence());
     expect(parsed.mode).toBe("isolated_pinned_container");
     expect(parsed.image).toEqual({
-      version: "3.2.3",
+      version: "3.2.4",
       digest: PINNED_RESTORE_TARGET_IMAGE_DIGEST,
     });
     expect(parsed.fulltextIndexes.map((index) => index.name)).toEqual([
@@ -571,7 +546,7 @@ describe("strict isolated restore target evidence", () => {
 });
 
 describe("restore failure evidence", () => {
-  for (const schemaVersion of [4, 5] as const) {
+  for (const schemaVersion of [1] as const) {
     test(`schema ${schemaVersion} without rawManifestSha256 fails durably before DB access`, async () => {
       await withTempDir(async (directory) => {
         const exportPath = path.join(directory, "backups", "surreal", "missing-raw.surql.gz");
@@ -595,7 +570,7 @@ describe("restore failure evidence", () => {
     });
   }
 
-  for (const schemaVersion of [4, 5] as const) {
+  for (const schemaVersion of [1] as const) {
     test(`schema ${schemaVersion} manifest filename/exportFile binding fails before DB access`, async () => {
       await withTempDir(async (directory) => {
         const exportPath = path.join(directory, "backups", "surreal", "selected.surql.gz");
@@ -619,14 +594,14 @@ describe("restore failure evidence", () => {
     });
   }
 
-  test("schema 4 exportBytes mismatch fails before namespace creation/import", async () => {
+  test("schema 1 exportBytes mismatch fails before namespace creation/import", async () => {
     await withTempDir(async (directory) => {
       const exportPath = path.join(directory, "backups", "surreal", "wrong-size.surql.gz");
       await mkdir(path.dirname(exportPath), { recursive: true });
       await writeFile(exportPath, "anonymized export");
       const hashes = await hashFile(exportPath);
       await writeManifest(directory, exportPath, {
-        schemaVersion: 4,
+        schemaVersion: 1,
         exportBytes: hashes.sizeBytes + 1,
       });
 
@@ -701,7 +676,7 @@ describe("restore failure evidence", () => {
       ));
 
       expect(error.report.failure).toEqual({ stage: "import", code: "import_failed" });
-      expect(error.report.schemaVersion).toBe(5);
+      expect(error.report.schemaVersion).toBe(1);
       expect(error.report.importTransport).toEqual({
         category: "http_server_error",
         bytesSent: 17,

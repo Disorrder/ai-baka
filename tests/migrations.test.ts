@@ -31,55 +31,6 @@ function migrationFile(version: number, name: string, sum: string): MigrationFil
 }
 
 describe("migrations (unit)", () => {
-  test("0005 удаляет только глобальный chunk FULLTEXT index, не canonical records", async () => {
-    const migration = await readFile(
-      path.join(import.meta.dir, "..", "schema", "0005_legacy_migration_run.surql"),
-      "utf8",
-    );
-    expect(migration).toContain("REMOVE INDEX IF EXISTS chunk_content ON TABLE chunk;");
-    expect(migration).not.toMatch(/\b(?:DELETE|REMOVE TABLE)\s+chunk\b/i);
-  });
-
-  test("0006 добавляет cached character counts без изменения canonical tables", async () => {
-    const migration = await readFile(
-      path.join(import.meta.dir, "..", "schema", "0006_content_character_counts.surql"),
-      "utf8",
-    );
-    expect(migration).toContain("DEFINE FIELD IF NOT EXISTS content_chars ON TABLE chunk TYPE int;");
-    expect(migration).toContain("DEFINE FIELD IF NOT EXISTS content_chars ON TABLE message TYPE int;");
-    expect(migration).not.toMatch(/\bUPDATE\s+(?:message|chunk)\b/i);
-    expect(migration).not.toMatch(/\b(?:DELETE|REMOVE TABLE)\s+(?:message|chunk)\b/i);
-  });
-
-  test("0007 добавляет writer reference indexes без изменения данных", async () => {
-    const migration = await readFile(
-      path.join(import.meta.dir, "..", "schema", "0007_writer_reference_indexes.surql"),
-      "utf8",
-    );
-    expect(migration).toContain(
-      "DEFINE INDEX IF NOT EXISTS search_document_dialogue_revision ON TABLE search_document FIELDS dialogue_revision;",
-    );
-    expect(migration).toContain(
-      "DEFINE INDEX IF NOT EXISTS embedding_job_search_document ON TABLE embedding_job FIELDS search_document;",
-    );
-    expect(migration).not.toMatch(/\bUPDATE\b/i);
-    expect(migration).not.toMatch(/\b(?:DELETE|REMOVE TABLE)\b/i);
-  });
-
-  test("0009 добавляет backfillable Codex lineage без изменения revisions", async () => {
-    const migration = await readFile(
-      path.join(import.meta.dir, "..", "schema", "0009_codex_lineage.surql"),
-      "utf8",
-    );
-    expect(migration).toContain(
-      "DEFINE FIELD IF NOT EXISTS parent_source_dialogue_id ON TABLE dialogue_revision TYPE option<string>;",
-    );
-    expect(migration).toContain(
-      "DEFINE INDEX IF NOT EXISTS dialogue_revision_parent_source_dialogue_id ON TABLE dialogue_revision FIELDS parent_source_dialogue_id;",
-    );
-    expect(migration).not.toMatch(/\b(?:UPDATE|DELETE|REMOVE TABLE)\b/i);
-  });
-
   test("checksum — sha256 содержимого", () => {
     expect(checksum("hello")).toBe(
       "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",

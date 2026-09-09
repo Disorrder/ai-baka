@@ -43,7 +43,7 @@ HOME-derived `BAKA_DB_ROOT` устойчив между обычными `baka d
   production-копии. `surreal fix` — не SST repair; native RocksDB RepairDB —
   lossy salvage без гарантии time-consistent state.
 - Recovery принимает только exact-pinned SurrealDB image, committed logical
-  export и соответствующий manifest с совпавшими size/SHA-256, schema 5,
+  export и соответствующий manifest с совпавшими size/SHA-256, schema 1,
   namespace/database и `rawManifestSha256`.
 - Final `BAKA_DB_ROOT` и recovery work root должны быть fresh real directories
   без symlink traversal. Final DB и work root не должны совпадать.

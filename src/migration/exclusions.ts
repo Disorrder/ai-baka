@@ -4,7 +4,7 @@
  * This module deliberately does not change migration reconciliation.  The
  * historical row remains `quarantined` and continues to point at its durable
  * migration_quarantine record.  A signed exclusion only adjudicates the
- * current unresolved state through resolved_at/resolution and schema-5+
+ * current unresolved state through resolved_at/resolution and schema-1
  * migration_meta evidence.
  */
 
@@ -51,8 +51,8 @@ export const OPERATOR_EXCLUSION_CODES = [
 ] as const;
 
 function assertOperatorExclusionSchemaVersion(schemaVersion: number): void {
-  if (schemaVersion < 5 || schemaVersion > 9) {
-    throw new Error(`operator exclusions require schema 5–9; current ${schemaVersion}`);
+  if (schemaVersion !== 1) {
+    throw new Error(`operator exclusions require schema 1; current ${schemaVersion}`);
   }
 }
 

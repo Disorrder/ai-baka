@@ -64,7 +64,7 @@ function successfulReport(input: {
     exportSha256: "a".repeat(64),
     manifestSha256: "b".repeat(64),
     rawManifestSha256: "c".repeat(64),
-    schemaVersion: 5,
+    schemaVersion: 1,
     dbRoot: input.freshDbRoot,
     corruptDbRoot: input.currentDbRoot,
     sourceMode: "current-internal",
@@ -85,7 +85,7 @@ function successfulReport(input: {
     indexBuilds: [{ name: "search_document_content", state: "ready" }],
     stagedVerification: {
       ok: true,
-      schemaVersion: 5,
+      schemaVersion: 1,
       recordCounts: { search_document: 2, chunk: 3 },
       rawManifestSha256: "c".repeat(64),
       rawFilesChecked: 1,
@@ -189,7 +189,7 @@ describe("recovery:promote", () => {
       const result = await runRecoveryPromotion(cfg, options, dependencies(events));
       expect(result).toMatchObject({
         ok: true,
-        schemaVersion: 5,
+        schemaVersion: 1,
         currentDbRoot: options.currentDbRoot,
         quarantineDbRoot: options.quarantineDbRoot,
         stoppedContainerId: CONTAINER_ID,

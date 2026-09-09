@@ -1,5 +1,18 @@
 # AGENTS.md
 
+## Версия релиза и схемы
+
+Для ai-baka **0.1.0** существует ровно одна начальная миграция:
+`schema/0001_initial.surql`, числовая версия схемы **1**. В неё включён весь
+актуальный DDL; новые миграции добавляются только при переходе на следующий
+релиз. Версии файлов/отчётов (`formatVersion`) от версии схемы независимы.
+Дорелизная цепочка 0001–0009 несовместима по номерам/checksum и не
+перенумеровывается автоматически; рабочую БД и старые backup artifacts
+нельзя переобозначать как schema 1. Исторические live-измерения ниже относятся
+к прежним development-схемам, не к текущему baseline.
+Legacy SQLite import остаётся отдельной функцией. Порядок обновления —
+в README, раздел «Обновление».
+
 ## Статус проекта
 
 Реализованы этапы 0–8 из [`docs/plan.md`](docs/plan.md) (раздел «Порядок
@@ -15,8 +28,8 @@ EXTRACTOR_VERSION = 3), SurrealDB writer и structured sync
 segmentation_version = "2", target 6000–7000 / hard < 8192 токенов,
 эвристика chars/3.5 с seam под точный tokenizer), BM25 full-text
 поиск (`src/search/fulltext.ts`, CLI `baka search`) по curated
-`search_document`; глобальный forensic index `chunk_content` удаляется в
-schema 5, а legacy flags fail closed до DB query. Canonical chunks/history
+`search_document`; глобальный forensic index `chunk_content` не создаётся в
+начальной схеме 1, а legacy flags fail closed до DB query. Canonical chunks/history
 сохранены. Пересоздание projection — `baka search:rebuild`
 (`src/search/rebuild.ts`).
 Этап 7: embedding pipeline (`src/embeddings/`) — provider abstraction +
@@ -78,8 +91,8 @@ legacy-таблицам; `migration run` — этап 10.
   src/search/rebuild.ts).
 - `search_document` содержит отдельный `user_prompt` для каждого
   human-authored user message и финальные видимые assistant answers только
-  current revisions; migration 0005 удаляет только глобальный
-  `chunk_content` FULLTEXT, не canonical `chunk` records. Legacy forensic
+  current revisions; начальная схема не создаёт глобальный
+  `chunk_content` FULLTEXT, сохраняя canonical `chunk` records. Legacy forensic
   flags fail closed без query/table scan.
 
 Ключевые решения этапа 7:
@@ -151,7 +164,7 @@ legacy-таблицам; `migration run` — этап 10.
   finalize (container, затем volume, с доказанной отсутствующей identity) →
   production restart/health/baseline → только после этого RestoreTestReport v5;
 - `recovery:rebuild` — отдельный one-way production flow: authenticated
-  schema-5 export → fresh final `BAKA_DB_ROOT` + отдельный internal work root →
+  schema-1 export → fresh final `BAKA_DB_ROOT` + отдельный internal work root →
   staged import/index/verification → exact staging-container removal + temp cleanup →
   private durable journal/report. Вход требует exact independently pinned
   `--export-sha256`, `--manifest-sha256`, effective internal
@@ -285,7 +298,7 @@ legacy-таблицам; `migration run` — этап 10.
 - restore drill вырезает FULLTEXT DDL из export'а, сначала импортирует
   данные, затем строит BM25/HIGHLIGHTS один раз — без дорогого
   инкрементального обновления индекса на каждом INSERT-батче.
-- schema 5 больше не строит FULLTEXT по всем physical `chunk` revisions:
+- начальная схема не строит FULLTEXT по всем physical `chunk` revisions:
   production/restore требуют только `search_document_content`; canonical
   chunks и historical revisions остаются сохранены без глобального индекса.
 
@@ -325,8 +338,8 @@ legacy-таблицам; `migration run` — этап 10.
   default — `<HOME>/Library/Application Support/ai-baka/rocksdb`
   на внутреннем APFS/POSIX storage. ExFAT для live RocksDB и recovery temp/
   staging/journal не поддерживается; старый archive/db не runtime fallback.
-- Схема БД — миграции в `schema/*.surql` (0001–0004, строго по
-  `docs/plan.md` §7/§8/§12/§13/§15); migration runner —
+- Схема БД — единственная `schema/0001_initial.surql` (версия схемы 1,
+  по `docs/plan.md` §7/§8/§12/§13/§15); migration runner —
   `src/db/migrations.ts` (`baka db migrate`, версия схемы видна в
   `baka db status`).
 

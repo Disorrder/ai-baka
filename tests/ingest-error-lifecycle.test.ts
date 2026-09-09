@@ -135,9 +135,9 @@ describe("ingest error lifecycle integration", () => {
           basename = "fixture.jsonl", presence_status = "active", missing_complete_scans = 0,
           first_seen_at = $now, last_seen_at = $now;
         CREATE sync_run:old SET kind = "fixture", status = "completed_with_errors",
-          started_at = $now, host = host:lifecycle, baka_commit = "fixture", schema_version = 5;
+          started_at = $now, host = host:lifecycle, baka_commit = "fixture", schema_version = 1;
         CREATE sync_run:retry SET kind = "fixture", status = "running",
-          started_at = $now, host = host:lifecycle, baka_commit = "fixture", schema_version = 5;
+          started_at = $now, host = host:lifecycle, baka_commit = "fixture", schema_version = 1;
         CREATE source_revision:lifecycle SET source_location = source_location:lifecycle,
           sha256 = $sha, size_bytes = 1, mtime_ms = 1, raw_archive_path = "raw/codex/fixture",
           snapshot_kind = "regular_copy", captured_at = $now, parser_name = "codex",

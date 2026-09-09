@@ -1,7 +1,7 @@
 -- 0001_initial.surql
--- Этап 2, docs/plan.md §7: identity-таблицы, source provenance,
--- канонический корпус. Все таблицы SCHEMAFULL; metadata/raw object-поля —
--- FLEXIBLE. Связи — record links, option<> там, где поле может отсутствовать.
+-- Начальная схема 1 для ai-baka 0.1.0: полный canonical corpus, поиск,
+-- embeddings и legacy import. Все таблицы SCHEMAFULL; metadata/raw object-поля
+-- FLEXIBLE. Новые миграции добавляются только при переходе на следующий релиз. В процессе работы над новой версией дополняем последнюю миграцию (не в ветке main).
 
 -- ============================================================
 -- archive_meta — singleton archive_meta:main (план §7.1)
@@ -182,7 +182,7 @@ DEFINE FIELD IF NOT EXISTS size_bytes ON TABLE source_revision TYPE int;
 DEFINE FIELD IF NOT EXISTS mtime_ms ON TABLE source_revision TYPE int;
 -- быстрый fingerprint, НЕ identity
 DEFINE FIELD IF NOT EXISTS head_hash ON TABLE source_revision TYPE option<string>;
-DEFINE FIELD IF NOT EXISTS raw_archive_path ON TABLE source_revision TYPE string;
+DEFINE FIELD IF NOT EXISTS raw_archive_path ON TABLE source_revision TYPE option<string>;
 -- snapshot_kind: regular_copy | sqlite_backup | vacuum_into | legacy_raw
 DEFINE FIELD IF NOT EXISTS snapshot_kind ON TABLE source_revision TYPE string;
 DEFINE FIELD IF NOT EXISTS captured_at ON TABLE source_revision TYPE datetime;
@@ -297,3 +297,219 @@ DEFINE FIELD IF NOT EXISTS tool_call_id ON TABLE chunk TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS tool_name ON TABLE chunk TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS raw_event_type ON TABLE chunk TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS metadata ON TABLE chunk TYPE option<object> FLEXIBLE;
+
+-- ============================================================
+-- search_document — производная единица поиска (план §8.1)
+-- Полностью производна: при смене dialogue.current_revision старые
+-- search_document удаляются и создаются заново.
+-- ============================================================
+DEFINE TABLE IF NOT EXISTS search_document SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS dialogue ON TABLE search_document TYPE record<dialogue>;
+DEFINE FIELD IF NOT EXISTS dialogue_revision ON TABLE search_document TYPE record<dialogue_revision>;
+DEFINE FIELD IF NOT EXISTS message ON TABLE search_document TYPE option<record<message>>;
+-- document_type: user_prompt | assistant_final
+DEFINE FIELD IF NOT EXISTS document_type ON TABLE search_document TYPE string;
+DEFINE FIELD IF NOT EXISTS segment_no ON TABLE search_document TYPE int;
+DEFINE FIELD IF NOT EXISTS content ON TABLE search_document TYPE string;
+DEFINE FIELD IF NOT EXISTS content_sha256 ON TABLE search_document TYPE string;
+DEFINE FIELD IF NOT EXISTS token_count ON TABLE search_document TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS source_chunks ON TABLE search_document TYPE array<record<chunk>>;
+DEFINE FIELD IF NOT EXISTS extraction_method ON TABLE search_document TYPE string;
+DEFINE FIELD IF NOT EXISTS extraction_version ON TABLE search_document TYPE string;
+DEFINE FIELD IF NOT EXISTS segmentation_version ON TABLE search_document TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE search_document TYPE datetime;
+
+-- ============================================================
+-- Analyzer archive_mixed (план §12.2)
+-- Нейтрален для русского/английского/кода/camelCase/путей; stemming
+-- не применяем без relevance-тестов.
+-- ============================================================
+DEFINE ANALYZER IF NOT EXISTS archive_mixed
+TOKENIZERS class, camel
+FILTERS lowercase;
+
+-- ============================================================
+-- Fulltext-индексы (план §12.3). Синтаксис SurrealDB 3.x:
+-- FULLTEXT ANALYZER (не SEARCH ANALYZER).
+-- ============================================================
+DEFINE INDEX IF NOT EXISTS search_document_content
+ON TABLE search_document
+FIELDS content
+FULLTEXT ANALYZER archive_mixed
+BM25 HIGHLIGHTS;
+
+-- ============================================================
+-- embedding_space — metadata векторного пространства (план §13.1)
+-- Каждое space получает отдельную физическую таблицу (physical_table)
+-- с фиксированной dimension и собственным ANN-индексом.
+-- ============================================================
+DEFINE TABLE IF NOT EXISTS embedding_space SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS slug ON TABLE embedding_space TYPE string;
+DEFINE FIELD IF NOT EXISTS provider ON TABLE embedding_space TYPE string;
+DEFINE FIELD IF NOT EXISTS model ON TABLE embedding_space TYPE string;
+DEFINE FIELD IF NOT EXISTS dimensions ON TABLE embedding_space TYPE int;
+DEFINE FIELD IF NOT EXISTS distance ON TABLE embedding_space TYPE string;
+DEFINE FIELD IF NOT EXISTS vector_type ON TABLE embedding_space TYPE string;
+DEFINE FIELD IF NOT EXISTS segmentation_version ON TABLE embedding_space TYPE string;
+DEFINE FIELD IF NOT EXISTS active ON TABLE embedding_space TYPE bool;
+DEFINE FIELD IF NOT EXISTS physical_table ON TABLE embedding_space TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE embedding_space TYPE datetime;
+DEFINE INDEX IF NOT EXISTS embedding_space_slug_unique ON TABLE embedding_space FIELDS slug UNIQUE;
+
+-- ============================================================
+-- embedding_job — очередь векторизации (план §13.5)
+-- Embeddings не входят в критический путь sync (план §3.4).
+-- ============================================================
+DEFINE TABLE IF NOT EXISTS embedding_job SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS search_document ON TABLE embedding_job TYPE record<search_document>;
+DEFINE FIELD IF NOT EXISTS embedding_space ON TABLE embedding_job TYPE record<embedding_space>;
+DEFINE FIELD IF NOT EXISTS input_sha256 ON TABLE embedding_job TYPE string;
+-- status: pending | processing | retryable_error | permanent_error | completed | cancelled
+DEFINE FIELD IF NOT EXISTS status ON TABLE embedding_job TYPE string;
+DEFINE FIELD IF NOT EXISTS attempts ON TABLE embedding_job TYPE int;
+DEFINE FIELD IF NOT EXISTS next_attempt_at ON TABLE embedding_job TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS locked_by ON TABLE embedding_job TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS locked_at ON TABLE embedding_job TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS last_error ON TABLE embedding_job TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE embedding_job TYPE datetime;
+DEFINE FIELD IF NOT EXISTS completed_at ON TABLE embedding_job TYPE option<datetime>;
+DEFINE INDEX IF NOT EXISTS embedding_job_document_space ON TABLE embedding_job FIELDS search_document, embedding_space UNIQUE;
+DEFINE INDEX IF NOT EXISTS embedding_job_search_document ON TABLE embedding_job FIELDS search_document;
+
+-- ============================================================
+-- legacy_identity_map — mapping legacy SQLite entity → новая запись.
+-- Один из надёжных ключей автоматического merge при дедупликации
+-- (план §15.7). Соответствие таблиц — план §15.5.
+-- ============================================================
+DEFINE TABLE IF NOT EXISTS legacy_identity_map SCHEMAFULL;
+-- legacy_table: agent_systems | projects | source_files | raw_backups | threads | messages | message_chunks
+DEFINE FIELD IF NOT EXISTS legacy_table ON TABLE legacy_identity_map TYPE string;
+-- PK записи в legacy SQLite (строкой: legacy id могут быть нечисловыми)
+DEFINE FIELD IF NOT EXISTS legacy_id ON TABLE legacy_identity_map TYPE string;
+-- record новой модели; bare record, т.к. целевая таблица зависит от legacy_table
+DEFINE FIELD IF NOT EXISTS target ON TABLE legacy_identity_map TYPE record;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE legacy_identity_map TYPE datetime;
+DEFINE INDEX IF NOT EXISTS legacy_identity_map_unique ON TABLE legacy_identity_map FIELDS legacy_table, legacy_id UNIQUE;
+
+-- ============================================================
+-- migration_meta — reconciliation metadata миграции истории.
+-- Один record на запуск миграции; счётчики гибкие (сверка «ни одной
+-- тихо потерянной строки», план §15.2/§15.10).
+-- ============================================================
+DEFINE TABLE IF NOT EXISTS migration_meta SCHEMAFULL;
+-- status: preflight | running | completed | completed_with_errors | failed
+DEFINE FIELD IF NOT EXISTS status ON TABLE migration_meta TYPE string;
+DEFINE FIELD IF NOT EXISTS started_at ON TABLE migration_meta TYPE datetime;
+DEFINE FIELD IF NOT EXISTS finished_at ON TABLE migration_meta TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS legacy_db_path ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS legacy_db_sha256 ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS sync_run ON TABLE migration_meta TYPE option<record<sync_run>>;
+-- counters: счётчики legacy → новая модель для reconciliation-отчёта
+DEFINE FIELD IF NOT EXISTS counters ON TABLE migration_meta TYPE option<object> FLEXIBLE;
+DEFINE FIELD IF NOT EXISTS notes ON TABLE migration_meta TYPE option<string>;
+
+-- created_by_run is immutable provenance, not permission to delete a shared
+-- record. A migration transaction sets it only on records created by that
+-- transaction; existing live/shared rows are never relabelled.
+DEFINE FIELD IF NOT EXISTS created_by_run ON TABLE vendor TYPE option<record<migration_meta>>;
+DEFINE FIELD IF NOT EXISTS created_by_run ON TABLE model TYPE option<record<migration_meta>>;
+DEFINE FIELD IF NOT EXISTS created_by_run ON TABLE workspace TYPE option<record<migration_meta>>;
+DEFINE FIELD IF NOT EXISTS created_by_run ON TABLE workspace_location TYPE option<record<migration_meta>>;
+DEFINE FIELD IF NOT EXISTS created_by_run ON TABLE source_root TYPE option<record<migration_meta>>;
+DEFINE FIELD IF NOT EXISTS created_by_run ON TABLE source_location TYPE option<record<migration_meta>>;
+DEFINE FIELD IF NOT EXISTS created_by_run ON TABLE source_revision TYPE option<record<migration_meta>>;
+DEFINE FIELD IF NOT EXISTS created_by_run ON TABLE dialogue TYPE option<record<migration_meta>>;
+DEFINE FIELD IF NOT EXISTS created_by_run ON TABLE dialogue_revision TYPE option<record<migration_meta>>;
+DEFINE FIELD IF NOT EXISTS parent_source_dialogue_id ON TABLE dialogue_revision TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS agent_depth ON TABLE dialogue_revision TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS agent_nickname ON TABLE dialogue_revision TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS agent_role ON TABLE dialogue_revision TYPE option<string>;
+DEFINE INDEX IF NOT EXISTS dialogue_revision_parent_source_dialogue_id ON TABLE dialogue_revision FIELDS parent_source_dialogue_id;
+DEFINE FIELD IF NOT EXISTS created_by_run ON TABLE message TYPE option<record<migration_meta>>;
+DEFINE FIELD IF NOT EXISTS content_chars ON TABLE message TYPE int;
+DEFINE FIELD IF NOT EXISTS response_wait_ms ON TABLE message TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS response_status ON TABLE message TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS response_completed_at ON TABLE message TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS response_turn_id ON TABLE message TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS created_by_run ON TABLE chunk TYPE option<record<migration_meta>>;
+DEFINE FIELD IF NOT EXISTS content_chars ON TABLE chunk TYPE int;
+DEFINE FIELD IF NOT EXISTS created_by_run ON TABLE search_document TYPE option<record<migration_meta>>;
+DEFINE INDEX IF NOT EXISTS search_document_dialogue_revision ON TABLE search_document FIELDS dialogue_revision;
+
+-- Append-only per-run classification ledger. Reconciliation and host
+-- attribution read only this table: retrying a later run can never overwrite
+-- the historical category/assignment of an earlier run.
+DEFINE TABLE IF NOT EXISTS migration_row_commit SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS migration ON TABLE migration_row_commit TYPE record<migration_meta>;
+DEFINE FIELD IF NOT EXISTS legacy_table ON TABLE migration_row_commit TYPE string;
+DEFINE FIELD IF NOT EXISTS legacy_id ON TABLE migration_row_commit TYPE string;
+DEFINE FIELD IF NOT EXISTS category ON TABLE migration_row_commit TYPE string
+  ASSERT $value IN ["matched", "inserted", "quarantined"];
+-- Quarantine rows point at migration_quarantine, successful rows at canonical
+-- records. Keeping target mandatory makes every classification auditable.
+DEFINE FIELD IF NOT EXISTS target ON TABLE migration_row_commit TYPE record;
+DEFINE FIELD IF NOT EXISTS host_mapping_id ON TABLE migration_row_commit TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS host_assignment_json ON TABLE migration_row_commit TYPE option<string>;
+-- Exact before/after values for pointer/presence changes are captured by the
+-- same transaction that mutates them. They are audit/recovery evidence only.
+DEFINE FIELD IF NOT EXISTS previous_state ON TABLE migration_row_commit TYPE option<object> FLEXIBLE;
+DEFINE FIELD IF NOT EXISTS written_state ON TABLE migration_row_commit TYPE option<object> FLEXIBLE;
+DEFINE FIELD IF NOT EXISTS committed_at ON TABLE migration_row_commit TYPE datetime;
+DEFINE INDEX IF NOT EXISTS migration_row_commit_run_row ON TABLE migration_row_commit
+  FIELDS migration, legacy_table, legacy_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS migration_row_commit_run_category ON TABLE migration_row_commit
+  FIELDS migration, legacy_table, category;
+
+-- Одна запись на quarantined legacy row в конкретном migration run.
+-- Детерминированный record id задаёт importer; повтор внутри одного run
+-- обновляет диагностику, но не создаёт дубль.
+DEFINE TABLE IF NOT EXISTS migration_quarantine SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS migration ON TABLE migration_quarantine TYPE record<migration_meta>;
+DEFINE FIELD IF NOT EXISTS legacy_table ON TABLE migration_quarantine TYPE string;
+DEFINE FIELD IF NOT EXISTS legacy_id ON TABLE migration_quarantine TYPE string;
+DEFINE FIELD IF NOT EXISTS raw_payload ON TABLE migration_quarantine TYPE object FLEXIBLE;
+DEFINE FIELD IF NOT EXISTS reason ON TABLE migration_quarantine TYPE string;
+-- Parser identity обязательна даже для ошибок до harness parser: importer
+-- использует явный legacy-migration-adapter@1.
+DEFINE FIELD IF NOT EXISTS parser_name ON TABLE migration_quarantine TYPE string;
+DEFINE FIELD IF NOT EXISTS parser_version ON TABLE migration_quarantine TYPE string;
+DEFINE FIELD IF NOT EXISTS retryable ON TABLE migration_quarantine TYPE bool;
+DEFINE FIELD IF NOT EXISTS attempts ON TABLE migration_quarantine TYPE int;
+-- lineage_key стабилен между migration run; previous_attempt связывает
+-- исторические попытки, не удаляя audit trail после успешного retry.
+DEFINE FIELD IF NOT EXISTS lineage_key ON TABLE migration_quarantine TYPE string;
+DEFINE FIELD IF NOT EXISTS previous_attempt ON TABLE migration_quarantine TYPE option<record<migration_quarantine>>;
+DEFINE FIELD IF NOT EXISTS first_failed_at ON TABLE migration_quarantine TYPE datetime;
+DEFINE FIELD IF NOT EXISTS last_failed_at ON TABLE migration_quarantine TYPE datetime;
+DEFINE FIELD IF NOT EXISTS resolved_at ON TABLE migration_quarantine TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS resolution ON TABLE migration_quarantine TYPE option<string>;
+DEFINE INDEX IF NOT EXISTS migration_quarantine_run_row ON TABLE migration_quarantine
+  FIELDS migration, legacy_table, legacy_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS migration_quarantine_lineage ON TABLE migration_quarantine
+  FIELDS lineage_key, last_failed_at;
+
+-- Approval/lifecycle evidence для Stage 10. Строковые JSON assignments
+-- канонизированы и их SHA хранится отдельно: это делает audit artifact
+-- переносимым между версиями SurrealDB без FLEXIBLE array semantics.
+DEFINE FIELD IF NOT EXISTS approval_artifact_sha256 ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS approval_file_sha256 ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS approval_attestation_sha256 ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS approval_key_fingerprint ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS host_mapping_artifact_sha256 ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS host_mapping_assignments_json ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS backup_artifact_path ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS backup_artifact_sha256 ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS backup_manifest_path ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS backup_manifest_sha256 ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS raw_manifest_sha256 ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS restore_artifact_path ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS restore_artifact_sha256 ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS restore_namespace ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS report_path ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS report_sha256 ON TABLE migration_meta TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS report_size_bytes ON TABLE migration_meta TYPE option<int>;
+
+-- Restore namespace — UUID-scoped attempt id, поэтому его повторное
+-- использование означает replay старого safety evidence.
+DEFINE INDEX IF NOT EXISTS migration_restore_namespace_unique ON TABLE migration_meta
+  FIELDS restore_namespace UNIQUE;

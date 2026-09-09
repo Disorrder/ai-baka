@@ -89,7 +89,7 @@ async function writeLogicalArtifact(directory: string): Promise<string> {
   await writeFile(manifestPath, `${JSON.stringify({
     createdAt: "2026-07-26T00:00:00.000Z",
     surrealdbVersion: "3.2.3",
-    schemaVersion: 5,
+    schemaVersion: 1,
     bakaCommit: "test",
     namespace: "source_must_not_be_queried",
     database: "archive",

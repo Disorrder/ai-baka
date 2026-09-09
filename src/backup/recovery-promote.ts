@@ -65,7 +65,7 @@ export interface RecoveryPromotionReport {
   exportSha256: string;
   manifestSha256: string;
   rawManifestSha256: string;
-  schemaVersion: 5;
+  schemaVersion: 1;
   stoppedContainerId: string;
   productionStarted: false;
   databaseOpened: false;
@@ -210,7 +210,7 @@ function validateRecoverySuccessReport(
   freshDbIdentity: RecoveryDirectoryIdentity;
 } {
   if (
-    report.formatVersion !== 1 || report.ok !== true || report.schemaVersion !== 5 ||
+    report.formatVersion !== 1 || report.ok !== true || report.schemaVersion !== 1 ||
     report.sourceMode !== "current-internal" || report.dbRoot !== paths.freshDbRoot ||
     report.corruptDbRoot !== paths.currentDbRoot || report.reportPath !== reportPath ||
     report.stoppedCorruptContainerId !== containerId ||
@@ -261,7 +261,7 @@ function validateRecoverySuccessReport(
   const verification = requiredObject(report.stagedVerification, "staged verification");
   const recordCounts = requiredObject(verification.recordCounts, "record counts");
   if (
-    verification.ok !== true || verification.schemaVersion !== 5 ||
+    verification.ok !== true || verification.schemaVersion !== 1 ||
     verification.rawManifestSha256 !== report.rawManifestSha256 ||
     Object.keys(recordCounts).length < 1 ||
     Object.values(recordCounts).some((count) =>
@@ -604,7 +604,7 @@ export async function runRecoveryPromotion(
         exportSha256: reportEvidence.exportSha256,
         manifestSha256: reportEvidence.manifestSha256,
         rawManifestSha256: reportEvidence.rawManifestSha256,
-        schemaVersion: 5,
+        schemaVersion: 1,
         stoppedContainerId: containerId,
         productionStarted: false,
         databaseOpened: false,

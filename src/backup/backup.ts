@@ -46,8 +46,8 @@ import {
   writePrivateFileAtomicNoClobber,
 } from "./safety.ts";
 
-/** Таблицы схемы 0001–0004. */
-const SCHEMA_4_CORE_TABLES = [
+/** Все core-таблицы начальной схемы; динамические search_embedding_* добавляются из БД. */
+export const CORE_TABLES = [
   "archive_meta",
   "host",
   "os_account",
@@ -73,22 +73,16 @@ const SCHEMA_4_CORE_TABLES = [
   "legacy_identity_map",
   "migration_meta",
   "schema_migration",
-] as const;
-
-/** Новые durable-таблицы, введённые схемой 0005. */
-export const SCHEMA_5_CORE_TABLES = [
   "migration_row_commit",
   "migration_quarantine",
 ] as const;
 
-/** Все core-таблицы текущей схемы; динамические search_embedding_* добавляются из БД. */
-export const CORE_TABLES = [...SCHEMA_4_CORE_TABLES, ...SCHEMA_5_CORE_TABLES] as const;
 
-export type SupportedBackupSchemaVersion = 4 | 5 | 6 | 7 | 8 | 9;
+export type SupportedBackupSchemaVersion = 1;
 export function isSupportedBackupSchemaVersion(
   schemaVersion: number,
 ): schemaVersion is SupportedBackupSchemaVersion {
-  return Number.isSafeInteger(schemaVersion) && schemaVersion >= 4 && schemaVersion <= 9;
+  return schemaVersion === 1;
 }
 
 
@@ -98,9 +92,8 @@ export function isSupportedBackupSchemaVersion(
  * could publish a manifest that silently omits durable data.
  */
 export function coreTablesForSchemaVersion(schemaVersion: number): readonly string[] {
-  if (schemaVersion === 4) return SCHEMA_4_CORE_TABLES;
   if (isSupportedBackupSchemaVersion(schemaVersion)) return CORE_TABLES;
-  throw new Error(`backup: неподдерживаемая версия схемы ${schemaVersion}; ожидается 4–9`);
+  throw new Error(`backup: неподдерживаемая версия схемы ${schemaVersion}; ожидается 1`);
 }
 
 export interface BackupManifest {

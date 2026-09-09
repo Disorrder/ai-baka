@@ -982,7 +982,7 @@ async function migrationFixture(options: {
   await writeFile(manifestPath, `${JSON.stringify({
     createdAt: backupCreatedAt,
     surrealdbVersion: "surrealdb-3.2.3",
-    schemaVersion: 5,
+    schemaVersion: 1,
     bakaCommit: "test",
     namespace: "baka",
     database: "archive",
@@ -1017,7 +1017,7 @@ async function migrationFixture(options: {
     manifestFile: path.basename(manifestPath),
     manifestSha256: manifest.sha256,
     rawManifestSha256: "b".repeat(64),
-    schemaVersion: 5,
+    schemaVersion: 1,
     searchDocuments: 0,
     chunks: 0,
     checks: expectedSuccessfulRestoreCheckNames(0, 0).map((name) => ({
@@ -1071,7 +1071,7 @@ async function migrationFixture(options: {
       sha256Fingerprint: keyFingerprint,
     },
     safetyContext: {
-      schemaVersion: 5,
+      schemaVersion: 1,
       sourceNamespace: "baka",
       sourceDatabase: "archive",
       restoreNamespace,
@@ -1368,7 +1368,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
       recoverSnapshot: async (input) => fixtureRecoveredDialogue(input.threadExternalId),
       monotonicNow: () => clockReads++ === 0
@@ -1404,7 +1404,7 @@ describe("Stage 10 migration runner", () => {
     const report = await runLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: new MemoryBackend(),
       recoverSnapshot: async (input) => fixtureRecoveredDialogue(input.threadExternalId),
       monotonicNow: () => clockReads++ === 0 ? 0 : 1_000,
@@ -1437,7 +1437,7 @@ describe("Stage 10 migration runner", () => {
     const first = await runLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
       recoverSnapshot: recover,
       reportPath,
@@ -1473,7 +1473,7 @@ describe("Stage 10 migration runner", () => {
     const second = await runLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
       recoverSnapshot: recover,
       reportPath: path.join(path.dirname(snapshot.snapshotPath), "migration-report-2.json"),
@@ -1495,7 +1495,7 @@ describe("Stage 10 migration runner", () => {
     const first = await runLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
       recoverSnapshot: async () => undefined,
     });
@@ -1511,7 +1511,7 @@ describe("Stage 10 migration runner", () => {
     const second = await retryLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
       recoverSnapshot: async (input) =>
         input.source === "payload" ? dialogue(input.threadExternalId, "recovered") : undefined,
@@ -1528,7 +1528,7 @@ describe("Stage 10 migration runner", () => {
     const report = await runLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
       recoverSnapshot: async (input) => fixtureRecoveredDialogue(input.threadExternalId),
     });
@@ -1565,7 +1565,7 @@ describe("Stage 10 migration runner", () => {
     const report = await runLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
       recoverSnapshot: async (input) => {
         calls.push(`${input.threadExternalId}:${input.source}`);
@@ -1584,7 +1584,7 @@ describe("Stage 10 migration runner", () => {
     const report = await runLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
       recoverSnapshot: async (input) =>
         input.source === "payload" ? dialogue(input.threadExternalId, "recovered") : undefined,
@@ -1612,7 +1612,7 @@ describe("Stage 10 migration runner", () => {
       const report = await runLegacyMigration({
         ...snapshot,
         bakaCommit: "test",
-        schemaVersion: 5,
+        schemaVersion: 1,
         backend,
         recoverSnapshot: async () => undefined,
       });
@@ -1638,7 +1638,7 @@ describe("Stage 10 migration runner", () => {
     const first = await runLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
       recoverSnapshot,
     });
@@ -1653,7 +1653,7 @@ describe("Stage 10 migration runner", () => {
     const second = await retryLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
       recoverSnapshot,
     });
@@ -1669,7 +1669,7 @@ describe("Stage 10 migration runner", () => {
     const third = await retryLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
       recoverSnapshot,
     });
@@ -1704,7 +1704,7 @@ describe("Stage 10 migration runner", () => {
       ...clean,
       snapshotSha256: "0".repeat(64),
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
     })).rejects.toThrow("SHA mismatch");
     expect(backend.reports).toHaveLength(0);
@@ -1713,7 +1713,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...clean,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
     })).rejects.toThrow("content-addressed");
     expect(backend.reports).toHaveLength(0);
@@ -1738,7 +1738,7 @@ describe("Stage 10 migration runner", () => {
       ...totals,
       authorization: staleTotals,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: totalsBackend,
     })).rejects.toThrow("differs from exact signed approval file");
     expect(totalsBackend.startCalls).toBe(0);
@@ -1753,7 +1753,7 @@ describe("Stage 10 migration runner", () => {
       ...problems,
       authorization: truncated,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: problemsBackend,
     })).rejects.toThrow("differs from exact signed approval file");
     expect(problemsBackend.startCalls).toBe(0);
@@ -1764,7 +1764,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...live,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: liveBackend,
     })).rejects.toThrow("live-probe evidence stale");
     expect(liveBackend.startCalls).toBe(0);
@@ -1775,7 +1775,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...safety,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: safetyBackend,
     })).rejects.toThrow("backup export artifact hash/size mismatch");
     expect(safetyBackend.startCalls).toBe(0);
@@ -1788,7 +1788,7 @@ describe("Stage 10 migration runner", () => {
       ...noClobber,
       reportPath,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: noClobberBackend,
     })).rejects.toThrow("no-clobber");
     expect(await readFile(reportPath, "utf8")).toBe("do not overwrite\n");
@@ -1802,7 +1802,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
     })).rejects.toThrow("detached signed");
     expect(backend.startCalls).toBe(0);
@@ -1813,7 +1813,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...forged,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: forgedBackend,
     })).rejects.toThrow("not bound to exact approved evidence");
     expect(forgedBackend.startCalls).toBe(0);
@@ -1829,7 +1829,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...wrongTrust,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: wrongTrustBackend,
     })).rejects.toThrow("signer does not match trusted key fingerprint");
     expect(wrongTrustBackend.startCalls).toBe(0);
@@ -1845,7 +1845,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...forged,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: forgedBackend,
     })).rejects.toThrow("exact fields mismatch");
     expect(forgedBackend.startCalls).toBe(0);
@@ -1866,7 +1866,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...mismatched,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: mismatchedBackend,
     })).rejects.toThrow("exact authenticated backup");
     expect(mismatchedBackend.startCalls).toBe(0);
@@ -1887,7 +1887,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...incompleteCleanup,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: cleanupBackend,
     })).rejects.toThrow("cleanup is incomplete");
     expect(cleanupBackend.startCalls).toBe(0);
@@ -1901,7 +1901,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...wrongRuntime,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: runtimeBackend,
     })).rejects.toThrow("runtime binding mismatch");
     expect(runtimeBackend.startCalls).toBe(0);
@@ -1913,7 +1913,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...valid,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: validBackend,
     })).resolves.toMatchObject({ status: "completed" });
     expect(validBackend.startCalls).toBe(1);
@@ -1928,7 +1928,7 @@ describe("Stage 10 migration runner", () => {
       await expect(runLegacyMigration({
         ...forged,
         bakaCommit: "test",
-        schemaVersion: 5,
+        schemaVersion: 1,
         backend,
       })).rejects.toThrow("source namespace/database runtime binding mismatch");
       expect(backend.startCalls).toBe(0);
@@ -1942,7 +1942,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...wrongReportDatabase,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: wrongReportBackend,
     })).rejects.toThrow("runtime binding mismatch");
     expect(wrongReportBackend.startCalls).toBe(0);
@@ -1961,7 +1961,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...swappedManifest,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: swappedBackend,
     })).rejects.toThrow(/path binding|authenticated backup/);
     expect(swappedBackend.startCalls).toBe(0);
@@ -1976,7 +1976,7 @@ describe("Stage 10 migration runner", () => {
       await expect(runLegacyMigration({
         ...wrongCfg,
         bakaCommit: "test",
-        schemaVersion: 5,
+        schemaVersion: 1,
         backend,
       })).rejects.toThrow("source namespace/database runtime binding mismatch");
       expect(backend.startCalls).toBe(0);
@@ -1997,7 +1997,7 @@ describe("Stage 10 migration runner", () => {
     await expect(runLegacyMigration({
       ...snapshot,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend,
     })).rejects.toThrow("signed approval file");
     expect(backend.startCalls).toBe(0);
@@ -2010,7 +2010,7 @@ describe("Stage 10 migration runner", () => {
       ...snapshot,
       reportPath: basePath,
       bakaCommit: "test",
-      schemaVersion: 5,
+      schemaVersion: 1,
       backend: new MemoryBackend(),
       recoverSnapshot: async (input) => dialogue(input.threadExternalId, "atomic"),
     });
@@ -2037,7 +2037,7 @@ describe("Stage 10 migration runner", () => {
       const report = await runLegacyMigration({
         ...snapshot,
         bakaCommit: "test",
-        schemaVersion: 5,
+        schemaVersion: 1,
         backend,
         recoverSnapshot: async (input) => dialogue(input.threadExternalId, "must not replay broken row"),
       });
@@ -2054,7 +2054,7 @@ describe("Stage 10 migration runner", () => {
     },
   );
 
-  test("deleted guard и schema 0005 фиксируют live-risk + legacy_missing_raw NONE", async () => {
+  test("deleted guard preserves live presence and repaired raw provenance", () => {
     expect(shouldApplyLegacyDeleted(true, undefined)).toBe(true);
     expect(shouldApplyLegacyDeleted(false, "deleted_in_source")).toBe(true);
     expect(shouldApplyLegacyDeleted(false, "active")).toBe(false);
@@ -2062,17 +2062,6 @@ describe("Stage 10 migration runner", () => {
     expect(shouldAttachRepairedRaw(undefined, "raw/claude/f.jsonl")).toBe(true);
     expect(shouldAttachRepairedRaw("raw/old.jsonl", "raw/new.jsonl")).toBe(false);
     expect(shouldAttachRepairedRaw(undefined, undefined)).toBe(false);
-    const schema = await readFile(
-      path.join(import.meta.dir, "..", "schema", "0005_legacy_migration_run.surql"),
-      "utf8",
-    );
-    expect(schema).toContain("raw_archive_path ON TABLE source_revision TYPE option<string>");
-    expect(schema).toContain("DEFINE TABLE IF NOT EXISTS migration_quarantine SCHEMAFULL");
-    expect(schema).toContain("retryable ON TABLE migration_quarantine TYPE bool");
-    expect(schema).toContain("DEFINE TABLE IF NOT EXISTS migration_row_commit SCHEMAFULL");
-    expect(schema).toContain("created_by_run ON TABLE dialogue_revision");
-    expect(schema).not.toContain("last_migration ON TABLE legacy_identity_map");
-    expect(schema).toContain("migration_restore_namespace_unique");
   });
 
   test("Surreal split dialogue/mark APIs fail closed outside atomic commitDialogueRow", async () => {

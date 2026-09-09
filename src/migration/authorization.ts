@@ -793,7 +793,7 @@ export async function validateMigrationSafetyEvidence(
   const restore: PersistedRestoreTestReport = parsePersistedRestoreTestReport(restoreJson);
   const archiveRoot = path.resolve(context.archiveRoot);
   if (
-    context.schemaVersion < 5 || restore.schemaVersion !== context.schemaVersion ||
+    context.schemaVersion !== 1 || restore.schemaVersion !== context.schemaVersion ||
     restore.namespace !== context.restoreNamespace ||
     restore.namespace === context.sourceNamespace ||
     restore.database !== context.sourceDatabase ||

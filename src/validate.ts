@@ -542,8 +542,8 @@ export async function validateMigrationQuarantine(
   } = {},
 ): Promise<ValidationIssue[]> {
   const issues: ValidationIssue[] = [];
-  // До migration 0005 dedicated table не существует; старый quarantine
-  // представлен только ingest_error(stage=migration).
+  // Не запрашиваем dedicated table, если вызывающая диагностика уже
+  // обнаружила неподдерживаемую схему.
   if (options.includeDedicatedTable ?? true) {
     const lifecycle = options.lifecycle ?? await inspectMigrationQuarantineLifecycle(db, {
       ...(options.archiveRoot ? { archiveRoot: options.archiveRoot } : {}),
@@ -670,12 +670,12 @@ export async function runValidationWithDb(
   }
 
   issues.push(...(await validateEmbeddingState(db)));
-  const migrationQuarantine = schemaVersion >= 5
+  const migrationQuarantine = schemaVersion === 1
     ? await inspectMigrationQuarantineLifecycle(db, { archiveRoot: cfg.archiveRoot })
     : undefined;
   issues.push(
     ...(await validateMigrationQuarantine(db, {
-      includeDedicatedTable: schemaVersion >= 5,
+      includeDedicatedTable: schemaVersion === 1,
       archiveRoot: cfg.archiveRoot,
       ...(migrationQuarantine ? { lifecycle: migrationQuarantine } : {}),
     })),

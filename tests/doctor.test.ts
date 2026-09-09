@@ -541,7 +541,7 @@ describe("doctor safety and explicit repairs", () => {
           repairManifest: true,
           rebuildOptions: {
             host: new RecordId("host", "one"),
-            schemaVersion: 5,
+            schemaVersion: 1,
             enqueueEmbeddings: true,
           },
         },

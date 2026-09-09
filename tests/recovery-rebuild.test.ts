@@ -57,13 +57,13 @@ function manifest(): BackupManifest {
   return {
     createdAt: "2026-07-27T00:01:50.000Z",
     surrealdbVersion: "surrealdb-3.2.4",
-    schemaVersion: 5,
+    schemaVersion: 1,
     bakaCommit: "test",
     namespace: "baka",
     database: "archive",
     recordCounts: { search_document: 2, chunk: 3 },
     rawManifestSha256: "c".repeat(64),
-    exportFile: "2026-07-27T161832Z__schema-5__surreal-3.2.4.surql.zst",
+    exportFile: "2026-07-27T161832Z__schema-1__surreal-3.2.4.surql.zst",
     compression: "zstd",
     exportBytes: 123,
     exportSha256: EXPORT_SHA,
@@ -73,7 +73,7 @@ function manifest(): BackupManifest {
 function verification(): RecoveryDatabaseVerification {
   return {
     ok: true,
-    schemaVersion: 5,
+    schemaVersion: 1,
     recordCounts: manifest().recordCounts,
     rawManifestSha256: "c".repeat(64),
     rawFilesChecked: 1,
@@ -265,7 +265,7 @@ function options(exportPath: string, dbRoot: string) {
 }
 
 describe("recovery:rebuild orchestration", () => {
-  test("authenticates the exact schema-5 export and pinned manifest bytes", async () => {
+  test("authenticates the exact schema-1 export and pinned manifest bytes", async () => {
     await withTempDir(async (root) => {
       const archiveRoot = path.join(root, "archive");
       const exportPath = path.join(root, "internal-source", manifest().exportFile);
@@ -284,7 +284,7 @@ describe("recovery:rebuild orchestration", () => {
       await writeFile(manifestPath, `${JSON.stringify(exact)}\n`);
       const evidence = await authenticateRecoveryBackup(config(archiveRoot), exportPath);
       expect(evidence.exportSha256).toBe(exportHash.sha256);
-      expect(evidence.manifest.schemaVersion).toBe(5);
+      expect(evidence.manifest.schemaVersion).toBe(1);
       expect(evidence.sourceIdentity).toMatchObject({
         resolvedPath: exportPath,
         sha256: exportHash.sha256,
@@ -299,14 +299,14 @@ describe("recovery:rebuild orchestration", () => {
         surrealdbVersion: "3.2.3",
       })}\n`);
       await expect(authenticateRecoveryBackup(config(archiveRoot), exportPath))
-        .rejects.toThrow("exact authenticated schema-5");
+        .rejects.toThrow("exact authenticated schema-1");
 
       await writeFile(manifestPath, `${JSON.stringify({
         ...exact,
-        schemaVersion: 4,
+        schemaVersion: 5,
       })}\n`);
       await expect(authenticateRecoveryBackup(config(archiveRoot), exportPath))
-        .rejects.toThrow("exact authenticated schema-5");
+        .rejects.toThrow(/неподдерживаемая версия схемы/);
     });
   });
 

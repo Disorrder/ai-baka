@@ -360,7 +360,7 @@ async function verifiedBackupArtifact(
       JSON.parse(await readFile(manifestPath, "utf8")),
       manifestPath,
     );
-    if (manifest.schemaVersion >= 5 && !manifest.rawManifestSha256) return undefined;
+    if (manifest.schemaVersion === 1 && !manifest.rawManifestSha256) return undefined;
     const exportPath = await assertRegularNonSymlinkFile(
       exportPathInput,
       "status logical export",
