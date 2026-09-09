@@ -183,6 +183,9 @@ class DialogueBuilder {
 
   finish(): ParsedDialogue | undefined {
     if (!this.externalId && this.messages.length === 0) {
+      // Recognized history indexes are raw-only, not broken transcripts.
+      if (this.eventCounts.history_entry && Object.keys(this.eventCounts).length === 1 &&
+          !this.diagnostics.some((diagnostic) => diagnostic.severity === "error")) return undefined;
       this.diagnostics.push({
         code: "empty_snapshot",
         message: `${this.path}: no sessionId and no messages`,

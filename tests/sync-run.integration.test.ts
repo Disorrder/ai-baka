@@ -636,6 +636,33 @@ describe("structured sync (integration)", () => {
     } finally { await env.cleanup(); }
   });
 
+  testDb("recognized Claude history is archived once, while corrupt records remain errors", async () => {
+    const env = await makeSyncEnv();
+    try {
+      const file = path.join(env.srcRoot, "history.jsonl");
+      const history = JSON.stringify({ display: "Synthetic prompt", timestamp: 1783400001000 }) + "\n";
+      await writeFile(file, history);
+      env.cfg.sourceOverrides["claude-code"] = [file];
+      let snapshots = 0;
+      const options = { ...syncOptions(env), harness: "claude-code" as const,
+        snapshotSource: async (...args: Parameters<typeof snapshotSource>) => {
+          snapshots += 1;
+          return snapshotSource(...args);
+        } };
+      const first = await runSync(env.cfg, options);
+      expect(first.status).toBe("completed");
+      expect(first.counters.revisionsCreated).toBe(1);
+      expect(first.counters.dialoguesWritten).toBe(0);
+      expect((await runSync(env.cfg, options)).status).toBe("completed");
+      expect(snapshots).toBe(1);
+      await writeFile(file, `${history}{`);
+      const malformed = await runSync(env.cfg, options);
+      expect(malformed.status).toBe("completed_with_errors");
+      expect(malformed.counters.ingestErrors).toBeGreaterThan(0);
+      expect(snapshots).toBe(2);
+    } finally { await env.cleanup(); }
+  });
+
   testDb("last_successful_revision очищается при parse_error re-parse + validate (§23.3)", async () => {
     const env = await makeSyncEnv();
     try {
