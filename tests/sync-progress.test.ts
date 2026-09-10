@@ -34,3 +34,25 @@ test("repeated parser warnings stay on one live line and produce one private-saf
   expect(output).not.toContain("private-error-payload");
   expect(output).not.toContain("late-error");
 });
+
+test("shared non-TTY progress throttles batches while retaining stage changes and completion", async () => {
+  const child = Bun.spawn([process.execPath, "-e", `
+    import { createProgressLogger } from ${JSON.stringify(new URL("../src/cli-progress.ts", import.meta.url).href)};
+    let now = 10000;
+    Date.now = () => now;
+    const log = createProgressLogger("sqlite_export_progress");
+    for (let completed = 0; completed <= 5353; completed++) {
+      log({stage:1,detail:"manifest",completed});
+    }
+    now += 5000;
+    log({stage:1,detail:"manifest",completed:5353});
+    log({stage:2,detail:"export",completed:0,total:5353});
+    for (let completed = 1; completed <= 5353; completed++) {
+      log({stage:2,detail:"export",completed,total:5353});
+    }
+  `], {stdout:"pipe",stderr:"pipe"});
+  const text = await new Response(child.stderr).text();
+  expect(await child.exited).toBe(0);
+  expect(text).not.toContain("\x1b");
+  expect(text.trim().split("\n").map(line=>JSON.parse(line).completed)).toEqual([0,5353,0,5353]);
+});

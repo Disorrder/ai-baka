@@ -11,6 +11,7 @@
     "archive:init": "bun run src/cli.ts archive:init",
     "discover": "bun run src/cli.ts discover",
     "sync": "bun run src/cli.ts sync",
+    "export:sqlite": "bun run src/cli.ts export:sqlite",
     "status": "bun run src/cli.ts status",
     "validate": "bun run src/cli.ts validate",
     "db:preflight": "bun run src/cli.ts db preflight",
@@ -23,6 +24,7 @@
     "db:restore:test": "bun run src/cli.ts restore:test",
     "raw:verify": "bun run src/cli.ts raw:verify",
     "disk:eject": "bun run src/cli.ts disk eject",
+    "report:model-efficiency": "bun run scripts/model-efficiency-report.ts",
     "test": "bun test --timeout 30000",
     "typecheck": "tsc --noEmit"
   },

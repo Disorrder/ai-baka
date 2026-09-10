@@ -39,6 +39,18 @@ SQLite остаётся read-only; автоматического удалени
   `chunk_content` FULLTEXT; legacy forensic flags fail closed без DB scan;
 - embeddings перестраиваются без изменения архива.
 
+## Аналитический SQLite-экспорт
+
+`src/sqlite-export/` фиксирует manifest ready-ревизий и читает canonical-корпус
+одним native HTTP export без изменения источника и дополнительных DB indexes.
+OS FIFO ограничивает поток; encrypted temporary spool группирует выбранные
+records по ревизиям. Конфигурация/presets, классификация и writer разделены;
+существующие extractors вызываются по turn, без копирования search segments.
+Инструкции и review — отдельные слои; whitelist применяется до записи открытого
+payload в итоговый SQLite.
+Это не новый основной storage и не raw backup. Контракт, согласованность,
+ограничения и проверки — в [sqlite-export.md](sqlite-export.md).
+
 ## Итоговая формула
 
 ```text

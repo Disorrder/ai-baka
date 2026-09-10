@@ -27,6 +27,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   streamHttpGetToExclusiveFile,
+  streamHttpPostResponse,
 } from "../src/backup/http-stream.ts";
 import {
   DEFAULT_IDLE_TIMEOUT_MS,
@@ -699,4 +700,43 @@ describe("network-streamed restore HTTP transport", () => {
       }
     });
   }, 10_000);
+});
+
+test("POST download applies real backpressure while its consumer is paused", async () => {
+  const total=64*1024*1024,block=Buffer.alloc(64*1024,97);
+  let sent=0,finished=false;
+  const {server,sockets,baseUrl}=await listenRaw(async (_request,socket)=>{
+    socket.write(`HTTP/1.1 200 OK\r\nContent-Length: ${total}\r\nConnection: close\r\n\r\n`);
+    while(sent<total){if(!socket.write(block))await once(socket,"drain");sent+=block.length;}
+    finished=true;socket.end();
+  });
+  const stream=streamHttpPostResponse({url:baseUrl,headers:{"Content-Type":"application/json"},body:"{}"});
+  try {
+    const first=await stream.next();expect(first.done).toBe(false);
+    // curl and kernel socket buffers run on real time, outside Bun's fake clock.
+    await Bun.sleep(200);
+    expect(finished).toBe(false);
+    expect(sent).toBeLessThan(total);
+    let received=first.value!.byteLength,maximumChunk=received;
+    for await(const chunk of stream){maximumChunk=Math.max(maximumChunk,chunk.byteLength);received+=chunk.byteLength;}
+    expect(maximumChunk).toBeLessThanOrEqual(64*1024);
+    expect(received).toBe(total);
+  } finally {await stream.return(undefined);await closeRawServer(server,sockets);}
+});
+
+test("POST stream cancellation closes the source connection", async () => {
+  let closed!:()=>void;
+  const sourceClosed=new Promise<void>(resolve=>{closed=resolve;});
+  const {server,sockets,baseUrl}=await listenRaw((_request,socket)=>{
+    socket.once("close",closed);
+    socket.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4000\r\n"+"x".repeat(16384)+"\r\n");
+  });
+  const abort=new AbortController();
+  const stream=streamHttpPostResponse({url:baseUrl,headers:{},body:"{}",signal:abort.signal});
+  try {
+    expect((await stream.next()).done).toBe(false);
+    abort.abort();
+    await expect(stream.next()).rejects.toThrow();
+    await sourceClosed;
+  } finally {await stream.return(undefined);await closeRawServer(server,sockets);}
 });

@@ -11,8 +11,8 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { lstat, open, type FileHandle } from "node:fs/promises";
+import { CURL_EXECUTABLE, curlConfigQuote, curlChildEnvironment } from "./http-curl.ts";
 
-const CURL_EXECUTABLE = "/usr/bin/curl";
 const DEFAULT_MAX_ERROR_BODY_BYTES = 64 * 1024;
 // SurrealDB can remain silent while it applies the tail of a multi-gigabyte
 // import. Keep production tolerance deliberately long; deterministic tests
@@ -119,12 +119,6 @@ function validateIdleTimeout(value: number | undefined): number {
   return timeout;
 }
 
-function configQuote(value: string): string {
-  if (/[\u0000-\u001f\u007f]/u.test(value)) {
-    throw new Error("HTTP upload: control characters are forbidden in curl config values");
-  }
-  return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
-}
 
 function curlConfig(input: {
   url: URL;
@@ -140,16 +134,16 @@ function curlConfig(input: {
     if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u.test(name) || forbidden.has(name.toLowerCase())) {
       throw new Error(`HTTP upload: forbidden or invalid caller header ${name}`);
     }
-    headerLines.push(`header = ${configQuote(`${name}: ${value}`)}`);
+    headerLines.push(`header = ${curlConfigQuote(`${name}: ${value}`)}`);
   }
   const timeoutSeconds = Math.max(1, Math.ceil(input.idleTimeoutMs / 1000));
   return [
     "silent",
     "http1.1",
-    `url = ${configQuote(input.url.toString())}`,
+    `url = ${curlConfigQuote(input.url.toString())}`,
     'request = "POST"',
-    `upload-file = ${configQuote(input.sourcePath)}`,
-    `header = ${configQuote(`Content-Length: ${input.contentLength}`)}`,
+    `upload-file = ${curlConfigQuote(input.sourcePath)}`,
+    `header = ${curlConfigQuote(`Content-Length: ${input.contentLength}`)}`,
     'header = "Expect:"',
     'header = "Connection: close"',
     ...headerLines,
@@ -252,13 +246,6 @@ async function readBoundedDiagnostic(stream: ReadableStream<Uint8Array>): Promis
   return new TextDecoder().decode(joined);
 }
 
-function safeChildEnvironment(): Record<string, string> {
-  return Object.fromEntries(
-    ["PATH", "LANG", "LC_ALL", "TMPDIR"]
-      .map((name) => [name, process.env[name]])
-      .filter((entry): entry is [string, string] => entry[1] !== undefined),
-  );
-}
 
 /**
  * Streams one regular file into HTTP(S) POST through native curl/libcurl.
@@ -307,7 +294,7 @@ export async function streamHttpPostFile(
         stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",
-        env: safeChildEnvironment(),
+        env: curlChildEnvironment(),
       });
     } catch {
       throw safeError("socket_error", 0, operation);
