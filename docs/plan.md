@@ -2650,6 +2650,13 @@ baka search <query> [--mode <text|vector|hybrid>] [--harness <slug>]
 baka export-thread <dialogue-id> [-o|--output <path>]
   [--include-relative-source-paths] [--force] [--json]
 
+baka export:sqlite [--preset <qa-analysis|conversation|tools|instructions|full-canonical>]
+  [--config <json>] [--out <sqlite>] [--dry-run] [--force] [--discover]
+  [--instructions <exclude|separate>] [--unknown-policy <metadata|separate|include>]
+  [--match-scope <turn|dialogue|message>] [--revisions <current|all>]
+  [--harness <slug>] [--host <record-id>] [--vendor <slug>] [--model <name>]
+  [--after <UTC>] [--before <UTC>] [--fields <list>] [--exclude-fields <list>]
+
 baka reparse
   (--source-revision <id>|--source-location <id>|--harness <slug>|--all)
   [--parser-version <latest|n>] [--only-outdated] [--dry-run]
@@ -2662,6 +2669,14 @@ Vector/hybrid используют privacy-safe query embedding и hybrid явн
 деградирует в text при недоступном provider. `export-thread` исключает paths
 по умолчанию, абсолютные paths — всегда; overwrite требует `--force`.
 `reparse` принимает ровно один selector, а `--dry-run` ничего не пишет.
+
+`export:sqlite` — отдельный аналитический формат, не raw backup и не замена
+SurrealDB. Полные фильтры, классификация, обязательные поля, пять профилей,
+read-only manifest-последовательность и критерии приёмки описаны в
+[sqlite-export.md](sqlite-export.md). Приёмка включает физическое отсутствие
+исключённого текста, неоднозначности legacy flags, все turn'ы, scoped tool связи,
+переносимость Python SQLite, отмену/no-clobber и неизменность источника.
+Реальный production export требует отдельного выбора среза и destination.
 
 ## 17.6. Paid и destructive operator workflows
 
