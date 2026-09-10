@@ -8,10 +8,13 @@
  */
 
 import { constants as fsConstants } from "node:fs";
-import { lstat, open, unlink, type FileHandle } from "node:fs/promises";
+import { lstat, mkdtemp, open, rm, unlink, type FileHandle } from "node:fs/promises";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { pipeline } from "node:stream/promises";
+import { CURL_EXECUTABLE, curlConfigQuote, curlChildEnvironment } from "./http-curl.ts";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 const DEFAULT_MAX_ERROR_BODY_BYTES = 8 * 1024;
 const SENSITIVE_REQUEST_HEADERS = new Set([
@@ -124,6 +127,74 @@ function responseFromHeaders(
     signal?.addEventListener("abort", onAbort, { once: true });
     request.end();
   });
+}
+
+/**
+ * Bounded POST download through an OS pipe. Bun 1.3's fetch and IncomingMessage
+ * can accumulate native response buffers behind a slow JavaScript consumer.
+ * curl blocks on its stdout pipe instead; credentials/config travel only on stdin.
+ */
+export async function* streamHttpPostResponse(options: {
+  url: string | URL;
+  headers: Readonly<Record<string,string>>;
+  body: string;
+  signal?: AbortSignal;
+}): AsyncGenerator<Uint8Array> {
+  const url=validateUrl(options.url);
+  if(!Bun.which(CURL_EXECUTABLE))throw Object.assign(new Error("HTTP stream: curl is required"),{code:"CURL_NOT_FOUND"});
+  const mkfifo=Bun.which("mkfifo");
+  if(!mkfifo)throw Object.assign(new Error("HTTP stream: mkfifo is required"),{code:"MKFIFO_NOT_FOUND"});
+  options.signal?.throwIfAborted();
+  const lines=[
+    `url = ${curlConfigQuote(url.href)}`, 'request = "POST"', `data-raw = ${curlConfigQuote(options.body)}`,
+    "http1.1", "connect-timeout = 30", "speed-limit = 1", "speed-time = 3600",
+    `header = "Content-Length: ${Buffer.byteLength(options.body)}"`, 'header = "Expect:"', 'header = "Connection: close"',
+  ];
+  for(const [name,value] of Object.entries(options.headers)) {
+    if(!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u.test(name)||["content-length","transfer-encoding","expect","connection"].includes(name.toLowerCase()))throw new Error("HTTP stream: invalid header");
+    lines.push(`header = ${curlConfigQuote(`${name}: ${value}`)}`);
+  }
+  const directory=await mkdtemp(path.join(tmpdir(),"baka-http-pipe-"));
+  const fifo=path.join(directory,"body");
+  let bootstrap:FileHandle|undefined,reader:FileHandle|undefined,writer:FileHandle|undefined;
+  let child:Bun.Subprocess<"pipe",number,"pipe">|undefined,statusTask:Promise<number>|undefined;
+  const onAbort=()=>{try{child?.kill("SIGTERM");}catch{}};
+  try {
+    const made=Bun.spawn([mkfifo,"-m","600",fifo],{stdout:"ignore",stderr:"ignore",env:curlChildEnvironment()});
+    if(await made.exited!==0||!(await lstat(fifo)).isFIFO())throw new Error("HTTP stream: cannot create private FIFO");
+    // Bootstrap avoids blocking either open; only the child retains a writer afterward.
+    bootstrap=await open(fifo,fsConstants.O_RDWR|fsConstants.O_NOFOLLOW);
+    reader=await open(fifo,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW);
+    writer=await open(fifo,fsConstants.O_WRONLY|fsConstants.O_NOFOLLOW);
+    options.signal?.throwIfAborted();
+    child=Bun.spawn([CURL_EXECUTABLE,"--disable","--silent","--show-error","--fail","--no-buffer","--config","-","--write-out","%{stderr}\\nBAKA_HTTP_STATUS:%{http_code}\\n"],{stdin:"pipe",stdout:writer.fd,stderr:"pipe",env:curlChildEnvironment()});
+    await writer.close();writer=undefined;await bootstrap.close();bootstrap=undefined;
+    options.signal?.addEventListener("abort",onAbort,{once:true});
+    const process=child;
+    statusTask=(async()=>{
+      let suffix="";
+      for await(const chunk of process.stderr)suffix=(suffix+Buffer.from(chunk).toString("utf8")).slice(-8192);
+      return Number(/BAKA_HTTP_STATUS:(\d{3})/.exec(suffix)?.[1]??0);
+    })();
+    child.stdin.write(`${lines.join("\n")}\n`);await child.stdin.end();
+    while(true) {
+      options.signal?.throwIfAborted();
+      const buffer=Buffer.allocUnsafe(64*1024);
+      const {bytesRead}=await reader.read(buffer,0,buffer.byteLength,null);
+      if(!bytesRead)break;
+      yield buffer.subarray(0,bytesRead);
+    }
+    const exitCode=await child.exited,status=await statusTask;
+    options.signal?.throwIfAborted();
+    if(exitCode!==0||status!==200)throw Object.assign(new Error("HTTP stream: source request failed"),{code:exitCode===28?"ETIMEDOUT":status?"HTTP_STATUS_ERROR":"HTTP_TRANSPORT_ERROR",status,exitCode});
+  } finally {
+    options.signal?.removeEventListener("abort",onAbort);
+    if(child?.exitCode===null)onAbort();
+    await writer?.close();await bootstrap?.close();
+    if(child)await child.exited;
+    await statusTask;await reader?.close();
+    await rm(directory,{recursive:true,force:true});
+  }
 }
 
 async function boundedErrorBody(

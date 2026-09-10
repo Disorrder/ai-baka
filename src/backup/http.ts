@@ -50,7 +50,7 @@ export interface SqlRootOptions {
 }
 
 /** Базовый HTTP URL сервера (ws://…/rpc → http://…). */
-export function httpBaseUrl(cfg: AppConfig): string {
+export function httpBaseUrl(cfg: Pick<AppConfig, "surrealUrl">): string {
   return cfg.surrealUrl
     .replace(/^ws:\/\//, "http://")
     .replace(/^wss:\/\//, "https://")
