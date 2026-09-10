@@ -1439,7 +1439,7 @@ const program = new Command();
 program
   .name("baka")
   .description("Локальный архив AI-диалогов: SurrealDB + immutable raw")
-  .version("0.1.0");
+  .version("0.1.1");
 
 function handle<A extends unknown[]>(
   action: (...args: A) => Promise<void>,
