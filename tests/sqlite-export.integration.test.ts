@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { Surreal } from "surrealdb";
 import type { BoundQuery } from "surrealdb";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { ensureHost, ensureHarness, ensureHarnessInstallation, ensureModel, ensureVendor } from "../src/db/repositories/identity.ts";
@@ -75,6 +75,59 @@ liveTest("real schema, paginated SELECTs, fixed current revision and zero source
     expect(await cli.exited).toBe(0);
     expect(JSON.parse(cliStdout).counts.written_analysis_items).toBe(5);
     expect(cliStderr).not.toContain("DENIED_");
+    // Run the exact package script in a disposable cwd, not the user's reports/.
+    const packageJson=await readFile(new URL("../package.json",import.meta.url));
+    const sourceDirectory=path.resolve(import.meta.dir,"../src");
+    await writeFile(path.join(dir,"package.json"),packageJson);
+    await symlink(sourceDirectory,path.join(dir,"src"),"dir");
+    const runCli=async(args:string[],cwd=dir,archiveRoot=path.join(dir,"archive"))=>{
+      const child=Bun.spawn(["bun","export:sqlite","--batch-size","2",...args],{
+        cwd,
+        env:{...process.env,SURREAL_URL:url,SURREAL_NAMESPACE:ns,SURREAL_DATABASE:"test",SURREAL_USER:"root",SURREAL_PASS:"root",BAKA_ARCHIVE_ROOT:archiveRoot,BAKA_DB_ROOT:path.join(dir,"storage")},
+        stdout:"pipe",stderr:"pipe",
+      });
+      const stdout=await new Response(child.stdout).text();
+      const stderr=await new Response(child.stderr).text();
+      return {code:await child.exited,stdout,stderr};
+    };
+    const defaultOutput=path.join(dir,"reports","ai-conversations.sqlite");
+    const preview=await runCli(["--dry-run"]);
+    expect(preview.code).toBe(0);
+    expect(JSON.parse(preview.stdout).status).toBe("dry_run");
+    expect(await Bun.file(defaultOutput).exists()).toBe(false);
+    await expect(lstat(path.join(dir,"reports"))).rejects.toMatchObject({code:"ENOENT"});
+    const created=await runCli([]);
+    expect(created.code).toBe(0);
+    expect(JSON.parse(created.stdout).outputPath).toBe(defaultOutput);
+    const replaced=await runCli([]);
+    expect(replaced.code).toBe(0);
+    expect(JSON.parse(replaced.stdout).counts.written_analysis_items).toBe(5);
+    const previous=await readFile(defaultOutput);
+    const explicitExisting=await runCli(["--out","reports/ai-conversations.sqlite"]);
+    expect(explicitExisting.code).toBe(1);
+    expect(await readFile(defaultOutput)).toEqual(previous);
+    const failed=await runCli(["--max-revision-bytes","1"]);
+    expect(failed.code).toBe(1);
+    expect(await readFile(defaultOutput)).toEqual(previous);
+    const custom=await runCli(["--out","custom.sqlite"]);
+    expect(custom.code).toBe(0);
+    expect(JSON.parse(custom.stdout).outputPath).toBe(path.join(dir,"custom.sqlite"));
+    expect(await readFile(defaultOutput)).toEqual(previous);
+    const forced=await runCli(["--out","custom.sqlite","--force"]);
+    expect(forced.code).toBe(0);
+    await rename(path.join(dir,"reports"),path.join(dir,"reports-real"));
+    await symlink(path.join(dir,"reports-real"),path.join(dir,"reports"),"dir");
+    const linked=await runCli([]);
+    expect(linked.code).toBe(1);
+    expect(await readFile(path.join(dir,"reports-real","ai-conversations.sqlite"))).toEqual(previous);
+    const protectedCwd=path.join(dir,"protected");
+    await mkdir(protectedCwd);
+    await writeFile(path.join(protectedCwd,"package.json"),packageJson);
+    await symlink(sourceDirectory,path.join(protectedCwd,"src"),"dir");
+    const protectedResult=await runCli([],protectedCwd,protectedCwd);
+    expect(protectedResult.code).toBe(1);
+    expect(await Bun.file(path.join(protectedCwd,"reports","ai-conversations.sqlite")).exists()).toBe(false);
+    await expect(lstat(path.join(protectedCwd,"reports"))).rejects.toMatchObject({code:"ENOENT"});
     expect(JSON.stringify(await db.query("SELECT * FROM dialogue; SELECT * FROM dialogue_revision; SELECT * FROM message; SELECT * FROM chunk; SELECT * FROM search_document"))).toBe(baseline);
     const malicious=await exportSqlite(createSurrealExportSource(db,url),resolveExportConfig({filters:{host:["host:x']; DELETE message; --"]}}),{dryRun:true});
     expect(malicious.counts.manifest_revisions).toBe(0);

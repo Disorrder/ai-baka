@@ -8,7 +8,7 @@ import { connectDb } from "../db/client.ts";
 import { ExportConfigError, FILTERS, exportDiscovery, resolveExportConfig } from "./config.ts";
 import { gitHead } from "../db/migrations.ts";
 import { createSurrealExportSource } from "./source.ts";
-import { exportSqlite } from "./index.ts";
+import { DEFAULT_SQLITE_EXPORT_PATH, exportSqlite } from "./index.ts";
 import { createSqliteExportProgress } from "./progress.ts";
 import type { SqliteExportProgressDisplay } from "./progress.ts";
 import { SqliteExportFailure } from "./errors.ts";
@@ -16,8 +16,8 @@ import { SqliteExportFailure } from "./errors.ts";
 export function registerSqliteExport(program: Command): void {
   const command = program.command("export:sqlite")
     .description("Readonly canonical export в переносимый аналитический SQLite; не raw backup")
-    .option("--out <path>", "новый .sqlite файл (каталог должен существовать)")
-    .option("--force", "атомарно заменить существующий regular export после проверки")
+    .option("--out <path>", "файл назначения; каталог reports для стандартного пути создаётся автоматически", DEFAULT_SQLITE_EXPORT_PATH)
+    .option("--force", "заменить явно заданный --out; без --out стандартный файл заменяется автоматически")
     .option("--dry-run", "прочитать и оценить срез без итоговой базы")
     .option("--discover", "показать допустимые поля и фильтры без подключения к БД")
     .option("--config <path>", "JSON конфигурация; явные CLI flags имеют приоритет")
@@ -63,14 +63,14 @@ export function registerSqliteExport(program: Command): void {
         overrides[configKey!] = filters;
       }
       const config = resolveExportConfig(configFile, overrides);
-      if (!options.dryRun && !options.out) throw new Error("export:sqlite требует --out или --dry-run");
       const app = loadConfig();
+      const explicitOutput = command.getOptionValueSource("out") !== "default";
       progress = createSqliteExportProgress(config, options.dryRun === true);
       process.on("SIGINT", onSignal); process.on("SIGTERM", onSignal);
       db = await connectDb(app, { failFast: true });
       const report = await exportSqlite(createSurrealExportSource(db, app.surrealUrl), config, {
-        out: typeof options.out === "string" ? options.out : undefined,
-        force: options.force === true, dryRun: options.dryRun === true, signal: abort.signal,
+        out: options.dryRun === true && !explicitOutput ? undefined : String(options.out),
+        force: !explicitOutput || options.force === true, dryRun: options.dryRun === true, signal: abort.signal,
         exporterCommit: gitHead(),
         protectedPaths: [app.dbRoot, app.archiveRoot, ...HARNESS_ORDER.flatMap(slug => app.sourceOverrides[slug] ?? HARNESSES[slug].defaultRoots({ home: os.homedir(), env: process.env }))],
         progress: progress.update,

@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { SQLQueryBindings, Statement } from "bun:sqlite";
 import { createHmac, randomBytes } from "node:crypto";
-import { link, lstat, mkdtemp, open, realpath, rename, rm, stat, unlink } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, open, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { hashFile } from "../sources/snapshot/hashing.ts";
@@ -12,6 +12,8 @@ import { DICTIONARY, EXPORT_SCHEMA, SQLITE_EXPORT_FORMAT, SQLITE_EXPORT_VERSION 
 import type { ExportConfig, ExportOptions, ExportSource, RevisionManifestEntry, SqliteExportProgress, SqliteExportReport } from "./types.ts";
 import { SqliteExportFailure } from "./errors.ts";
 import { PayloadVerifier } from "./payload-verification.ts";
+
+export const DEFAULT_SQLITE_EXPORT_PATH = "reports/ai-conversations.sqlite";
 
 const LIMITATIONS = [
   "Fixed ready-revision manifest collected over an interval; not a point-in-time database snapshot. Current pointers are not re-read for selection.",
@@ -41,9 +43,17 @@ export async function exportSqlite(source: ExportSource, input: ExportConfig, op
   // Resolve every existing ancestor before allocating files. Canonical /tmp may itself be a platform symlink.
   if (output) {
     let current = directory;
+    let createDefaultDirectory = false;
     while (true) {
-      const s = await lstat(current);
-      if (s.isSymbolicLink() || !s.isDirectory()) throw new Error("sqlite export: output ancestors must be real directories, not symlinks");
+      const s = await lstat(current).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT" && current === directory && !options.dryRun &&
+            output === path.resolve(DEFAULT_SQLITE_EXPORT_PATH)) {
+          createDefaultDirectory = true;
+          return undefined;
+        }
+        throw error;
+      });
+      if (s && (s.isSymbolicLink() || !s.isDirectory())) throw new Error("sqlite export: output ancestors must be real directories, not symlinks");
       const parent = path.dirname(current); if (parent === current) break; current = parent;
     }
     const protectedPaths = ["/Volumes/Archive/Legacy Conversations", ...(options.protectedPaths ?? [])];
@@ -55,6 +65,13 @@ export async function exportSqlite(source: ExportSource, input: ExportConfig, op
     const existing = await lstat(output).catch((e: NodeJS.ErrnoException) => { if (e.code === "ENOENT") return undefined; throw e; });
     if (existing && (!existing.isFile() || existing.isSymbolicLink() || existing.nlink > 1)) throw new Error("sqlite export: refusing non-regular, symlink or hardlinked output");
     if (existing && !options.force) throw new Error("sqlite export: output exists; use --force to replace after verification");
+    if (createDefaultDirectory) {
+      await mkdir(directory, {mode:0o700}).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "EEXIST") throw error;
+      });
+      const created = await lstat(directory);
+      if (created.isSymbolicLink() || !created.isDirectory()) throw new Error("sqlite export: unsafe default output directory");
+    }
   }
   options.signal?.throwIfAborted();
   const work = await mkdtemp(path.join(directory, ".baka-sqlite-"));
