@@ -1,3 +1,4 @@
+import { createTerminalProgress } from "../cli-progress.ts";
 import type { SyncSummary } from "./sync-run.ts";
 
 /** Human output only; machine-readable counters retain their original contract. */
@@ -107,59 +108,24 @@ export interface SyncProgress {
 /** Presentation only: percentages describe the current operation, not elapsed work. */
 export function createSyncProgress() {
   const stream = process.stderr;
-  const started = Date.now();
+  const ui = createTerminalProgress(5);
   let current: SyncProgress = { stage: 1, detail: "Подготовка" };
   let stopped = false;
-  let lastDraw = 0;
-  let frame = 0;
   let warningCount = 0;
   const warnings = new Map<string, number>();
-  const color = !process.env.NO_COLOR && process.env.TERM !== "dumb";
-  const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
   function draw() {
-    if (stopped) return;
-    lastDraw = Date.now();
-    const p = current;
-    const seconds = Math.floor((lastDraw - started) / 1000);
-    const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
-    const count = p.total === undefined
-      ? p.completed === undefined ? "" : ` · ${p.completed} ${p.unit ?? ""}`
-      : ` · ${p.completed ?? 0}/${p.total} ${p.unit ?? ""}`;
-    const ratio = p.total === undefined ? undefined : p.total === 0 ? 1
-      : Math.max(0, Math.min(1, (p.completed ?? 0) / p.total));
-    const barWidth = (stream.columns || 100) >= 120 ? 10 : 6;
-    const filled = Math.round((ratio ?? 0) * barWidth);
-    const spinner = frames[frame++ % frames.length]!;
-    const bar = ratio === undefined ? spinner
-      : `${spinner} [${"━".repeat(filled)}${"─".repeat(barWidth - filled)}]`;
-    const harness = p.root ? ` (${p.root})` : "";
-    const roots = p.rootsTotal === undefined ? ""
-      : ` · источники ${p.rootsCompleted ?? 0}/${p.rootsTotal}`;
-    // Bun measures terminal cells, not UTF-16 length; never wrap into another line.
-    const warningSummary = warningCount > 0 ? ` · замечания ${warningCount}` : "";
-    const text = ` ${elapsed} ${bar} ${p.stage}/5 · ${p.detail}${harness}${count}${warningSummary}${roots}`
-      .replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
-    const width = Math.max(1, (stream.columns || 100) - 1);
-    let clipped = "";
-    let cells = 0;
-    for (const char of text) {
-      cells += Bun.stringWidth(char);
-      if (cells > width) break;
-      clipped += char;
-    }
-    stream.write(`\r\x1b[2K${color ? "\x1b[36m" : ""}${clipped}${color ? "\x1b[0m" : ""}`);
+    const roots = current.rootsTotal === undefined ? ""
+      : ` · источники ${current.rootsCompleted ?? 0}/${current.rootsTotal}`;
+    ui.update({
+      ...current,
+      detail: `${current.detail}${current.root ? ` (${current.root})` : ""}`,
+      suffix: `${warningCount > 0 ? ` · замечания ${warningCount}` : ""}${roots}`,
+    });
   }
-
-  draw();
-  const timer = setInterval(draw, 100);
-  timer.unref();
   return {
     update(progress: SyncProgress) {
-      const changed = progress.stage !== current.stage || progress.detail !== current.detail;
       current = progress;
-      if (changed || progress.total !== undefined && progress.completed === progress.total ||
-          Date.now() - lastDraw >= 100) draw();
+      draw();
     },
     log(event: Record<string, unknown>) {
       if (stopped || event.event === "sync_finish" || event.event === "sync_timing") return;
@@ -179,32 +145,16 @@ export function createSyncProgress() {
         : "источники недоступны или обработаны не полностью";
       warnings.set(reason, (warnings.get(reason) ?? 0) + 1);
       warningCount += 1;
-      if (Date.now() - lastDraw >= 100) draw();
+      draw();
     },
     stop() {
       if (stopped) return;
       stopped = true;
-      clearInterval(timer);
-      stream.write("\r\x1b[2K");
+      ui.stop();
       if (warningCount > 0) {
         const details = [...warnings].map(([reason, count]) => `${reason}: ${count}`).join("; ");
         stream.write(`Замечания sync (${warningCount}): ${details}. Подробный журнал доступен с --json.\n`);
       }
     },
-  };
-}
-
-/** Progress JSONL is throttled independently of the existing event log. */
-export function createSyncProgressLogger() {
-  let previousStage = 0;
-  let previousDetail = "";
-  let lastWrite = 0;
-  return (progress: SyncProgress) => {
-    const now = Date.now();
-    if (progress.stage === previousStage && progress.detail === previousDetail && now - lastWrite < 5000) return;
-    previousStage = progress.stage;
-    previousDetail = progress.detail;
-    lastWrite = now;
-    console.error(JSON.stringify({ time: new Date(now).toISOString(), event: "sync_progress", ...progress }));
   };
 }

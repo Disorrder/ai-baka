@@ -27,7 +27,8 @@ import { isLocked } from "./infra/lock.ts";
 import { readSentinel } from "./infra/sentinel.ts";
 import { discoverSourceRoots } from "./sources/discovery/discovery.ts";
 import { runSync, type SyncSummary } from "./sync/sync-run.ts";
-import { createSyncProgress, createSyncProgressLogger, formatSyncSummary } from "./sync/progress.ts";
+import { createSyncProgress, formatSyncSummary } from "./sync/progress.ts";
+import { createProgressLogger } from "./cli-progress.ts";
 import { HARNESSES, type HarnessSlug } from "./sources/adapters/harnesses.ts";
 import { collectStatus, formatStatus } from "./status.ts";
 import { runValidation } from "./validate.ts";
@@ -2500,7 +2501,7 @@ program
                 : undefined,
             enqueueEmbeddings: options.enqueueEmbeddings,
             dryRun: options.dryRun,
-            onProgress: progress?.update ?? createSyncProgressLogger(),
+            onProgress: progress?.update ?? createProgressLogger("sync_progress"),
             logger: progress?.log,
           });
         } finally {
