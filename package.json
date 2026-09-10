@@ -23,6 +23,7 @@
     "db:restore:test": "bun run src/cli.ts restore:test",
     "raw:verify": "bun run src/cli.ts raw:verify",
     "disk:eject": "bun run src/cli.ts disk eject",
+    "report:model-efficiency": "bun run scripts/model-efficiency-report.ts",
     "test": "bun test --timeout 30000",
     "typecheck": "tsc --noEmit"
   },
