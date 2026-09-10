@@ -260,3 +260,41 @@ test("a late failure after write batches preserves the previous output",async()=
   expect(await readFile(out,"utf8")).toBe("previous output");
   expect(await readdir(path.dirname(out))).toEqual(["result.sqlite"]);
 });
+
+test("embedded reader queries count visible text and retain empty threads and unknowns",async()=>{
+  const revision=syntheticRevision("reader");
+  revision.messages[4]!.humanAuthored=false;
+  revision.messages.push({
+    id:"message:reader_progress",sequence:15,role:"assistant",
+    humanAuthored:false,visibleToUser:true,metadata:{phase:"commentary"},usageEvents:[],
+    chunks:[{id:"chunk:reader_progress",sequence:0,kind:"text",content:"working",metadata:{}}],
+  });
+  recount(revision);
+  const empty=syntheticRevision("empty");
+  empty.messages=empty.messages.filter(m=>m.role==="tool");recount(empty);
+  const out=await output();
+  await exportSqlite(syntheticSource([revision,empty]),resolveExportConfig({preset:"conversation"}),{out});
+  const db=new Database(out,{readonly:true});
+  try {
+    const sql=(name:string)=>{
+      const row=db.query<{description:string},[string]>("SELECT description FROM data_dictionary WHERE name=?").get(name);
+      if(!row)throw new Error(`missing reader query ${name}`);
+      return row.description;
+    };
+    expect(db.query(sql("sql_qa_counts")).all()).toEqual([
+      {category:"assistant_final",classification:"confirmed",analytic_items:2,characters:Array.from("Первый ответ — 東京Второй ответ").length},
+      {category:"human_input",classification:"confirmed",analytic_items:2,characters:Array.from("исправь функциюда").length},
+    ]);
+    expect(db.query(sql("sql_visible_counts")).all()).toContainEqual({
+      category:"assistant_other",classification:"confirmed",analytic_items:1,characters:7,
+    });
+    const catalog=db.query<{dialogue_id:string;revision_id:string;analytic_items:number;characters:number},[]>(sql("sql_thread_catalog")).all();
+    expect(catalog.map(r=>r.analytic_items)).toEqual([4,0]);
+    expect(catalog[1]!.characters).toBe(0);
+    const thread=db.query<{category:string},[string,string]>(sql("sql_dialogue")).all(catalog[0]!.dialogue_id,catalog[0]!.revision_id);
+    expect(thread.map(r=>r.category)).toEqual(["human_input","assistant_final","assistant_final","human_input"]);
+    expect(db.query(sql("sql_uncertainty_summary")).all()).toEqual([{
+      layer:"metadata",category:"human_input",reason:"legacy_ambiguous_authorship",analytic_items:1,items_with_text:0,
+    }]);
+  } finally {db.close();}
+});
