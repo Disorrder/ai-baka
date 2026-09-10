@@ -1,6 +1,6 @@
 # Аналитический экспорт в SQLite
 
-`baka export:sqlite` читает canonical-корпус SurrealDB и создаёт один переносимый
+`bun export:sqlite` читает canonical-корпус SurrealDB и создаёт один переносимый
 `.sqlite`. Это не основной storage, не legacy recovery, не raw backup и не
 исследование диалогов. Поиск и прежний `export-thread` не меняются.
 
@@ -13,7 +13,7 @@
 
 ### Маршрут чтения
 
-Откройте файл read-only, например `sqlite3 -readonly ./exports/qa.sqlite`.
+Откройте файл read-only, например `sqlite3 -readonly ./reports/ai-conversations.sqlite`.
 Краткая инструкция и SQL находятся и внутри самого файла:
 
 ```sql
@@ -160,39 +160,52 @@ ORDER BY i.layer, i.category, i.reason;
 
 Настройте обычное подключение ai-baka к **уже существующей** базе. Команда не
 запускает Docker, миграции, sync, reparse, embeddings или внешние API.
-Каталог назначения должен существовать и находиться вне архива, live DB и
-source roots. Не используйте symlink в пути назначения.
+Без `--out` результат — `reports/ai-conversations.sqlite` относительно рабочего
+каталога команды; отсутствующий `reports/` создаётся автоматически после проверок
+безопасности. Для другого явного `--out` родительский каталог должен существовать.
+Назначение должно находиться вне архива, live DB и source roots, без symlink.
 Дополнительные индексы и изменения production-схемы не нужны. Для большого
 потокового чтения используются системные `curl` и `mkfifo` (штатные на macOS;
 на Linux — curl и coreutils). Временный каталог должен вмещать зашифрованные
 выбранные данные одновременно с итоговым файлом.
 
 ```bash
-mkdir -p ./exports
-bun run baka export:sqlite --discover
-bun run baka export:sqlite --config ./examples/sqlite-export.json --dry-run
-bun run baka export:sqlite --preset qa-analysis --out ./exports/qa.sqlite
+bun export:sqlite --discover
+bun export:sqlite --config ./examples/sqlite-export.json --dry-run
+
+# Стандартный файл; при повторном запуске заменяется автоматически.
+bun export:sqlite
+
+# Явный --out: существующий файл защищён, пока не указан --force.
+mkdir -p ./reports
+bun export:sqlite --out ./reports/qa.sqlite
+bun export:sqlite --out ./reports/qa.sqlite --force
 
 # Независимые измерения: приложение и машина.
-bun run baka export:sqlite --harness codex --host 'host:HOST_ID' \
-  --out ./exports/codex-host.sqlite
+bun export:sqlite --harness codex --host 'host:HOST_ID' \
+  --out ./reports/codex-host.sqlite
 
 # Сохранить вопросы вместе с подходящим исполнением.
-bun run baka export:sqlite --vendor openai --match-scope turn \
-  --out ./exports/openai.sqlite
+bun export:sqlite --vendor openai --match-scope turn \
+  --out ./reports/openai.sqlite
 
-bun run baka export:sqlite --preset tools --harness claude-code \
-  --out ./exports/tools.sqlite
-bun run baka export:sqlite --instructions separate \
-  --out ./exports/qa-with-instructions.sqlite
-bun run baka export:sqlite --unknown-policy separate \
-  --out ./exports/qa-review.sqlite
-bun run baka export:sqlite --preset instructions \
-  --out ./exports/instructions.sqlite
+bun export:sqlite --preset tools --harness claude-code \
+  --out ./reports/tools.sqlite
+bun export:sqlite --instructions separate \
+  --out ./reports/qa-with-instructions.sqlite
+bun export:sqlite --unknown-policy separate \
+  --out ./reports/qa-review.sqlite
+bun export:sqlite --preset instructions \
+  --out ./reports/instructions.sqlite
 ```
 
-Существующий результат сохраняется; `--force` разрешает замену **только после
-проверки нового файла**. Symlink, hardlinked output и не-regular file отклоняются.
+Без `--out` стандартный файл заменяется **только после проверки новой выгрузки**;
+при ошибке старый остаётся нетронутым. С явным `--out` замена требует `--force`,
+даже если указан стандартный путь. Symlink, hardlinked output и не-regular file
+отклоняются в обоих режимах. `--dry-run` без `--out` не создаёт `reports/` и
+не трогает существующий default файл. Содержимое по умолчанию не меняется:
+это `qa-analysis`, а не полная копия всех сообщений. Полная форма
+`bun run baka export:sqlite` также поддерживается.
 Один JSON-отчёт — в stdout, progress — в stderr. В TTY используется общий с sync
 renderer: одна строка со стадией, прошедшим временем и счётчиками. Сбор manifest
 и чтение исходного потока показывают spinner без выдуманного total; обработка

@@ -2670,6 +2670,11 @@ Vector/hybrid используют privacy-safe query embedding и hybrid явн
 по умолчанию, абсолютные paths — всегда; overwrite требует `--force`.
 `reparse` принимает ровно один selector, а `--dry-run` ничего не пишет.
 
+`bun export:sqlite` запускает ту же команду. Без `--out` используется
+`reports/ai-conversations.sqlite` с созданием каталога и атомарной заменой после
+успешных проверок. Для явного `--out` overwrite требует `--force`;
+`--dry-run` без `--out` не создаёт стандартный каталог/файл. Профиль остаётся QA.
+
 `export:sqlite` — отдельный аналитический формат, не raw backup и не замена
 SurrealDB. Полные фильтры, классификация, обязательные поля, пять профилей,
 read-only manifest-последовательность и критерии приёмки описаны в
