@@ -1,0 +1,20 @@
+{
+  "preset": "qa-analysis",
+  "instructions": "exclude",
+  "unknownPolicy": "metadata",
+  "matchScope": "turn",
+  "revisions": "current",
+  "filters": {
+    "harness": ["codex"]
+  },
+  "excludeFilters": {},
+  "fields": [
+    "messages.timestamp",
+    "messages.model",
+    "messages.service_provider",
+    "messages.reasoning_effort",
+    "messages.response_status"
+  ],
+  "batchSize": 128,
+  "maxRevisionBytes": 134217728
+}

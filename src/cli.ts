@@ -193,6 +193,7 @@ import {
 } from "./search/evaluation.ts";
 import { runDoctor, type DoctorOptions, type DoctorReport } from "./doctor.ts";
 import { exportThread } from "./export-thread.ts";
+import { registerSqliteExport } from "./sqlite-export/cli.ts";
 import { runReparse, type ReparseSelection } from "./reparse.ts";
 import {
   createRunId,
@@ -3630,6 +3631,8 @@ function printDoctorReport(report: DoctorReport): void {
   }
   for (const manual of report.manual) console.log(`  MANUAL ${manual}`);
 }
+
+registerSqliteExport(program);
 
 program
   .command("export-thread <dialogue-id>")
