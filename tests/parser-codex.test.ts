@@ -236,6 +236,43 @@ describe("codex parser: model-switch", () => {
     });
   });
 
+  test("current usage records не становятся unknown и не дублируют legacy token_count", async () => {
+    const { dialogue, diagnostics } = await parseFixture("current-usage-events.jsonl");
+    const assistants = dialogue.messages.filter(
+      (message) => message.role === "assistant" && message.usageEvents.length > 0,
+    );
+
+    expect(diagnostics.filter((diagnostic) => diagnostic.code === "unknown_event")).toHaveLength(0);
+    expect(dialogue.messages.flatMap((message) => message.chunks).some(
+      (chunk) => chunk.rawEventType === "event_msg.item_completed" ||
+        chunk.rawEventType === "top:token_usage_record",
+    )).toBe(false);
+    expect(assistants).toHaveLength(2);
+    expect(assistants[0]!.usageEvents.map((event) => event.scope)).toEqual([
+      "request",
+      "turn",
+      "session_cumulative",
+    ]);
+    expect(normalizeUsageEvents(assistants[0]!.usageEvents)).toMatchObject({
+      inputTokens: 1000,
+      cachedInputTokens: 600,
+      cacheWriteInputTokens: 50,
+      outputTokens: 100,
+      totalTokensNormalized: 1100,
+    });
+    expect(assistants[0]!.metadata.modelContextWindow).toBe(200000);
+    expect(normalizeUsageEvents(assistants[1]!.usageEvents)).toMatchObject({
+      inputTokens: 2000,
+      outputTokens: 200,
+      totalTokensNormalized: 2200,
+    });
+    expect(dialogue.metadata.eventCounts).toMatchObject({
+      "event_msg.item_completed": 1,
+      "top:token_usage_record": 2,
+      "event_msg.token_count_cross_format_duplicate": 1,
+    });
+  });
+
   test("forked session: duration_ms replay-истории parent не засчитывается", async () => {
     const { dialogue } = await parseFixture("forked-inherited-duration.jsonl");
     const withDuration = dialogue.messages.filter((m) => m.metadata.durationMs !== undefined);
