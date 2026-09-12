@@ -22,8 +22,11 @@
  *   info.total_token_usage (session cumulative); codex пишет событие по разу
  *   на каждый rate-limit bucket с идентичным info — копии отбрасываются
  *   (eventCounts["event_msg.token_count_bucket_duplicate"]);
+ * - token_usage_record: новый эквивалент usage с request/turn/thread scopes;
+ *   при соседнем legacy token_count одна модельная операция учитывается один раз;
  * - compacted, world_state, task_*, mcp_*, patch_apply_*, web_search_*,
- *   thread_rolled_back, sub_agent_activity, inter_agent_communication_metadata:
+ *   item_completed, thread_rolled_back, sub_agent_activity,
+ *   inter_agent_communication_metadata:
  *   операционные события — не сообщения; учитываются в metadata.eventCounts,
  *   raw остаётся в immutable snapshot. task_complete.duration_ms учитывается
  *   только если payload.started_at не раньше старта ЭТОГО файла: у fork'ов
@@ -59,7 +62,7 @@ import { isSqliteFile } from "../shared/sqlite.ts";
 import { isCodexMetadataSqlite } from "./sqlite-metadata.ts";
 
 export const CODEX_PARSER_NAME = "codex";
-export const CODEX_PARSER_VERSION = 10;
+export const CODEX_PARSER_VERSION = 11;
 
 type ResponseStatus = "completed" | "aborted" | "incomplete";
 
@@ -83,6 +86,7 @@ const OPERATIONAL_EVENT_TYPES = new Set([
   "agent_reasoning",
   "agent_reasoning_delta",
   "agent_message_delta",
+  "item_completed",
   "token_count", // обрабатывается отдельно
 ]);
 
@@ -169,8 +173,8 @@ class DialogueBuilder {
   private unknownTypes = new Set<string>();
   /** Текст последнего user message из event_msg/user_message (dedupe). */
   private lastUserEventText: string | undefined;
-  /** info предыдущего token_count — дедуп rate-limit bucket-копий. */
-  private lastTokenCountInfoKey: string | undefined;
+  /** Последнее usage-наблюдение — дедуп legacy bucket и cross-format копий. */
+  private lastUsageObservation: { key: string; source: "record" | "token_count" } | undefined;
   private activeTurn: ActiveTurn | undefined;
   private turnSequence = 0;
   /** Время старта ЭТОГО файла из session_meta — граница replay-истории fork'а. */
@@ -206,6 +210,9 @@ class DialogueBuilder {
         return;
       case "event_msg":
         this.eventMsg(payload, timestamp, locator);
+        return;
+      case "token_usage_record":
+        this.tokenUsageRecord(payload);
         return;
       case "compacted":
         this.pushMessage({
@@ -712,46 +719,82 @@ class DialogueBuilder {
     // (rate_limits.limit_id: "codex", "codex_bengalfox", ...): info при этом
     // идентичен. Кумулятивный счётчик растёт только от новых вызовов, поэтому
     // повтор предыдущего info — всегда bucket-копия, а не новый вызов.
-    const infoKey = tokenCountInfoKey(info);
-    if (infoKey !== undefined) {
-      if (infoKey === this.lastTokenCountInfoKey) {
-        this.count("event_msg.token_count_bucket_duplicate");
-        return;
-      }
-      this.lastTokenCountInfoKey = infoKey;
-    }
-    const events: ParsedUsageEvent[] = [];
     const last = asObject(info?.last_token_usage);
-    if (last) {
-      events.push({
-        scope: "request",
-        ...usageFields(last),
-        source: "codex.token_count.last_token_usage",
-        raw: last,
-      });
-    }
     const total = asObject(info?.total_token_usage);
-    if (total) {
-      events.push({
-        scope: "session_cumulative",
-        ...usageFields(total),
-        source: "codex.token_count.total_token_usage",
-        raw: total,
-      });
+    const target = [...this.messages].reverse().find((m) => m.role === "assistant");
+    const window = asNumber(info?.model_context_window);
+    if (target && window !== undefined) target.metadata.modelContextWindow = window;
+    this.recordUsage(
+      last,
+      undefined,
+      total,
+      "token_count",
+      target,
+    );
+  }
+
+  /** Новый top-level формат: usage = request, turn/thread = cumulative. */
+  private tokenUsageRecord(payload: Record<string, unknown>): void {
+    this.count("top:token_usage_record");
+    const target = [...this.messages].reverse().find((m) => m.role === "assistant");
+    this.recordUsage(
+      asObject(payload.usage),
+      asObject(payload.turn_token_usage),
+      asObject(payload.thread_token_usage),
+      "record",
+      target,
+    );
+  }
+
+  private recordUsage(
+    request: Record<string, unknown> | undefined,
+    turn: Record<string, unknown> | undefined,
+    session: Record<string, unknown> | undefined,
+    source: "record" | "token_count",
+    target: ParsedMessage | undefined,
+  ): void {
+    const key = usageObservationKey(request, session);
+    if (key !== undefined && key === this.lastUsageObservation?.key) {
+      this.count(
+        source === "token_count" && this.lastUsageObservation.source === "token_count"
+          ? "event_msg.token_count_bucket_duplicate"
+          : `${source === "record" ? "top:token_usage_record" : "event_msg.token_count"}_cross_format_duplicate`,
+      );
+      return;
+    }
+    if (key !== undefined) this.lastUsageObservation = { key, source };
+
+    const prefix = source === "record" ? "codex.token_usage_record" : "codex.token_count";
+    const events: ParsedUsageEvent[] = [];
+    if (request) {
+      events.push(
+        usageEvent(
+          request,
+          "request",
+          `${prefix}.${source === "record" ? "usage" : "last_token_usage"}`,
+        ),
+      );
+    }
+    if (turn) events.push(usageEvent(turn, "turn", `${prefix}.turn_token_usage`));
+    if (session) {
+      events.push(
+        usageEvent(
+          session,
+          "session_cumulative",
+          `${prefix}.${source === "record" ? "thread_token_usage" : "total_token_usage"}`,
+        ),
+      );
     }
     if (events.length === 0) return;
-    const target = [...this.messages].reverse().find((m) => m.role === "assistant");
     if (target) {
       target.usageEvents.push(...events);
-      const window = asNumber(info?.model_context_window);
-      if (window !== undefined) target.metadata.modelContextWindow = window;
-    } else {
-      this.diagnostics.push({
-        code: "orphan_usage_event",
-        message: `${this.path}: token_count before any assistant message`,
-        severity: "warning",
-      });
+      return;
     }
+    this.diagnostics.push({
+      code: "orphan_usage_event",
+      message: `${this.path}: ${source === "record" ? "token_usage_record" : "token_count"} before any assistant message`,
+      severity: "warning",
+    });
   }
 
   private unknown(
@@ -1043,30 +1086,41 @@ function usageVectorKey(usage: Record<string, unknown> | undefined): string {
   return [
     asNumber(usage.input_tokens) ?? "",
     asNumber(usage.cached_input_tokens) ?? "",
+    asNumber(usage.cache_write_input_tokens) ?? "",
     asNumber(usage.output_tokens) ?? "",
     asNumber(usage.reasoning_output_tokens) ?? "",
     asNumber(usage.total_tokens) ?? "",
   ].join(":");
 }
 
-/** Ключ дедупликации token_count: last + cumulative, rate_limits игнорируются. */
-function tokenCountInfoKey(info: Record<string, unknown> | undefined): string | undefined {
-  if (!info) return undefined;
-  const last = asObject(info.last_token_usage);
-  const total = asObject(info.total_token_usage);
-  if (!last && !total) return undefined;
-  return `${usageVectorKey(last)}|${usageVectorKey(total)}`;
+/** Ключ одной usage-операции для legacy и top-level форматов. */
+function usageObservationKey(
+  request: Record<string, unknown> | undefined,
+  session: Record<string, unknown> | undefined,
+): string | undefined {
+  if (!request && !session) return undefined;
+  return `${usageVectorKey(request)}|${usageVectorKey(session)}`;
+}
+
+function usageEvent(
+  usage: Record<string, unknown>,
+  scope: ParsedUsageEvent["scope"],
+  source: string,
+): ParsedUsageEvent {
+  return { scope, ...usageFields(usage), source, raw: usage };
 }
 
 function usageFields(usage: Record<string, unknown>): Omit<ParsedUsageEvent, "scope" | "source" | "raw"> {
   const out: Omit<ParsedUsageEvent, "scope" | "source" | "raw"> = {};
   const input = asNumber(usage.input_tokens);
   const cached = asNumber(usage.cached_input_tokens);
+  const cacheWrite = asNumber(usage.cache_write_input_tokens);
   const output = asNumber(usage.output_tokens);
   const reasoning = asNumber(usage.reasoning_output_tokens);
   const total = asNumber(usage.total_tokens);
   if (input !== undefined) out.inputTokens = input;
   if (cached !== undefined) out.cachedInputTokens = cached;
+  if (cacheWrite !== undefined) out.cacheWriteInputTokens = cacheWrite;
   if (output !== undefined) out.outputTokens = output;
   if (reasoning !== undefined) out.reasoningOutputTokens = reasoning;
   if (total !== undefined) out.totalTokensReported = total;

@@ -1,5 +1,12 @@
 # История изменений
 
+## [Unreleased]
+
+- Codex parser распознаёт текущие `event_msg.item_completed` как операционную
+  телеметрию и top-level `token_usage_record` как request/turn/thread usage.
+  Соседняя legacy-копия `event_msg.token_count` отбрасывается без двойного
+  учёта, а record-only файлы сохраняют usage без `unknown_event`.
+
 ## [0.1.1] — 2026-09-10
 
 - Добавлен экспорт всех диалогов из базы в SQLite: `bun export:sqlite`.
